@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>재고이찌 API Client (Test Tool)</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 20px;
+      background: #111;
+      color: #eee;
+    }
+    h1 {
+      font-size: 20px;
+      margin-bottom: 16px;
+    }
+    label {
+      display: block;
+      margin-top: 10px;
+      font-weight: bold;
+    }
+    input, textarea {
+      width: 100%;
+      padding: 8px;
+      margin-top: 4px;
+      background: #1e1e1e;
+      color: #fff;
+      border: 1px solid #444;
+    }
+    button {
+      margin-top: 12px;
+      padding: 10px 14px;
+      background: #2c2c2c;
+      color: #fff;
+      border: 1px solid #555;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #444;
+    }
+    textarea {
+      height: 200px;
+      resize: vertical;
+      font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+  <h1>재고이찌 API Client (Test Tool)</h1>
+
+  <label>Base URL</label>
+  <input id="baseUrl" value="http://localhost:8000" />
+
+  <label>X-API-KEY</label>
+  <input id="apiKey" value="test1234" />
+
+  <label>JWT Token (선택)</label>
+  <input id="jwt" placeholder="Bearer 토큰이 있다면 입력" />
+
+  <button onclick="checkHealth()">Health 확인</button>
+  <button onclick="getAdvanced()">고급설정 조회 (GET)</button>
+  <button onclick="putAdvanced()">고급설정 저장 (PUT)</button>
+
+  <label>응답 결과</label>
+  <textarea id="result" readonly></textarea>
+
+  <script>
+    const resultBox = document.getElementById("result");
+
+    function getHeaders() {
+      const headers = {
+        "Content-Type": "application/json",
+        "X-API-KEY": document.getElementById("apiKey").value
+      };
+
+      const jwt = document.getElementById("jwt").value;
+      if (jwt) {
+        headers["Authorization"] = "Bearer " + jwt;
+      }
+
+      return headers;
+    }
+
+    async function checkHealth() {
+      const base = document.getElementById("baseUrl").value;
+
+      try {
+        const res = await fetch(`${base}/health`, {
+          method: "GET",
+          headers: getHeaders(),
+        });
+
+        const text = await res.text();
+        resultBox.value =
+          `STATUS: ${res.status}\n\n` +
+          `RESPONSE:\n${text}`;
+      } catch (err) {
+        resultBox.value = err.toString();
+      }
+    }
+
+    async function getAdvanced() {
+      const base = document.getElementById("baseUrl").value;
+
+      try {
+        const res = await fetch(`${base}/api/settings/advanced`, {
+          method: "GET",
+          headers: getHeaders(),
+        });
+
+        const text = await res.text();
+        resultBox.value =
+          `STATUS: ${res.status}\n\n` +
+          `RESPONSE:\n${text}`;
+      } catch (err) {
+        resultBox.value = err.toString();
+      }
+    }
+
+    async function putAdvanced() {
+      const base = document.getElementById("baseUrl").value;
+
+      const payload = {
+        security: {
+          require_x_api_key: true,
+          require_jwt_token: false,
+          api_key: document.getElementById("apiKey").value
+        },
+        performance: {
+          request_limit_per_minute: 5,
+          cache_ttl_seconds: 15
+        },
+        api: {
+          api_base_url: base
+        }
+      };
+
+      try {
+        const res = await fetch(`${base}/api/settings/advanced`, {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify(payload),
+        });
+
+        const text = await res.text();
+        resultBox.value =
+          `STATUS: ${res.status}\n\n` +
+          `REQUEST:\n${JSON.stringify(payload, null, 2)}\n\nRESPONSE:\n${text}`;
+      } catch (err) {
+        resultBox.value = err.toString();
+      }
+    }
+  </script>
+</body>
+</html>

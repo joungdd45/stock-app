@@ -1,0 +1,80 @@
+﻿# 📄 docker-compose.yml (전체수정)
+# 목표: Postgres + Redis + FastAPI(uvicorn backend.main:app)
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: stockapp-postgres
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: inventory
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d inventory"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: stockapp-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    container_name: stockapp-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    working_dir: /app
+    command: >
+      sh -lc '
+      if [ "$APP_ENV" = "development" ]; then
+        uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000} --reload --reload-dir /app/backend;
+      else
+        uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000};
+      fi'
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/inventory
+      REDIS_URL: redis://redis:6379/0
+      APP_ENV: development
+      PYTHONPATH: /app
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    volumes:
+      - ./:/app:rw
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+networks:
+  default:
+    name: stockapp-net
+
+volumes:
+  pgdata:
+  redisdata:

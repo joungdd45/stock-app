@@ -1,0 +1,26 @@
+# 📄 .dockerignore (전체수정)
+# 파이썬/노드 캐시 & 가상환경만 제외하고, 소스 코드는 전부 포함한다.
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+.venv/
+.env.local
+.env.*.local
+
+# VCS
+.git/
+.gitignore
+
+# 프론트 빌드산출물/캐시
+node_modules/
+dist/
+build/
+.next/
+.cache/
+
+# 에디터/OS
+.vscode/
+.DS_Store
+Thumbs.db
