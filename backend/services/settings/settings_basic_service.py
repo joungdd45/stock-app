@@ -83,7 +83,13 @@ class SettingsBasicService:
         self.session: Session = _get_session_adapter(session)
         self.user = user or {}
 
-        self._current_user_id: int = int(self.user.get("user_id", 0))
+        # JWT payload(sub) 또는 user_id 둘 다 지원
+        raw_user_id = self.user.get("user_id") or self.user.get("sub") or 0
+        try:
+            self._current_user_id: int = int(raw_user_id)
+        except (TypeError, ValueError):
+            self._current_user_id = 0
+
         self._current_role: str = str(self.user.get("role", ""))
 
         models = _get_models()

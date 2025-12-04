@@ -1,7 +1,7 @@
 # 📄 backend/services/outbound/outbound_register_service.py
 # 페이지: 출고 등록(OutboundRegisterPage) - 조회 탭
 # 역할: 출고등록 목록 조회 / 선택 수정 / 선택 삭제 / 선택 엑셀(xlsx) 데이터 조회
-# 단계: v2.1 (쿼리 구현, DB 스펙 v1.6-r2 반영)
+# 단계: v2.1 (쿼리 구현, DB 스펙 v1.6-r2 반영 + header.status 필드 추가, completed 제외 필터)
 #
 # ✅ 서비스 원칙
 # - 판단/조회/계산/검증/상태변경/트랜잭션/도메인 예외만 담당
@@ -128,9 +128,10 @@ class OutboundRegisterService:
         - keyword: 국가 / 주문번호 / 트래킹번호 / SKU / 상품명 통합 검색
         - 한 행 구조:
           header_id / item_id / country / order_number / tracking_number /
-          sku / product_name / qty / total_price
+          sku / product_name / qty / total_price / status
         - 페이징: page, size
         - 기본 정렬: item.id DESC (최신순)
+        - completed 상태의 헤더는 목록에서 제외
         """
 
         # 기본 검증
@@ -209,10 +210,11 @@ class OutboundRegisterService:
         sort_col = sort_column_map[effective_sort_by]
         sort_col = sort_col.desc() if effective_sort_dir == "desc" else sort_col.asc()
 
-        # 기본 where 조건: soft delete 제외
+        # 기본 where 조건: soft delete 제외 + completed 제외
         conditions = [
             OutboundHeader.deleted_at.is_(None),
             OutboundItem.deleted_at.is_(None),
+            OutboundHeader.status != "completed",  # completed 헤더는 조회에서 제외
         ]
 
         # keyword 검색 — 국가 / 주문번호 / 트래킹번호 / SKU / 상품명
@@ -250,6 +252,7 @@ class OutboundRegisterService:
                 Product.name.label("product_name"),
                 OutboundItem.qty.label("qty"),
                 OutboundItem.sales_total.label("total_price"),
+                OutboundHeader.status.label("status"),
             )
             .join(OutboundHeader, OutboundItem.header_id == OutboundHeader.id)
             .join(Product, OutboundItem.sku == Product.sku)
@@ -275,6 +278,7 @@ class OutboundRegisterService:
                     "product_name": row.product_name,
                     "qty": row.qty,
                     "total_price": row.total_price,
+                    "status": row.status,
                 }
             )
 
@@ -555,6 +559,7 @@ class OutboundRegisterService:
                 Product.name.label("product_name"),
                 OutboundItem.qty.label("qty"),
                 OutboundItem.sales_total.label("total_price"),
+                OutboundHeader.status.label("status"),
             )
             .join(OutboundHeader, OutboundItem.header_id == OutboundHeader.id)
             .join(Product, OutboundItem.sku == Product.sku)
@@ -589,6 +594,7 @@ class OutboundRegisterService:
                     "product_name": row.product_name,
                     "qty": row.qty,
                     "total_price": row.total_price,
+                    "status": row.status,
                     "header_id": row.header_id,
                     "item_id": row.item_id,
                 }

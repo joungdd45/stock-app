@@ -21,28 +21,25 @@ import {
   TableSelectRow,
   SkeletonText,
 } from "@carbon/react";
+import { outboundAdapter } from "@/api/adapters/outbound.adapter";
+import { handleError } from "@/utils/handleError";
 
 /* ────────────────────────────────────────────────────────────────
- * 타입, 더미 데이터, 헤더 정의
+ * 타입, 헤더 정의
  * ────────────────────────────────────────────────────────────────*/
 type Row = {
-  id: string;           // 행 고유 ID
-  country: string;      // 국가 (예: SG, MY 등)
-  orderNo: string;      // 주문번호
-  trackingNo: string;   // 트래킹번호
-  sku: string;          // SKU 코드
-  name: string;         // 상품명
-  quantity: number;     // 출고수량
-  totalPrice: number;   // 총 가격
+  id: string;         // Carbon row id (itemId 문자열)
+  headerId: number;   // header_id
+  itemId: number;     // item_id
+  country: string;    // 국가
+  orderNo: string;    // 주문번호
+  trackingNo: string; // 트래킹번호
+  sku: string;        // SKU 코드
+  name: string;       // 상품명
+  quantity: number;   // 출고수량
+  totalPrice: number; // 총 가격(숫자)
+  status: string;     // 상태(draft, picking, completed, canceled 등) - 표시용은 아님
 };
-
-const MOCK_ROWS: Row[] = [
-  { id: "O-250001", country: "SG", orderNo: "SG20251022001", trackingNo: "SING-TRK-10001", sku: "FD_SAMY_BULDAKSA02_0200", name: "불닭사리 200g", quantity: 3, totalPrice: 9000 },
-  { id: "O-250002", country: "MY", orderNo: "MY20251023007", trackingNo: "MY-EXP-883201", sku: "FD_DSFS_MAXIMKAN05_MILDLOS030", name: "맥심 모카라떼 30T", quantity: 2, totalPrice: 18000 },
-  { id: "O-250003", country: "PH", orderNo: "PH20251023054", trackingNo: "PH-LBC-776502", sku: "FD_LOTTE_CHOCO_PIE12", name: "초코파이 12입", quantity: 1, totalPrice: 4500 },
-  { id: "O-250004", country: "SG", orderNo: "SG20251024012", trackingNo: "SING-TRK-10028", sku: "FD_SAMLIP_MINI_YAKGWA", name: "삼립 미니약과", quantity: 5, totalPrice: 12500 },
-  { id: "O-250005", country: "TH", orderNo: "TH20251024002", trackingNo: "TH-KERRY-553001", sku: "FD_OTTOGI_JINRAMEN_MILD5", name: "진라면 순한맛 5입", quantity: 2, totalPrice: 6000 },
-];
 
 const ALL_HEADERS = [
   { key: "country", header: "국가" },
@@ -59,8 +56,7 @@ const fmtInt = (n: number) =>
   new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 0 }).format(n);
 
 /* ────────────────────────────────────────────────────────────────
- * 필터 박스 (간단 검색)
- *  - 키워드: 국가, 주문번호, 트래킹번호, SKU, 상품명 부분 일치
+ * 필터 박스
  * ────────────────────────────────────────────────────────────────*/
 function FilterBox(props: {
   value: { keyword?: string };
@@ -104,9 +100,6 @@ function FilterBox(props: {
 
 /* ────────────────────────────────────────────────────────────────
  * 상단 우측 액션 버튼
- *  - 수정: 1건만 가능
- *  - 삭제: 다건 가능
- *  - 열 보이기 토글 + CSV 다운로드
  * ────────────────────────────────────────────────────────────────*/
 function ButtonGroup(props: {
   selectedCount: number;
@@ -154,7 +147,7 @@ function ButtonGroup(props: {
         className="rounded-xl border px-4 py-2 text-sm hover:bg-gray-50"
         onClick={props.onDownload}
       >
-        다운로드(CSV)
+        다운로드(xlsx)
       </button>
 
       <div className="relative" ref={menuRef}>
@@ -187,7 +180,7 @@ function ButtonGroup(props: {
 }
 
 /* ────────────────────────────────────────────────────────────────
- * 스타일: 보조텍스트 숨김 + 정렬 아이콘 커스텀
+ * 스타일
  * ────────────────────────────────────────────────────────────────*/
 const AssistiveTextFix = () => (
   <style>{`
@@ -233,6 +226,9 @@ export default function RegisterQueryPage() {
     dir: "DESC",
   });
 
+  // ✅ DataTable 강제 리마운트용 키 (수정/삭제 후 선택 상태 초기화)
+  const [reloadKey, setReloadKey] = useState(0);
+
   const [visibleKeys, setVisibleKeys] = useState<Set<string>>(
     new Set(ALL_HEADERS.map((h) => h.key))
   );
@@ -243,79 +239,260 @@ export default function RegisterQueryPage() {
       return next;
     });
 
-  /** 목록 조회 (현재는 더미 데이터 가공) */
-  async function fetchList(params: {
-    page: number;
-    pageSize: number;
+  const rowMap = useMemo(
+    () => new Map(rows.map((r) => [r.id, r])),
+    [rows]
+  );
+
+  // sort key → 백엔드 sort_by 매핑
+  const mapSortKeyToBackend = (key?: string): string | undefined => {
+    switch (key) {
+      case "country":
+        return "country";
+      case "orderNo":
+        return "order_number";
+      case "trackingNo":
+        return "tracking_number";
+      case "sku":
+        return "sku";
+      case "name":
+        return "product_name";
+      case "quantity":
+        return "qty";
+      case "totalPrice":
+        return "total_price";
+      default:
+        return undefined;
+    }
+  };
+
+  /** 목록 조회 */
+  async function fetchList(args?: {
+    page?: number;
+    pageSize?: number;
     sort?: { key?: string; dir?: "ASC" | "DESC" };
     filter?: { keyword?: string };
   }) {
+    const nextPage = args?.page ?? page;
+    const nextSize = args?.pageSize ?? pageSize;
+    const nextSort = args?.sort ?? sort;
+    const nextFilter = args?.filter ?? filter;
+
     setLoading(true);
-    await new Promise((r) => setTimeout(r, 300));
+    try {
+      const sort_by = mapSortKeyToBackend(nextSort.key);
+      const sort_dir =
+        nextSort.dir === "DESC"
+          ? ("desc" as const)
+          : nextSort.dir === "ASC"
+          ? ("asc" as const)
+          : undefined;
 
-    let data = [...MOCK_ROWS];
-
-    // 키워드(부분 일치): 국가 | 주문번호 | 트래킹번호 | SKU | 상품명
-    const f = params.filter ?? {};
-    if (f.keyword) {
-      const q = f.keyword.toLowerCase();
-      data = data.filter(
-        (r) =>
-          r.country.toLowerCase().includes(q) ||
-          r.orderNo.toLowerCase().includes(q) ||
-          r.trackingNo.toLowerCase().includes(q) ||
-          r.sku.toLowerCase().includes(q) ||
-          r.name.toLowerCase().includes(q)
-      );
-    }
-
-    // 정렬
-    const s = params.sort;
-    if (s?.key) {
-      data.sort((a: any, b: any) => {
-        const av = a[s.key!];
-        const bv = b[s.key!];
-        if (av === bv) return 0;
-        const base = av > bv ? 1 : -1;
-        return s.dir === "DESC" ? -base : base;
+      const res = await outboundAdapter.fetchRegisterList({
+        keyword: nextFilter.keyword || undefined,
+        page: nextPage,
+        size: nextSize,
+        sort_by,
+        sort_dir,
       });
+
+      if (!res.ok) {
+        return handleError(res.error);
+      }
+      if (!res.data) {
+        return handleError({
+          code: "FRONT-UNEXPECTED-001",
+          message: "처리 중 오류가 발생했습니다. 다시 시도해 주세요.",
+        } as any);
+      }
+
+      const raw: any = res.data;
+      const result = (raw.result ?? raw) as {
+        items?: any[];
+        total_count?: number;
+        page?: number;
+        size?: number;
+      };
+
+      const items = result.items ?? [];
+
+      const getStatus = (it: any): string => {
+        const rawStatus =
+          it.status ??
+          it.header_status ??
+          it.headerStatus ??
+          it.item_status ??
+          it.itemStatus ??
+          "";
+        return String(rawStatus).toLowerCase();
+      };
+
+      const mapped: Row[] = items.map((it) => {
+        const status = getStatus(it);
+        return {
+          id: String(it.item_id),
+          headerId: it.header_id,
+          itemId: it.item_id,
+          country: it.country,
+          orderNo: it.order_number,
+          trackingNo: it.tracking_number ?? "",
+          sku: it.sku,
+          name: it.product_name,
+          quantity: it.qty,
+          totalPrice: Number(it.total_price),
+          status,
+        };
+      });
+
+      setRows(mapped);
+      setTotalCount(mapped.length);
+    } catch (err: any) {
+      console.error(err);
+      handleError(err);
+    } finally {
+      setLoading(false);
     }
-
-    // 페이징
-    const total = data.length;
-    const start = (params.page - 1) * params.pageSize;
-    setRows(data.slice(start, start + params.pageSize));
-    setTotalCount(total);
-
-    setLoading(false);
   }
 
   useEffect(() => {
     fetchList({ page, pageSize, sort, filter });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page, pageSize, sort, filter]);
 
-  // CSV 다운로드(표시 컬럼 기준)
-  const handleDownloadCSV = () => {
-    const cols = ALL_HEADERS.filter((h) => visibleKeys.has(h.key)).map(
-      (h) => h.key as keyof Row
-    );
-    const headerLine = ["id", ...cols].join(",");
-    const lines = rows.map((r) =>
-      [
-        '"' + r.id + '"',
-        ...cols.map((k) =>
-          `"${String((r as any)[k]).replaceAll('"', '""')}"`
-        ),
-      ].join(",")
-    );
-    const csv = [headerLine, ...lines].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `outbound_${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+  // xlsx 다운로드
+  const handleDownloadXlsx = async (selectedItemIds: number[]) => {
+    if (selectedItemIds.length === 0) return;
+    try {
+      const res = await outboundAdapter.exportRegisterItems({
+        action: "export",
+        ids: selectedItemIds,
+        payload: {},
+      });
+
+      if (!res.ok) {
+        return handleError(res.error);
+      }
+      if (!res.data) {
+        return handleError({
+          code: "FRONT-UNEXPECTED-001",
+          message: "처리 중 오류가 발생했습니다. 다시 시도해 주세요.",
+        } as any);
+      }
+
+      const blob = res.data;
+      const url = URL.createObjectURL(blob);
+      const today = new Date().toISOString().slice(0, 10);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `outbound-register-${today}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      console.error(err);
+      handleError(err);
+    }
+  };
+
+  // 수정(단건)
+  const handleEditOne = async (row: Row) => {
+    const nextCountry =
+      window.prompt("국가 코드를 입력하세요.", row.country) ?? row.country;
+    const nextOrderNo =
+      window.prompt("주문번호를 입력하세요.", row.orderNo) ?? row.orderNo;
+    const nextTrackingNo =
+      window.prompt("트래킹번호를 입력하세요.", row.trackingNo) ??
+      row.trackingNo;
+    const nextSku =
+      window.prompt("SKU를 입력하세요.", row.sku) ?? row.sku;
+    const qtyStr =
+      window.prompt("출고수량을 입력하세요.", String(row.quantity)) ??
+      String(row.quantity);
+    const totalPriceStr =
+      window.prompt(
+        "총 가격(숫자 또는 1500.00 형태)을 입력하세요.",
+        String(row.totalPrice)
+      ) ?? String(row.totalPrice);
+
+    const qty = Number(qtyStr);
+    if (Number.isNaN(qty) || qty <= 0) {
+      window.alert("출고수량은 1 이상 숫자만 가능합니다.");
+      return;
+    }
+
+    try {
+      const res = await outboundAdapter.updateRegisterItem({
+        action: "update",
+        ids: [row.itemId],
+        payload: {
+          country: nextCountry,
+          order_number: nextOrderNo,
+          tracking_number: nextTrackingNo,
+          sku: nextSku,
+          qty,
+          total_price: totalPriceStr,
+        },
+      });
+
+      if (!res.ok) {
+        return handleError(res.error);
+      }
+      if (!res.data) {
+        return handleError({
+          code: "FRONT-UNEXPECTED-001",
+          message: "처리 중 오류가 발생했습니다. 다시 시도해 주세요.",
+        } as any);
+      }
+
+      window.alert("출고정보가 수정되었습니다.");
+
+      // ✅ 수정 후: 첫 페이지로 이동 + DataTable 리마운트 + 목록 새로 조회
+      setPage(1);
+      setReloadKey((k) => k + 1);
+      fetchList({ page: 1, pageSize, sort, filter });
+    } catch (err: any) {
+      console.error(err);
+      handleError(err);
+    }
+  };
+
+  // 삭제(다건)
+  const handleDeleteMany = async (selectedItemIds: number[]) => {
+    if (selectedItemIds.length === 0) return;
+    if (!window.confirm(`선택한 ${selectedItemIds.length}건을 삭제할까요?`)) {
+      return;
+    }
+
+    try {
+      const res = await outboundAdapter.deleteRegisterItems({
+        action: "delete",
+        ids: selectedItemIds,
+        payload: {},
+      });
+
+      if (!res.ok) {
+        return handleError(res.error);
+      }
+      if (!res.data) {
+        return handleError({
+          code: "FRONT-UNEXPECTED-001",
+          message: "처리 중 오류가 발생했습니다. 다시 시도해 주세요.",
+        } as any);
+      }
+
+      const deletedCount = res.data.result.deleted_count ?? 0;
+      window.alert(`총 ${deletedCount}건이 삭제되었습니다.`);
+
+      const remain = rows.length - deletedCount;
+      const nextPage = remain <= 0 && page > 1 ? page - 1 : page;
+
+      // ✅ 삭제 후: 페이지 재계산 + DataTable 리마운트 + 목록 새로 조회
+      setPage(nextPage);
+      setReloadKey((k) => k + 1);
+      fetchList({ page: nextPage, pageSize, sort, filter });
+    } catch (err: any) {
+      console.error(err);
+      handleError(err);
+    }
   };
 
   // 표시 중인 헤더만 사용
@@ -324,7 +501,7 @@ export default function RegisterQueryPage() {
     [visibleKeys]
   );
 
-  // Carbon rows로 변환(숫자 포맷 반영)
+  // Carbon rows 변환
   const rowsForCarbon = rows.map((r) => {
     const base: any = { id: r.id };
     for (const h of visibleHeaders) {
@@ -339,22 +516,22 @@ export default function RegisterQueryPage() {
     return base;
   });
 
-  // 총 페이지
   const maxPage = Math.max(1, Math.ceil(totalCount / pageSize));
 
-  // 헤더 클릭 시 정렬 상태 토글
+  // key 경고 제거 + 정렬 토글
   const wrapHeaderProps = (orig: any, header: any) => {
+    const { key, ...rest } = orig || {};
     const onClick = (e: any) => {
-      if (orig?.onClick) orig.onClick(e);
-      const key = header.key as string;
+      if (rest?.onClick) rest.onClick(e);
+      const k = header.key as string;
       setSort((prev) => {
         const nextDir =
-          prev.key !== key ? "ASC" : prev.dir === "ASC" ? "DESC" : "ASC";
-        return { key, dir: nextDir };
+          prev.key !== k ? "ASC" : prev.dir === "ASC" ? "DESC" : "ASC";
+        return { key: k, dir: nextDir };
       });
       setPage(1);
     };
-    return { ...orig, onClick };
+    return { ...rest, onClick };
   };
 
   // 컬럼 폭
@@ -368,7 +545,6 @@ export default function RegisterQueryPage() {
     totalPrice: "120px",
   };
 
-  // 헤더 아이콘(색상 규칙 동일 유지)
   const renderHeaderLabel = (headerKey: string, label: string) => {
     const isActive = sort.key === headerKey;
     const isDesc = isActive && sort.dir === "DESC";
@@ -406,13 +582,19 @@ export default function RegisterQueryPage() {
       />
 
       <DataTable
+        key={reloadKey} // ✅ 수정/삭제 후 리마운트용
         rows={rowsForCarbon}
         headers={visibleHeaders as any}
         useZebraStyles
         size="lg"
       >
         {({ rows, headers, getHeaderProps, getRowProps, getSelectionProps }) => {
-          const selectedCount = rows.filter((r: any) => r.isSelected).length;
+          const selectedCarbonRows = rows.filter((r: any) => r.isSelected);
+          const selectedCount = selectedCarbonRows.length;
+          const selectedDataRows: Row[] = selectedCarbonRows
+            .map((r: any) => rowMap.get(r.id) || null)
+            .filter((r): r is Row => r !== null);
+          const selectedItemIds = selectedDataRows.map((r) => r.itemId);
 
           return (
             <>
@@ -420,11 +602,13 @@ export default function RegisterQueryPage() {
                 selectedCount={selectedCount}
                 visibleKeys={visibleKeys}
                 onToggleKey={toggleKey}
-                onEdit={() => alert("더미: 수정은 1건만 가능합니다.")}
-                onDelete={() =>
-                  alert(`더미: 선택 ${selectedCount}건 삭제`)
-                }
-                onDownload={handleDownloadCSV}
+                onEdit={() => {
+                  if (selectedDataRows.length === 1) {
+                    handleEditOne(selectedDataRows[0]);
+                  }
+                }}
+                onDelete={() => handleDeleteMany(selectedItemIds)}
+                onDownload={() => handleDownloadXlsx(selectedItemIds)}
               />
 
               <TableContainer className="w-full overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-sm">
@@ -459,10 +643,11 @@ export default function RegisterQueryPage() {
                             header,
                             isSortable: true,
                           });
+                          const wrapped = wrapHeaderProps(hp, header);
                           return (
                             <TableHeader
                               key={header.key}
-                              {...wrapHeaderProps(hp, header)}
+                              {...wrapped}
                               className="text-gray-800 font-semibold text-base text-center"
                             >
                               {renderHeaderLabel(header.key, header.header)}
@@ -533,7 +718,7 @@ export default function RegisterQueryPage() {
                   </Table>
                 </div>
 
-                <div className="flex flex-col gap-2 border-top border-gray-100 p-3 md:flex-row md:items-center md:justify-between">
+                <div className="flex flex-col gap-2 border-t border-gray-100 p-3 md:flex-row md:items-center md:justify-between">
                   <div className="text-sm text-gray-600">
                     총 <b>{fmtInt(totalCount)}</b>건
                   </div>

@@ -20,85 +20,25 @@ import {
   TableSelectRow,
   SkeletonText,
 } from "@carbon/react";
+import { outboundAdapter } from "@/api/adapters/outbound.adapter";
+import { handleError } from "@/utils/handleError";
+import type { ApiError } from "@/api/hub/apiHub";
 
 /* ────────────────────────────────────────────────────────────────
- * 타입/더미데이터
+ * 타입
  * ────────────────────────────────────────────────────────────────*/
 type Row = {
   id: string;
   outboundDate: string; // 출고일자 YYYY-MM-DD
-  country: string;      // 국가 (SG, MY, PH 등)
-  orderNo: string;      // 주문번호
-  trackingNo: string;   // 트래킹번호
-  sku: string;          // SKU
-  name: string;         // 상품명
-  quantity: number;     // 출고수량
-  weight: number;       // 중량(g)
-  totalPrice: number;   // 총가격
+  country: string; // 국가 (SG, MY, PH 등)
+  orderNo: string; // 주문번호
+  trackingNo: string; // 트래킹번호
+  sku: string; // SKU
+  name: string; // 상품명
+  quantity: number; // 출고수량
+  weight: number; // 중량(g)
+  totalPrice: number; // 총가격
 };
-
-const MOCK_ROWS: Row[] = [
-  {
-    id: "D-250015",
-    outboundDate: "2025-10-24",
-    country: "SG",
-    orderNo: "SG20251023007",
-    trackingNo: "SING-TRK-11021",
-    sku: "FD_SAMLIP_MINI_YAKGWA",
-    name: "삼립 미니약과",
-    quantity: 5,
-    weight: 1200,
-    totalPrice: 12500,
-  },
-  {
-    id: "D-250014",
-    outboundDate: "2025-10-24",
-    country: "MY",
-    orderNo: "MY20251023054",
-    trackingNo: "MY-EXP-993201",
-    sku: "FD_DSFS_MAXIMKAN05_MILDLOS030",
-    name: "맥심 모카라떼 30T",
-    quantity: 2,
-    weight: 800,
-    totalPrice: 18000,
-  },
-  {
-    id: "D-250013",
-    outboundDate: "2025-10-23",
-    country: "PH",
-    orderNo: "PH20251022112",
-    trackingNo: "PH-LBC-776502",
-    sku: "FD_LOTTE_CHOCO_PIE12",
-    name: "초코파이 12입",
-    quantity: 3,
-    weight: 900,
-    totalPrice: 13500,
-  },
-  {
-    id: "D-250012",
-    outboundDate: "2025-10-23",
-    country: "TH",
-    orderNo: "TH20251022002",
-    trackingNo: "TH-KERRY-553001",
-    sku: "FD_OTTOGI_JINRAMEN_MILD5",
-    name: "진라면 순한맛 5입",
-    quantity: 4,
-    weight: 1100,
-    totalPrice: 12000,
-  },
-  {
-    id: "D-250011",
-    outboundDate: "2025-10-22",
-    country: "SG",
-    orderNo: "SG20251021001",
-    trackingNo: "SING-TRK-10987",
-    sku: "FD_SAMY_BULDAKSA02_0200",
-    name: "불닭사리 200g",
-    quantity: 6,
-    weight: 1300,
-    totalPrice: 18000,
-  },
-];
 
 /* ✅ 헤더 순서:
  * 출고일자 → 국가 → 주문번호 → 트래킹번호 → SKU → 상품명 → 출고수량 → 중량(g) → 총가격
@@ -114,6 +54,18 @@ const ALL_HEADERS = [
   { key: "weight", header: "중량(g)" },
   { key: "totalPrice", header: "총가격" },
 ] as const;
+
+const SORT_KEY_MAP: Record<string, string> = {
+  outboundDate: "outbound_date",
+  country: "country",
+  orderNo: "order_number",
+  trackingNo: "tracking_number",
+  sku: "sku",
+  name: "product_name",
+  quantity: "qty",
+  weight: "weight_g",
+  totalPrice: "sales_total",
+};
 
 const fmtInt = (n: number) =>
   new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 0 }).format(n);
@@ -183,16 +135,18 @@ function FilterBox(props: {
 }
 
 /* ────────────────────────────────────────────────────────────────
- * 버튼 그룹 (수정/삭제 제거, 출고취소만 선택 의존)
+ * 버튼 그룹 (출고취소 / 엑셀 내보내기)
  * ────────────────────────────────────────────────────────────────*/
 function ButtonGroup(props: {
   selectedCount: number;
+  selectedIds: string[];
   visibleKeys: Set<string>;
   onToggleKey: (k: string) => void;
-  onCancelOutbound?: () => void;
-  onExport?: () => void;
+  onCancelOutbound?: (ids: string[]) => void;
+  onExport?: (ids: string[]) => void;
 }) {
-  const disNone = props.selectedCount === 0;
+  const disCancel = props.selectedCount !== 1; // 한 건만 허용
+  const disExport = props.selectedCount === 0;
 
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -208,22 +162,22 @@ function ButtonGroup(props: {
 
   return (
     <div className="mb-3 flex flex-wrap items-center justify-end gap-2">
-      {/* 수정 버튼 제거 */}
-      {/* 삭제 버튼 제거 */}
-
       <button
         className={`rounded-xl px-4 py-2 text-sm ${
-          disNone ? "bg-gray-200 text-gray-500" : "bg-emerald-600 text-white"
+          disCancel ? "bg-gray-200 text-gray-500" : "bg-emerald-600 text-white"
         }`}
-        disabled={disNone}
-        onClick={props.onCancelOutbound}
+        disabled={disCancel}
+        onClick={() => props.onCancelOutbound?.(props.selectedIds)}
       >
         출고취소
       </button>
 
       <button
-        className="rounded-xl px-4 py-2 text-sm bg-gray-900 text-white"
-        onClick={props.onExport}
+        className={`rounded-xl px-4 py-2 text-sm ${
+          disExport ? "bg-gray-200 text-gray-500" : "bg-gray-900 text-white"
+        }`}
+        disabled={disExport}
+        onClick={() => props.onExport?.(props.selectedIds)}
       >
         엑셀 내보내기
       </button>
@@ -318,7 +272,7 @@ export default function CompletePage() {
       return next;
     });
 
-  /** 목록 조회 — 이후 API 연동 시 이 함수만 교체 */
+  /* 목록 조회: 백엔드 /api/outbound/complete/list 연동 */
   async function fetchList(params: {
     page: number;
     pageSize: number;
@@ -326,60 +280,88 @@ export default function CompletePage() {
     filter?: { from?: string; to?: string; keyword?: string };
   }) {
     setLoading(true);
-    await new Promise((r) => setTimeout(r, 200));
+    try {
+      const { page, pageSize, sort, filter } = params;
 
-    let data = [...MOCK_ROWS];
+      const sortKey = sort?.key ? SORT_KEY_MAP[sort.key] : undefined;
+      const sortDir =
+        sort?.dir === "DESC" ? "desc" : sort?.dir === "ASC" ? "asc" : undefined;
 
-    // 기간 필터: 출고일자
-    const f = params.filter ?? {};
-    if (f.from) data = data.filter((r) => r.outboundDate >= f.from!);
-    if (f.to) data = data.filter((r) => r.outboundDate <= f.to!);
-
-    // 키워드: 국가 | 주문번호 | 트래킹번호 | SKU | 상품명
-    if (f.keyword) {
-      const q = f.keyword.toLowerCase();
-      data = data.filter(
-        (r) =>
-          r.country.toLowerCase().includes(q) ||
-          r.orderNo.toLowerCase().includes(q) ||
-          r.trackingNo.toLowerCase().includes(q) ||
-          r.sku.toLowerCase().includes(q) ||
-          r.name.toLowerCase().includes(q),
-      );
-    }
-
-    // 정렬
-    const s = params.sort;
-    if (s?.key) {
-      data.sort((a: any, b: any) => {
-        const av = a[s.key!];
-        const bv = b[s.key!];
-        if (av === bv) return 0;
-        const base = av > bv ? 1 : -1;
-        return s.dir === "DESC" ? -base : base;
+      const res = await outboundAdapter.fetchCompleteList({
+        from_date: filter?.from || undefined,
+        to_date: filter?.to || undefined,
+        q: filter?.keyword || undefined,
+        page,
+        size: pageSize,
+        sort_by: sortKey,
+        sort_dir: sortDir,
       });
+
+      if (!res.ok) {
+        handleError(res.error as ApiError);
+        setRows([]);
+        setTotalCount(0);
+        return;
+      }
+      if (!res.data) {
+        handleError({
+          code: "FRONT-UNEXPECTED-001",
+          message: "출고 완료 목록 조회에 실패했습니다.",
+        } as ApiError);
+        setRows([]);
+        setTotalCount(0);
+        return;
+      }
+
+      const payload: any = res.data;
+      const result = payload.result ?? payload;
+
+      if (!result || !Array.isArray(result.items)) {
+        console.error("unexpected outbound-complete list payload", payload);
+        handleError({
+          code: "FRONT-UNEXPECTED-001",
+          message: "출고 완료 목록 응답 형식이 예상과 다릅니다.",
+        } as ApiError);
+        setRows([]);
+        setTotalCount(0);
+        return;
+      }
+
+      setRows(
+        result.items.map((item: any) => ({
+          id: String(item.item_id),
+          outboundDate: item.outbound_date,
+          country: item.country,
+          orderNo: item.order_number,
+          trackingNo: item.tracking_number,
+          sku: item.sku,
+          name: item.product_name,
+          quantity: item.qty,
+          weight: item.weight_g,
+          totalPrice: item.sales_total,
+        })),
+      );
+      setTotalCount(result.count ?? result.items.length);
+    } catch (e) {
+      console.error(e);
+      handleError(e as ApiError);
+      setRows([]);
+      setTotalCount(0);
+    } finally {
+      setLoading(false);
     }
-
-    // 페이징
-    const total = data.length;
-    const start = (params.page - 1) * params.pageSize;
-    setRows(data.slice(start, start + params.pageSize));
-    setTotalCount(total);
-
-    setLoading(false);
   }
 
   useEffect(() => {
     fetchList({ page, pageSize, sort, filter });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page, pageSize, sort, filter]);
 
-  // 표시 헤더만 사용
   const visibleHeaders = useMemo(
     () => ALL_HEADERS.filter((h) => visibleKeys.has(h.key)),
     [visibleKeys],
   );
 
-  // Carbon rows 변환(숫자 포맷 반영)
   const rowsForCarbon = rows.map((r) => {
     const base: any = { id: r.id };
     for (const h of visibleHeaders) {
@@ -398,7 +380,6 @@ export default function CompletePage() {
 
   const maxPage = Math.max(1, Math.ceil(totalCount / pageSize));
 
-  // 헤더 클릭 시 정렬 토글
   const wrapHeaderProps = (orig: any, header: any) => {
     const onClick = (e: any) => {
       if (orig?.onClick) orig.onClick(e);
@@ -410,10 +391,10 @@ export default function CompletePage() {
       });
       setPage(1);
     };
-    return { ...orig, onClick };
+    const { key, ...rest } = orig || {};
+    return { ...rest, onClick };
   };
 
-  // 열 너비
   const colWidth: Record<string, string> = {
     outboundDate: "130px",
     country: "90px",
@@ -448,32 +429,111 @@ export default function CompletePage() {
     );
   };
 
-  // 엑셀(CSV) 내보내기 — 표시 중인 컬럼 기준
-  const handleExport = () => {
-    const cols = ALL_HEADERS.filter((h) => visibleKeys.has(h.key)).map(
-      (h) => h.key as keyof Row,
-    );
+  const handleExport = async (selectedIds: string[]) => {
+    if (!selectedIds.length) return;
 
-    const headerLine = ["id", ...cols].join(",");
-    const lines = rows.map((r) =>
-      [
-        `"${String(r.id).replaceAll('"', '""')}"`,
-        ...cols.map((k) =>
-          `"${String((r as any)[k] ?? "").replaceAll('"', '""')}"`,
-        ),
-      ].join(","),
-    );
+    const ids = selectedIds
+      .map((id) => Number(id))
+      .filter((n) => !Number.isNaN(n));
 
-    const csv = [headerLine, ...lines].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `outbound_done_${new Date()
-      .toISOString()
-      .slice(0, 10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    if (!ids.length) {
+      alert("선택한 행의 ID가 올바르지 않습니다.");
+      return;
+    }
+
+    try {
+      setLoading(true);
+      const res = await outboundAdapter.exportComplete({ ids });
+      if (!res.ok) {
+        handleError(res.error as ApiError);
+        return;
+      }
+      if (!res.data) {
+        handleError({
+          code: "FRONT-UNEXPECTED-001",
+          message: "엑셀 내보내기에 실패했습니다.",
+        } as ApiError);
+        return;
+      }
+
+      const payload: any = res.data;
+      const result = payload.result ?? payload;
+
+      const { file_name, content_type, content_base64, count } = result;
+
+      if (!content_base64) {
+        alert("엑셀 파일 내용이 비어 있습니다.");
+        return;
+      }
+
+      const byteCharacters = atob(content_base64);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
+      }
+      const byteArray = new Uint8Array(byteNumbers);
+      const blob = new Blob([byteArray], {
+        type:
+          content_type ||
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download =
+        file_name ||
+        `outbound_complete_${new Date().toISOString().slice(0, 10)}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      if (typeof count === "number") {
+        console.log(`엑셀 내보내기: ${count}건`);
+      }
+    } catch (e) {
+      console.error(e);
+      handleError(e as ApiError);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCancelOutbound = async (selectedIds: string[]) => {
+    if (selectedIds.length !== 1) {
+      alert("출고취소는 한 건만 선택해서 처리할 수 있습니다.");
+      return;
+    }
+    const idNum = Number(selectedIds[0]);
+    if (Number.isNaN(idNum)) {
+      alert("선택한 행의 ID가 올바르지 않습니다.");
+      return;
+    }
+    if (!window.confirm("선택한 출고를 취소하시겠습니까?")) return;
+
+    try {
+      const res = await outboundAdapter.cancelComplete({
+        ids: [idNum],
+        reason: "사용자 요청 출고취소",
+      });
+      if (!res.ok) {
+        handleError(res.error as ApiError);
+        return;
+      }
+      if (!res.data) {
+        handleError({
+          code: "FRONT-UNEXPECTED-001",
+          message: "출고취소 처리에 실패했습니다.",
+        } as ApiError);
+        return;
+      }
+      alert("출고취소가 완료되었습니다.");
+      fetchList({ page, pageSize, sort, filter });
+    } catch (e) {
+      console.error(e);
+      handleError(e as ApiError);
+    }
   };
 
   return (
@@ -497,12 +557,15 @@ export default function CompletePage() {
         size="lg"
       >
         {({ rows, headers, getHeaderProps, getRowProps, getSelectionProps }) => {
-          const selectedCount = rows.filter((r: any) => r.isSelected).length;
+          const selectedRows = rows.filter((r: any) => r.isSelected);
+          const selectedCount = selectedRows.length;
+          const selectedIds = selectedRows.map((r: any) => String(r.id));
 
           return (
             <>
               <ButtonGroup
                 selectedCount={selectedCount}
+                selectedIds={selectedIds}
                 visibleKeys={visibleKeys}
                 onToggleKey={(k) =>
                   setVisibleKeys((prev) => {
@@ -511,9 +574,7 @@ export default function CompletePage() {
                     return next;
                   })
                 }
-                onCancelOutbound={() =>
-                  alert(`더미: 선택 ${selectedCount}건 출고취소`)
-                }
+                onCancelOutbound={handleCancelOutbound}
                 onExport={handleExport}
               />
 
@@ -545,10 +606,11 @@ export default function CompletePage() {
                       <TableRow>
                         <TableSelectAll {...getSelectionProps()} />
                         {headers.map((header: any) => {
-                          const hp = getHeaderProps({
+                          const hpRaw = getHeaderProps({
                             header,
                             isSortable: true,
                           });
+                          const { key, ...hp } = hpRaw;
                           return (
                             <TableHeader
                               key={header.key}
@@ -625,7 +687,6 @@ export default function CompletePage() {
                   </Table>
                 </div>
 
-                {/* 하단 요약: 총 건수만 표시 */}
                 <div className="flex flex-col gap-2 border-top border-gray-100 p-3 md:flex-row md:items-center md:justify-between">
                   <div className="text-sm text-gray-600">
                     총 <b>{fmtInt(totalCount)}</b>건

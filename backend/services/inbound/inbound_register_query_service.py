@@ -1,7 +1,7 @@
 # 📄 backend/services/inbound/inbound_register_query_service.py
 # 페이지: 입고관리 - 입고 등록 - 조회(inboundRegisterQueryPage)
 # 역할: 비즈니스 로직 전담 (조회, 단건조회, 수정, 삭제, 검증, 상태변경, 트랜잭션, 도메인 예외)
-# 단계: v2.0 (서비스 구현) / 구조 통일 작업지침 v2 적용
+# 단계: v2.1 (barcode 포함) / 구조 통일 작업지침 v2 적용
 #
 # ✅ 서비스 원칙
 # - 판단/조회/계산/검증/상태변경/트랜잭션/도메인 예외만 담당
@@ -165,7 +165,7 @@ class InboundRegisterQueryService:
         입고 등록 목록 조회.
 
         - 주문일자 범위(order_date)와 키워드(SKU/상품명/입고처)로 필터
-        - 한 행 = inbound_header 1건 + inbound_item 1건
+        - 한 행 = inbound_header 1건 + inbound_item 1건 + product 1건
         - 페이지 기준 합계(summary)는 현재 페이지 기준으로 계산
         """
         # 기본 검증
@@ -189,7 +189,7 @@ class InboundRegisterQueryService:
         InboundItem = self.models["InboundItem"]
         Product = self.models["Product"]
 
-        # 기본 쿼리 구성
+        # 기본 쿼리 구성 (상품과 조인해서 barcode 포함)
         query = (
             self.session.query(InboundItem, InboundHeader, Product)
             .join(InboundHeader, InboundItem.header_id == InboundHeader.id)
@@ -200,7 +200,7 @@ class InboundRegisterQueryService:
             )
         )
 
-        # 상태 필터: draft, committed 둘 다 조회 (향후 필요 시 확장 가능)
+        # 상태 필터: draft, committed 둘 다 조회
         query = query.filter(InboundHeader.status.in_(["draft", "committed"]))
 
         # 날짜 필터
@@ -262,6 +262,8 @@ class InboundRegisterQueryService:
                     "total_price": total_price,
                     "supplier_name": header.supplier_name,
                     "status": header.status,
+                    # ✅ 상품 기준 바코드 포함
+                    "barcode": getattr(product, "barcode", None),
                 }
             )
 
@@ -367,6 +369,8 @@ class InboundRegisterQueryService:
                 "supplier_name": header.supplier_name,
                 "status": header.status,
                 "memo": header.memo,
+                # ✅ 단건 조회에도 barcode 포함
+                "barcode": getattr(product, "barcode", None),
             },
         }
 

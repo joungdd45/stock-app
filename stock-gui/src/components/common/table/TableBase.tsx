@@ -6,8 +6,9 @@
 // - Skeleton 로딩, 정렬, 페이지네이션 지원
 // - [NOAH PATCH] 액션 버튼을 Carbon Table 바깥 상단으로 이동
 // - [NOAH PATCH] 체크박스 보조텍스트("Select row" 등) 완전 숨김(구/신 prefix 동시 대응)
+// - [NOAH PATCH] onSelectionChange 지원 (선택된 row.id 목록을 상위로 전달)
 
-import React, { useMemo } from "react";
+import React, { useMemo, useRef } from "react";
 import {
   DataTable,
   TableContainer,
@@ -52,6 +53,9 @@ type Props = {
   onFilterChange: (v: FilterValue) => void;
 
   actions?: React.ReactNode; // [NOAH PATCH] 외부 상단 액션 영역으로 렌더
+
+  // 선택된 row.id 목록 전달용 (선택 없으면 [])
+  onSelectionChange?: (ids: string[]) => void;
 };
 
 // [NOAH PATCH] 보조텍스트/선택라벨 숨김 + 정렬아이콘 숨김(구/신 prefix 동시대응)
@@ -101,8 +105,13 @@ export default function TableBase({
   filter,
   onFilterChange,
   actions,
+  onSelectionChange,
 }: Props) {
-  const safeHeaders = useMemo(() => (headers ?? []).filter((h) => !!h && !!h.key), [headers]);
+  const safeHeaders = useMemo(
+    () => (headers ?? []).filter((h) => !!h && !!h.key),
+    [headers]
+  );
+
   const sortableMap = useMemo(
     () => Object.fromEntries(safeHeaders.map((h) => [h.key, h.sortable !== false])),
     [safeHeaders]
@@ -125,23 +134,54 @@ export default function TableBase({
     );
   };
 
-  const colWidths = useMemo(() => safeHeaders.map((h) => h.width ?? "auto"), [safeHeaders]);
+  const colWidths = useMemo(
+    () => safeHeaders.map((h) => h.width ?? "auto"),
+    [safeHeaders]
+  );
+
   const carbonRows = useMemo(
-    () => rows.map((r) => ({ id: String(r.id ?? crypto.randomUUID()), ...r })),
+    () =>
+      rows.map((r) => ({
+        id: String(r.id ?? crypto.randomUUID()),
+        ...r,
+      })),
     [rows]
   );
 
-  // [NOAH PATCH] RegisterQueryPage와 동일: 헤더 클릭 시 정렬 토글 + 페이지 리셋
+  // React key 경고 방지: getHeaderProps가 반환하는 key는 제거하고 직접 key를 넣는다.
   const wrapHeaderProps = (orig: any, header: { key: string }) => {
+    const { key: _ignoredKey, onClick: origOnClick, ...rest } = orig ?? {};
+
     const onClick = (e: any) => {
-      if (orig?.onClick) orig.onClick(e);
-      const key = header.key;
-      if (!sortableMap[key]) return; // 비정렬 컬럼 방지
-      const nextDir: SortDir = sort.key !== key ? "ASC" : sort.dir === "ASC" ? "DESC" : "ASC";
-      onSortChange({ key, dir: nextDir });
+      if (typeof origOnClick === "function") {
+        origOnClick(e);
+      }
+      const colKey = header.key;
+      if (!sortableMap[colKey]) return;
+      const nextDir: SortDir =
+        sort.key !== colKey ? "ASC" : sort.dir === "ASC" ? "DESC" : "ASC";
+      onSortChange({ key: colKey, dir: nextDir });
       onPageChange(1);
     };
-    return { ...orig, onClick };
+
+    return { ...rest, onClick };
+  };
+
+  // 선택 상태 변경 감지용
+  const selectionKeyRef = useRef<string>("");
+
+  const reportSelectionIfChanged = (cRows: any[]) => {
+    if (!onSelectionChange) return;
+
+    const ids = cRows
+      .filter((r) => r.isSelected)
+      .map((r) => String(r.id));
+
+    const key = ids.join("|");
+    if (key !== selectionKeyRef.current) {
+      selectionKeyRef.current = key;
+      onSelectionChange(ids);
+    }
   };
 
   return (
@@ -172,137 +212,151 @@ export default function TableBase({
       )}
 
       <DataTable rows={carbonRows} headers={safeHeaders as any} useZebraStyles size="lg">
-        {({ rows: cRows = [], headers: cHeaders = [], getHeaderProps, getRowProps, getSelectionProps }) => (
-          <TableContainer className="w-full overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-sm">
-            <div className="max-h-[560px] overflow-auto">
-              <Table
-                aria-label="공통 테이블"
-                className={[
-                  "min-w-full w-full table-fixed border-collapse",
-                  "[&>thead>tr>th]:sticky [&>thead>tr>th]:top-0 [&>thead>tr>th]:z-10",
-                  "[&>thead>tr]:bg-gray-50 [&>thead>tr>th]:bg-gray-50 [&>thead>tr>th]:text-gray-800",
-                  "[&>thead>tr>th]:border-b border-gray-200",
-                  "[&>tbody>tr>td]:py-3 [&>thead>tr>th]:py-3",
-                  "[&>thead>tr>th]:whitespace-nowrap",
-                  "[&>thead>tr>th]:text-center [&>tbody>tr>td]:text-center",
-                ].join(" ")}
-              >
-                <colgroup>
-                  <col style={{ width: "44px" }} />
-                  {colWidths.map((w, i) => (
-                    <col key={`col-${i}`} style={{ width: w }} />
-                  ))}
-                </colgroup>
+        {({
+          rows: cRows = [],
+          headers: cHeaders = [],
+          getHeaderProps,
+          getRowProps,
+          getSelectionProps,
+        }) => {
+          // 선택 상태 상위 보고
+          reportSelectionIfChanged(cRows);
 
-                <TableHead>
-                  <TableRow>
-                    <TableSelectAll {...getSelectionProps()} />
-                    {cHeaders
-                      ?.filter((h: any) => !!h && !!h.key)
-                      .map((header: any) => {
-                        if (!header?.key) return null;
+          return (
+            <TableContainer className="w-full overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-sm">
+              <div className="max-h-[560px] overflow-auto">
+                <Table
+                  aria-label="공통 테이블"
+                  className={[
+                    "min-w-full w-full table-fixed border-collapse",
+                    "[&>thead>tr>th]:sticky [&>thead>tr>th]:top-0 [&>thead>tr>th]:z-10",
+                    "[&>thead>tr]:bg-gray-50 [&>thead>tr>th]:bg-gray-50 [&>thead>tr>th]:text-gray-800",
+                    "[&>thead>tr>th]:border-b border-gray-200",
+                    "[&>tbody>tr>td]:py-3 [&>thead>tr>th]:py-3",
+                    "[&>thead>tr>th]:whitespace-nowrap",
+                    "[&>thead>tr>th]:text-center [&>tbody>tr>td]:text-center",
+                  ].join(" ")}
+                >
+                  <colgroup>
+                    <col style={{ width: "44px" }} />
+                    {colWidths.map((w, i) => (
+                      <col key={`col-${i}`} style={{ width: w }} />
+                    ))}
+                  </colgroup>
 
-                        // Carbon 기본 props + 정렬 토글 onClick 주입
-                        const hp = getHeaderProps({ header, isSortable: true });
-                        const merged = wrapHeaderProps(hp, header);
+                  <TableHead>
+                    <TableRow>
+                      <TableSelectAll {...getSelectionProps()} />
+                      {cHeaders
+                        ?.filter((h: any) => !!h && !!h.key)
+                        .map((header: any) => {
+                          if (!header?.key) return null;
 
-                        const clickable = !!sortableMap[header.key];
+                          const hp = getHeaderProps({ header, isSortable: true });
+                          const merged = wrapHeaderProps(hp, header);
+                          const clickable = !!sortableMap[header.key];
 
-                        return (
-                          <TableHeader
-                            key={header.key}
-                            {...merged}
-                            className={`text-gray-700 font-semibold text-base text-center ${
-                              clickable ? "cursor-pointer select-none" : "opacity-60"
-                            }`}
-                          >
-                            {renderHeaderLabel(header.key, header.header)}
-                          </TableHeader>
-                        );
-                      })}
-                  </TableRow>
-                </TableHead>
+                          return (
+                            <TableHeader
+                              key={header.key}
+                              {...merged}
+                              className={`text-gray-700 font-semibold text-base text-center ${
+                                clickable ? "cursor-pointer select-none" : "opacity-60"
+                              }`}
+                            >
+                              {renderHeaderLabel(header.key, header.header)}
+                            </TableHeader>
+                          );
+                        })}
+                    </TableRow>
+                  </TableHead>
 
-                <TableBody>
-                  {loading &&
-                    Array.from({ length: 6 }).map((_, i) => (
-                      <TableRow key={`sk-${i}`} className="border-b border-gray-100">
-                        <TableCell />
-                        {cHeaders
-                          ?.filter((h: any) => !!h && !!h.key)
-                          .map((h: any) => (
-                            <TableCell key={`sk-${i}-${h.key}`}>
-                              <SkeletonText heading={false} lineCount={1} width="70%" />
+                  <TableBody>
+                    {loading &&
+                      Array.from({ length: 6 }).map((_, i) => (
+                        <TableRow key={`sk-${i}`} className="border-b border-gray-100">
+                          <TableCell />
+                          {cHeaders
+                            ?.filter((h: any) => !!h && !!h.key)
+                            .map((h: any) => (
+                              <TableCell key={`sk-${i}-${h.key}`}>
+                                <SkeletonText heading={false} lineCount={1} width="70%" />
+                              </TableCell>
+                            ))}
+                        </TableRow>
+                      ))}
+
+                    {!loading &&
+                      cRows.map((row: any) => (
+                        <TableRow
+                          {...getRowProps({ row })}
+                          key={row.id}
+                          className="border-b border-gray-100 hover:bg-gray-50"
+                        >
+                          <TableSelectRow {...getSelectionProps({ row })} />
+                          {row.cells.map((cell: any) => (
+                            <TableCell key={cell.id} className="text-center text-sm">
+                              {cell.value}
                             </TableCell>
                           ))}
+                        </TableRow>
+                      ))}
+
+                    {!loading && cRows.length === 0 && (
+                      <TableRow>
+                        <TableCell colSpan={cHeaders.length + 1}>
+                          <div className="py-10 text-center text-gray-500">
+                            조건에 맞는 결과가 없습니다.
+                          </div>
+                        </TableCell>
                       </TableRow>
-                    ))}
-
-                  {!loading &&
-                    cRows.map((row: any) => (
-                      <TableRow
-                        {...getRowProps({ row })}
-                        key={row.id}
-                        className="border-b border-gray-100 hover:bg-gray-50"
-                      >
-                        <TableSelectRow {...getSelectionProps({ row })} />
-                        {row.cells.map((cell: any) => (
-                          <TableCell key={cell.id} className="text-center text-sm">
-                            {cell.value}
-                          </TableCell>
-                        ))}
-                      </TableRow>
-                    ))}
-
-                  {!loading && cRows.length === 0 && (
-                    <TableRow>
-                      <TableCell colSpan={cHeaders.length + 1}>
-                        <div className="py-10 text-center text-gray-500">조건에 맞는 결과가 없습니다.</div>
-                      </TableCell>
-                    </TableRow>
-                  )}
-                </TableBody>
-              </Table>
-            </div>
-
-            <div className="flex flex-col gap-2 border-top border-gray-100 p-3 md:flex-row md:items-center md:justify-between">
-              <div className="text-sm text-gray-600">
-                총 <b>{total.toLocaleString()}</b>건
+                    )}
+                  </TableBody>
+                </Table>
               </div>
-              <div className="flex items-center gap-2">
-                <select
-                  className="rounded-md border px-2 py-1 text-sm"
-                  value={pageSize}
-                  onChange={(e) => onPageSizeChange(Number(e.target.value))}
-                >
-                  <option value={10}>10개씩</option>
-                  <option value={25}>25개씩</option>
-                  <option value={50}>50개씩</option>
-                </select>
-                <div className="flex items-center gap-1 text-sm text-gray-700">
-                  <button
-                    className="rounded-md border px-2 py-1 disabled:opacity-40"
-                    disabled={page <= 1 || loading}
-                    onClick={() => onPageChange(Math.max(1, page - 1))}
+
+              <div className="flex flex-col gap-2 border-top border-gray-100 p-3 md:flex-row md:items-center md:justify-between">
+                <div className="text-sm text-gray-600">
+                  총 <b>{total.toLocaleString()}</b>건
+                </div>
+                <div className="flex items-center gap-2">
+                  <select
+                    className="rounded-md border px-2 py-1 text-sm"
+                    value={pageSize}
+                    onChange={(e) => onPageSizeChange(Number(e.target.value))}
                   >
-                    이전
-                  </button>
-                  <span className="px-2">
-                    {page} / {Math.max(1, Math.ceil(total / pageSize))}
-                  </span>
-                  <button
-                    className="rounded-md border px-2 py-1 disabled:opacity-40"
-                    disabled={page >= Math.max(1, Math.ceil(total / pageSize)) || loading}
-                    onClick={() => onPageChange(page + 1)}
-                  >
-                    다음
-                  </button>
+                    <option value={10}>10개씩</option>
+                    <option value={25}>25개씩</option>
+                    <option value={50}>50개씩</option>
+                  </select>
+                  <div className="flex items-center gap-1 text-sm text-gray-700">
+                    <button
+                      className="rounded-md border px-2 py-1 disabled:opacity-40"
+                      disabled={page <= 1 || loading}
+                      onClick={() => onPageChange(Math.max(1, page - 1))}
+                    >
+                      이전
+                    </button>
+                    <span className="px-2">
+                      {page} / {Math.max(1, Math.ceil(total / pageSize))}
+                    </span>
+                    <button
+                      className="rounded-md border px-2 py-1 disabled:opacity-40"
+                      disabled={
+                        page >= Math.max(1, Math.ceil(total / pageSize)) || loading
+                      }
+                      onClick={() => onPageChange(page + 1)}
+                    >
+                      다음
+                    </button>
+                  </div>
                 </div>
               </div>
-            </div>
-          </TableContainer>
-        )}
+            </TableContainer>
+          );
+        }}
       </DataTable>
     </div>
   );
 }
+ 

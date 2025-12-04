@@ -1,649 +1,784 @@
-/**
- * UI: 입고 처리 페이지 (라운드 카드 + 스티키 헤더 테이블)
- * File: src/pages/Inbound/Process/inboundProcessPage.tsx
+/* ============================================================================
+ * 📄 src/pages/Inbound/Process/inboundProcessPage.tsx
+ * 입고 처리 페이지 (전표 선택 → 바코드 스캔 → 수량입력 → 개별 확정)
  *
- * 기능 요약
- * - 바코드 스캔 추가(Enter) → 새 행 추가, qty는 빈칸 시작
- * - 수량 입력 숫자만 허용, 빈칸 유지 가능
- * - 수량 입력칸에서 Enter → 해당 행의 "입고 처리" 버튼으로 포커스
- * - 처리 가능 조건: qty가 숫자이고 > 0, 상태가 "완료대기"
- * - 처리 후 버튼 대신 붉은색 볼드 "입고완료" 표시
- * - KST 기준 YYYY-MM-DD 주문일자 자동 생성
- * - UI 라운드 카드, 섹션 분리, 테이블 헤더 sticky
- * - 미등록 바코드 스캔 시 상단 중앙 토스트로 안내만 표시
- * - 체크박스 선택 후 "바코드 등록" 버튼으로 모달 오픈
- *   (바코드, SKU, 상품명을 모두 수정 가능)
- */
+ * 구성:
+ * 1) 상단 바코드 스캔 영역 (입고등록-조회탭의 검색 박스 자리에 위치)
+ * 2) 전표 선택 표 (조회탭 하단 표 느낌, 라디오 선택)
+ * 3) 스캔 목록 표
+ * 4) 바코드 미등록 시 바코드 등록 모달
+ *    + 전표 바코드는 SKU 기반 상품 lookup 으로 보강(B안)
+ *    + 모달 내부 SKU 입력 후 자동으로 상품명 lookup_by_sku
+ * ========================================================================== */
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import { inboundAdapter } from "@/api/adapters/inbound.adapter";
 
-// ────────────────────────────────────────────────────────────────
-// 타입
+/* ─────────────────────────────────────────────
+ * 타입 정의
+ * ───────────────────────────────────────────── */
+
+type InboundHeaderItem = {
+  item_id: number;
+  sku: string;
+  name: string;
+  qty: number;
+};
+
+type InboundHeaderSummary = {
+  header_id: number;
+  order_no: string;
+  barcode?: string | null;
+  sku?: string | null;
+  name?: string | null;
+  expected_qty: number;
+  items: InboundHeaderItem[];
+};
+
+type InboundProcessScanResult = {
+  sku: string;
+  name: string;
+  barcode: string;
+};
+
 type ScannedItem = {
   id: string;
-  orderDate: string;
   barcode: string;
   sku?: string;
   name?: string;
   qty?: number;
-  supplier?: string;
-  status: "대기" | "등록필요" | "완료대기" | "입고완료";
+  itemId?: number;
+  status: "등록필요" | "완료대기" | "입고완료";
 };
 
-type RegisterModalState = {
-  open: boolean;
-  targetRowId?: string;
-  targetSku?: string;
-  targetName?: string;
-  targetBarcode?: string;
+type BarcodeRegisterForm = {
+  barcode: string;
+  sku: string;
+  name: string;
 };
 
-// ────────────────────────────────────────────────────────────────
-// 헬퍼
 const uid = () => Math.random().toString(36).slice(2, 10);
 
-// KST 기준 YYYY-MM-DD 문자열 반환
-const todayKST = (): string => {
-  const now = new Date();
-  const kst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
-  const y = kst.getUTCFullYear();
-  const m = String(kst.getUTCMonth() + 1).padStart(2, "0");
-  const d = String(kst.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
+/* ─────────────────────────────────────────────
+ * 바코드 등록 모달
+ * ───────────────────────────────────────────── */
+
+type BarcodeRegisterModalProps = {
+  open: boolean;
+  form: BarcodeRegisterForm;
+  saving: boolean;
+  error: string | null;
+  onChange: (form: BarcodeRegisterForm) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+  // ✅ SKU 입력 후 상품명 자동 조회
+  onSkuLookup: (sku: string) => void;
 };
 
-// 바코드 → SKU/상품명 임시 매핑 (추후 API 대체)
-const mockResolveBarcode = (barcode: string) => {
-  if (/^\d{3,}$/.test(barcode)) {
-    return {
-      sku: `SKU-${barcode.slice(-6)}`,
-      name: `상품-${barcode.slice(-4)}`,
-    };
-  }
-  return null;
+const BarcodeRegisterModal: React.FC<BarcodeRegisterModalProps> = ({
+  open,
+  form,
+  saving,
+  error,
+  onChange,
+  onClose,
+  onSubmit,
+  onSkuLookup,
+}) => {
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40">
+      <div className="w-full max-w-md rounded-2xl bg-white p-5 shadow-xl">
+        <h2 className="mb-3 text-lg font-semibold text-gray-900">바코드 신규 등록</h2>
+
+        <p className="mb-3 text-xs text-gray-600">
+          스캔된 바코드가 아직 등록되어 있지 않습니다. 매핑할 SKU와 상품명을 입력해 주세요.
+        </p>
+
+        <div className="space-y-3 text-sm">
+          <div className="flex flex-col gap-1">
+            <span className="text-gray-700">바코드</span>
+            <input
+              type="text"
+              className="rounded-lg border px-3 py-2 bg-gray-50 text-gray-700"
+              value={form.barcode}
+              readOnly
+            />
+          </div>
+
+          <label className="flex flex-col gap-1">
+            <span className="text-gray-700">SKU</span>
+            <input
+              type="text"
+              className="rounded-lg border px-3 py-2"
+              placeholder="예: sku-001"
+              value={form.sku}
+              onChange={(e) => {
+                onChange({ ...form, sku: e.target.value });
+              }}
+              onBlur={() => {
+                // 포커스가 빠져나갈 때 lookup_by_sku 호출
+                if (form.sku.trim()) {
+                  onSkuLookup(form.sku.trim());
+                }
+              }}
+              disabled={saving}
+            />
+            <span className="mt-1 text-[11px] text-gray-400">
+              SKU 입력 후 입력창에서 나가면 자동으로 상품명을 조회합니다.
+            </span>
+          </label>
+
+          <label className="flex flex-col gap-1">
+            <span className="text-gray-700">상품명</span>
+            <input
+              type="text"
+              className="rounded-lg border px-3 py-2"
+              placeholder="상품명 입력"
+              value={form.name}
+              onChange={(e) => onChange({ ...form, name: e.target.value })}
+              disabled={saving}
+              onFocus={() => {
+                // 상품명에 포커스될 때 이름이 비어 있고 SKU가 있으면 한 번 더 보조 조회
+                if (!form.name.trim() && form.sku.trim()) {
+                  onSkuLookup(form.sku.trim());
+                }
+              }}
+            />
+          </label>
+
+          {error && (
+            <div className="rounded-xl bg-red-50 px-3 py-2 text-xs text-red-700 whitespace-pre-line">
+              {error}
+            </div>
+          )}
+        </div>
+
+        <div className="mt-5 flex justify-end gap-2 text-sm">
+          <button
+            type="button"
+            className="rounded-xl border px-4 py-2 text-gray-700 hover:bg-gray-50"
+            disabled={saving}
+            onClick={onClose}
+          >
+            취소
+          </button>
+          <button
+            type="button"
+            className="rounded-xl bg-black px-4 py-2 text-white disabled:opacity-60"
+            disabled={saving}
+            onClick={onSubmit}
+          >
+            {saving ? "등록 중..." : "등록"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 };
 
-// ────────────────────────────────────────────────────────────────
-// 컴포넌트
+/* ─────────────────────────────────────────────
+ * 메인 컴포넌트
+ * ───────────────────────────────────────────── */
+
 const ProcessPage: React.FC = () => {
   const [barcode, setBarcode] = useState("");
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  const [headerList, setHeaderList] = useState<InboundHeaderSummary[]>([]);
+  const [selectedHeader, setSelectedHeader] =
+    useState<InboundHeaderSummary | null>(null);
 
   const [items, setItems] = useState<ScannedItem[]>([]);
-  const [showRegisterModal, setShowRegisterModal] = useState<RegisterModalState>(
-    { open: false }
-  );
+  const qtyRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
-  // 토스트 메시지 상태
+  const [loadingRowId, setLoadingRowId] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
-  // 각 행 수량 input refs
-  const qtyRefs = useRef<Record<string, HTMLInputElement | null>>({});
-  const [lastAddedId, setLastAddedId] = useState<string | null>(null);
-
-  // 선택 체크박스
-  const [checked, setChecked] = useState<Record<string, boolean>>({});
-
-  const selectedCount = useMemo(
-    () => Object.values(checked).filter(Boolean).length,
-    [checked]
+  // 바코드 등록 모달
+  const [barcodeModalOpen, setBarcodeModalOpen] = useState(false);
+  const [barcodeForm, setBarcodeForm] = useState<BarcodeRegisterForm>({
+    barcode: "",
+    sku: "",
+    name: "",
+  });
+  const [barcodeSaving, setBarcodeSaving] = useState(false);
+  const [barcodeModalError, setBarcodeModalError] = useState<string | null>(
+    null
   );
 
-  // 포커스 유틸
-  const focusBarcodeInput = () =>
-    setTimeout(() => inputRef.current?.focus(), 0);
-
-  const focusFirstQty = () => {
-    const first = items[0];
-    if (!first) return;
-    const el = qtyRefs.current[first.id];
-    if (el) setTimeout(() => el.focus(), 0);
-  };
-
-  // 방금 추가한 행의 수량 input으로 렌더 후 자동 포커스
-  useEffect(() => {
-    if (!lastAddedId) return;
-    const el = qtyRefs.current[lastAddedId];
-    if (el) {
-      el.focus();
-      setLastAddedId(null);
-    }
-  }, [items, lastAddedId]);
-
-  // 토스트 자동 삭제
   useEffect(() => {
     if (!toast) return;
-    const timer = setTimeout(() => {
-      setToast(null);
-    }, 3000);
-    return () => clearTimeout(timer);
+    const t = setTimeout(() => setToast(null), 2500);
+    return () => clearTimeout(t);
   }, [toast]);
 
-  // 스캔 추가 (Enter 전용) — qty를 undefined로 두어 빈칸으로 시작
-  const handleScanAdd = () => {
-    const value = barcode.trim();
-    if (!value) {
-      focusBarcodeInput();
-      return;
-    }
-
-    const resolved = mockResolveBarcode(value);
-    const newId = uid();
-    const next: ScannedItem = {
-      id: newId,
-      orderDate: todayKST(),
-      barcode: value,
-      sku: resolved?.sku,
-      name: resolved?.name,
-      qty: undefined,
-      supplier: undefined,
-      status: resolved ? "완료대기" : "등록필요",
+  // 초기화
+  useEffect(() => {
+    const init = async () => {
+      try {
+        await inboundAdapter.processPing();
+      } catch (e) {
+        console.error("[InboundProcess] ping error", e);
+        setToast("입고 처리 API 연결에 실패했습니다.");
+      }
+      await loadHeaderList();
     };
+    void init();
+  }, []);
 
-    setItems((prev) => [next, ...prev]);
-    setBarcode("");
+  /* ─────────────────────────────────────────────
+   * 전표 로드 + SKU 기반 바코드 보강 (B안)
+   * ───────────────────────────────────────────── */
 
-    if (!resolved) {
-      // 미등록 바코드 안내만 표시 (모달 자동 오픈 X)
-      setToast(
-        "등록된 바코드가 아닙니다. 상품을 선택한 뒤 바코드 등록 버튼으로 연결해 주세요."
+  const loadHeaderList = async () => {
+    try {
+      const res = await inboundAdapter.registerQueryList({
+        page: 1,
+        size: 100,
+      });
+
+      if (!res.ok || !res.data) {
+        setToast("전표 조회 실패");
+        return;
+      }
+
+      // 1) committed 라인은 제외
+      const rows = (res.data.items ?? []).filter(
+        (row: any) => row.status !== "committed"
       );
+
+      // 2) header_id 기준 그룹핑
+      const grouped: Record<number, InboundHeaderSummary> = {};
+
+      rows.forEach((row: any) => {
+        const hid = row.header_id as number;
+
+        if (!grouped[hid]) {
+          grouped[hid] = {
+            header_id: hid,
+            order_no: row.order_no,
+            barcode: null,
+            sku: row.sku ?? null,
+            name: row.name ?? null,
+            expected_qty: 0,
+            items: [],
+          };
+        }
+
+        const bucket = grouped[hid];
+
+        bucket.items.push({
+          item_id: row.item_id,
+          sku: row.sku,
+          name: row.name,
+          qty: row.qty,
+        });
+
+        bucket.expected_qty += row.qty ?? 0;
+      });
+
+      const list = Object.values(grouped);
+
+      // 3) 전표 안에 등장하는 모든 SKU 모으기
+      const uniqueSkus = Array.from(
+        new Set(
+          list
+            .flatMap((h) => h.items.map((it) => it.sku))
+            .filter((sku): sku is string => !!sku)
+        )
+      );
+
+      // 4) SKU → barcode 매핑 (입고 어댑터의 lookupProductBySku 사용)
+      const skuBarcodeMap: Record<string, string> = {};
+
+      await Promise.all(
+        uniqueSkus.map(async (sku) => {
+          try {
+            const lookupRes = await inboundAdapter.lookupProductBySku(sku);
+            if (!lookupRes.ok || !lookupRes.data) return;
+
+            const data = lookupRes.data as any;
+            if (!data.ok || !data.item) return;
+
+            if (data.item.barcode) {
+              skuBarcodeMap[sku] = data.item.barcode;
+            }
+          } catch (e) {
+            console.error("[InboundProcess] lookupProductBySku error", sku, e);
+          }
+        })
+      );
+
+      // 5) 대표 SKU 기준으로 전표 요약에 barcode 채우기
+      const enriched = list.map((h) => {
+        const reprSku = h.sku || h.items[0]?.sku;
+        const reprBarcode =
+          reprSku && skuBarcodeMap[reprSku]
+            ? skuBarcodeMap[reprSku]
+            : null;
+        return {
+          ...h,
+          barcode: reprBarcode,
+        };
+      });
+
+      setHeaderList(enriched);
+      setSelectedHeader(enriched.length > 0 ? enriched[0] : null);
+    } catch (e) {
+      console.error("[InboundProcess] loadHeaderList error", e);
+      setToast("전표 조회 중 오류가 발생했습니다.");
+    }
+  };
+
+  /* ─────────────────────────────────────────────
+   * 바코드 등록 모달 관련
+   * ───────────────────────────────────────────── */
+
+  const openBarcodeRegisterModal = (scannedBarcode: string) => {
+    setBarcodeForm({
+      barcode: scannedBarcode,
+      sku: "",
+      name: "",
+    });
+    setBarcodeModalError(null);
+    setBarcodeModalOpen(true);
+  };
+
+  const closeBarcodeRegisterModal = () => {
+    if (barcodeSaving) return;
+    setBarcodeModalOpen(false);
+    setBarcodeModalError(null);
+  };
+
+  // ✅ SKU 기준 상품명 자동 채우기 (lookup_by_sku 활용)
+  const handleSkuLookupInModal = async (sku: string) => {
+    const trimmed = sku.trim();
+    if (!trimmed) return;
+
+    try {
+      const res = await inboundAdapter.lookupProductBySku(trimmed);
+
+      if (!res.ok || !res.data) {
+        setBarcodeModalError("SKU 조회에 실패했습니다. SKU를 다시 확인해 주세요.");
+        return;
+      }
+
+      const data: any = res.data;
+      if (!data.ok || !data.item) {
+        setBarcodeModalError("해당 SKU에 해당하는 상품을 찾을 수 없습니다.");
+        return;
+      }
+
+      const item = data.item;
+
+      setBarcodeForm((prev) => ({
+        ...prev,
+        sku: item.sku ?? trimmed,
+        name: item.name ?? prev.name,
+      }));
+      setBarcodeModalError(null);
+    } catch (e) {
+      console.error("[InboundProcess] handleSkuLookupInModal error", e);
+      setBarcodeModalError("상품 조회 중 오류가 발생했습니다.");
+    }
+  };
+
+  const submitBarcodeRegister = async () => {
+    const trimmedSku = barcodeForm.sku.trim();
+    const trimmedName = barcodeForm.name.trim();
+
+    if (!trimmedSku || !trimmedName) {
+      setBarcodeModalError("SKU와 상품명을 모두 입력하세요.");
       return;
     }
 
-    // 렌더 후 수량 포커스
-    setLastAddedId(newId);
-  };
+    setBarcodeSaving(true);
+    setBarcodeModalError(null);
 
-  // 수량 변경: 숫자만 허용, 빈칸은 undefined로 보존
-  const changeQty = (id: string, nextQty: number | undefined) => {
-    setItems((prev) =>
-      prev.map((it) => (it.id === id ? { ...it, qty: nextQty } : it))
-    );
-  };
+    const res = await inboundAdapter.processRegisterBarcode({
+      barcode: barcodeForm.barcode,
+      sku: trimmedSku,
+      name: trimmedName,
+    });
 
-  // 체크박스
-  const toggleCheck = (id: string, value: boolean) =>
-    setChecked((prev) => ({ ...prev, [id]: value }));
+    setBarcodeSaving(false);
 
-  const toggleCheckAll = (value: boolean) => {
-    const next: Record<string, boolean> = {};
-    items.forEach((it) => (next[it.id] = value));
-    setChecked(next);
-  };
+    if (!res.ok) {
+      const code = res.error?.code ?? "UNKNOWN";
+      const msg = res.error?.message ?? "등록 중 오류가 발생했습니다.";
+      const detail = res.error?.detail;
 
-  // 선택된 한 행 가져오기 (0개/여러 개일 때는 null)
-  const getSingleSelectedRow = (): ScannedItem | null => {
-    const selected = items.filter((it) => checked[it.id]);
-    if (selected.length === 0) return null;
-    if (selected.length > 1) return null;
-    return selected[0];
-  };
-
-  // "바코드 등록" 버튼 클릭 시: 선택된 행 기준으로 모달 오픈
-  const handleOpenRegisterModalFromSelection = () => {
-    const row = getSingleSelectedRow();
-    if (!row) {
-      if (selectedCount === 0) {
-        setToast("바코드를 등록할 상품을 먼저 한 개 선택하세요.");
+      if (code === "INBOUND-NOTFOUND-101") {
+        setBarcodeModalError(
+          `SKU를 찾을 수 없습니다. SKU를 다시 확인해 주세요.\n(${code}: ${
+            detail ?? msg
+          })`
+        );
       } else {
-        setToast("한 번에 한 상품만 바코드를 등록할 수 있습니다.");
+        setBarcodeModalError(`바코드 등록 실패\n코드: ${code}\n메시지: ${msg}`);
       }
       return;
     }
 
-    setShowRegisterModal({
-      open: true,
-      targetRowId: row.id,
-      targetSku: row.sku,
-      targetName: row.name,
-      targetBarcode: row.barcode || "",
-    });
+    setBarcodeModalOpen(false);
+    setToast("바코드가 등록되었습니다. 같은 바코드를 다시 스캔해 주세요.");
   };
 
-  // 바코드 등록(모달 저장) — 대상 행의 SKU/상품명/바코드/상태 업데이트
-  const registerBarcode = (
-    skuValue: string,
-    nameValue: string,
-    barcodeValue: string
-  ) => {
-    const { targetRowId } = showRegisterModal;
-    if (!targetRowId) return;
+  /* ─────────────────────────────────────────────
+   * 스캔 처리
+   * ───────────────────────────────────────────── */
 
+  const handleScanAdd = async () => {
+    if (!selectedHeader) {
+      setToast("먼저 전표를 선택하세요.");
+      return;
+    }
+
+    const value = barcode.trim();
+    if (!value) return;
+
+    const baseId = uid();
+
+    const fallback: ScannedItem = {
+      id: baseId,
+      barcode: value,
+      status: "등록필요",
+    };
+
+    try {
+      const res = await inboundAdapter.processScan({ barcode: value });
+
+      if (!res.ok || !res.data) {
+        setBarcode("");
+        openBarcodeRegisterModal(value);
+        setToast("등록되지 않은 바코드입니다. SKU를 등록해 주세요.");
+        return;
+      }
+
+      const r = (res.data.result ?? res.data) as InboundProcessScanResult;
+
+      const line = selectedHeader.items.find((it) => it.sku === r.sku);
+
+      if (!line) {
+        setBarcode("");
+        setToast("선택한 전표에 없는 SKU입니다.");
+        return;
+      }
+
+      const next: ScannedItem = {
+        id: baseId,
+        barcode: r.barcode,
+        sku: r.sku,
+        name: r.name,
+        qty: undefined,
+        itemId: line.item_id,
+        status: "완료대기",
+      };
+
+      setItems((prev) => [next, ...prev]);
+      setBarcode("");
+    } catch (e) {
+      console.error("[InboundProcess] scan error", e);
+      setBarcode("");
+      setToast("스캔 중 오류가 발생했습니다.");
+    }
+  };
+
+  const changeQty = (id: string, qty: number | undefined) => {
     setItems((prev) =>
-      prev.map((it) =>
-        it.id === targetRowId
-          ? {
-              ...it,
-              barcode: barcodeValue,
-              sku: skuValue,
-              name: nameValue,
-              status: "완료대기",
-            }
-          : it
-      )
+      prev.map((it) => (it.id === id ? { ...it, qty } : it))
     );
-
-    setShowRegisterModal({
-      open: false,
-      targetRowId: undefined,
-      targetSku: undefined,
-      targetName: undefined,
-      targetBarcode: undefined,
-    });
-
-    focusBarcodeInput();
-    setToast("바코드가 등록되었습니다. 이제 입고 처리할 수 있습니다.");
   };
 
-  // 행별 입고 처리: qty가 숫자이고 > 0 이면서 상태가 완료대기일 때만
-  const processRow = (id: string) => {
-    setItems((prev) =>
-      prev.map((it) => {
-        if (it.id !== id) return it;
-        if (
-          typeof it.qty === "number" &&
-          it.qty > 0 &&
-          it.status === "완료대기"
-        ) {
-          // 실제론 API 성공 시 반영
-          return { ...it, status: "입고완료" };
-        }
-        return it;
-      })
-    );
-    focusBarcodeInput();
+  /* ─────────────────────────────────────────────
+   * 개별 입고 처리
+   * ───────────────────────────────────────────── */
+
+  const processRow = async (row: ScannedItem) => {
+    if (!selectedHeader) {
+      setToast("전표를 선택하세요.");
+      return;
+    }
+    if (!row.sku || !row.itemId) {
+      setToast("전표 매핑 정보가 부족합니다.");
+      return;
+    }
+    if (!row.qty || row.qty <= 0) {
+      setToast("수량을 입력하세요.");
+      return;
+    }
+
+    setLoadingRowId(row.id);
+
+    try {
+      const setRes = await inboundAdapter.processSetQty({
+        sku: row.sku,
+        qty: row.qty,
+      });
+
+      if (!setRes.ok) {
+        setToast("수량 설정에 실패했습니다.");
+        setLoadingRowId(null);
+        return;
+      }
+
+      const confirmRes = await inboundAdapter.processConfirm({
+        header_id: selectedHeader.header_id,
+        items: [{ item_id: row.itemId, sku: row.sku, qty: row.qty }],
+        operator: "dj",
+      });
+
+      if (!confirmRes.ok) {
+        setToast("입고 처리에 실패했습니다.");
+        setLoadingRowId(null);
+        return;
+      }
+
+      setItems((prev) =>
+        prev.map((it) =>
+          it.id === row.id ? { ...it, status: "입고완료" } : it
+        )
+      );
+    } catch (e) {
+      console.error("[InboundProcess] confirm error", e);
+      setToast("입고 처리 중 오류가 발생했습니다.");
+    } finally {
+      setLoadingRowId(null);
+    }
   };
 
-  // ────────────────────────────────────────────────────────────────
-  // UI (라운드 카드 + 스티키 헤더 테이블)
+  /* ─────────────────────────────────────────────
+   * UI
+   * ───────────────────────────────────────────── */
+
   return (
     <>
       <div className="p-4 space-y-4">
-        {/* 상단 안내 카드 */}
-        <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-          <h1 className="text-lg font-semibold">입고 처리</h1>
-          <p className="mt-1 text-sm text-gray-600">
-            바코드를 스캔하거나 직접 입력한 뒤 Enter로 추가하세요. 등록되지 않은
-            바코드는 상단 안내로 표시되고, 체크박스로 상품을 선택해 바코드를
-            등록할 수 있습니다.
-          </p>
-        </div>
-
-        {/* 스캔/액션 카드 */}
-        <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-          <div className="flex flex-col gap-3 md:flex-row md:items-center">
-            <input
-              ref={inputRef}
-              value={barcode}
-              onChange={(e) => setBarcode(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  handleScanAdd();
+        {/* 1) 상단 바코드 스캔 박스 */}
+        <div className="mb-1 rounded-2xl border border-gray-200 bg-white p-4">
+          <div className="flex flex-col gap-2 md:flex-row md:items-center">
+            <div className="flex-1">
+              <input
+                ref={(el) => {
+                  inputRef.current = el;
+                }}
+                className="w-full border rounded-xl px-3 py-2"
+                placeholder={
+                  selectedHeader
+                    ? "바코드 스캔..."
+                    : "먼저 아래에서 전표를 선택하세요."
                 }
-                if (e.key === "Tab") {
-                  e.preventDefault();
-                  // 목록이 있으면 첫 행 수량 input으로 이동
-                  const first = items[0];
-                  const el = first ? qtyRefs.current[first.id] : null;
-                  if (el) el.focus();
-                }
-              }}
-              placeholder="바코드 스캔 또는 수기 입력"
-              className="w-full rounded-xl border px-3 py-2 md:w-[520px]"
-            />
-
-            <div className="md:ml-auto flex gap-2">
+                disabled={!selectedHeader}
+                value={barcode}
+                onChange={(e) => setBarcode(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void handleScanAdd();
+                  }
+                }}
+              />
+            </div>
+            <div className="mt-2 w-full md:mt-0 md:w-auto md:ml-3">
               <button
-                onClick={handleOpenRegisterModalFromSelection}
-                className="rounded-xl border px-4 py-2 text-sm hover:bg-gray-50"
+                type="button"
+                className="w-full rounded-xl bg.black px-4 py-2 text-sm text-white disabled:opacity-50 bg-black"
+                disabled={!selectedHeader || !barcode.trim()}
+                onClick={() => void handleScanAdd()}
               >
-                바코드 등록
+                스캔 처리
               </button>
             </div>
           </div>
+          <p className="mt-2 text-xs text-gray-500">
+            아래에서 입고 전표를 선택한 뒤, 상단 입력창에 바코드를 스캔해 주세요.
+            미등록 바코드는 자동으로 등록 모달이 열립니다.
+          </p>
         </div>
 
-        {/* 리스트 카드 */}
-        <div className="rounded-2xl border border-gray-200 bg-white shadow-sm">
-          {/* 상단 툴바 */}
-          <div className="flex items-center gap-3 border-b px-3 py-2 rounded-t-2xl">
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                onChange={(e) => toggleCheckAll(e.currentTarget.checked)}
-                checked={
-                  items.length > 0 &&
-                  items.every((it) => checked[it.id] === true)
-                }
-                aria-label="전체선택"
-              />
-              <span className="text-sm">전체선택</span>
-            </label>
-            <span className="text-sm text-gray-500">
-              총 {items.length}건, 선택 {selectedCount}건
-            </span>
-          </div>
+        {/* 2) 전표 선택 표 */}
+        <div className="border bg-white rounded-2xl shadow-sm p-4 space-y-3">
+          <h2 className="text-lg font-semibold">입고 전표 선택</h2>
 
-          {/* 테이블 */}
-          <div className="max-h-[560px] overflow-auto rounded-b-2xl">
+          <div className="max-h-[260px] overflow-auto border rounded-xl">
             <table
-              className={[
-                "w-full table-fixed border-collapse text-sm",
-                "[&>thead>tr>th]:sticky [&>thead>tr>th]:top-0 [&>thead>tr>th]:z-10",
-                "[&>thead>tr]:bg-gray-50 [&>thead>tr>th]:bg-gray-50",
-                "[&>thead>tr>th]:border-b border-gray-200",
-                "[&>thead>tr>th]:py-3 [&>tbody>tr>td]:py-3",
-              ].join(" ")}
+              className="w-full text-sm"
+              style={{ tableLayout: "fixed" }}
             >
-              <colgroup>
-                <col style={{ width: "60px" }} />
-                <col style={{ width: "120px" }} />
-                <col style={{ width: "220px" }} />
-                <col style={{ width: "220px" }} />
-                <col style={{ width: "auto" }} />
-                <col style={{ width: "120px" }} />
-                <col style={{ width: "140px" }} />
-              </colgroup>
-
-              <thead>
+              <thead className="bg-gray-50">
                 <tr>
-                  <th className="text-left px-2">선택</th>
-                  <th className="text-left px-2">주문일자</th>
-                  <th className="text-left px-2">바코드</th>
-                  <th className="text-left px-2">SKU</th>
-                  <th className="text-left px-2">상품명</th>
-                  <th className="text-right px-2">수량</th>
-                  <th className="text-center px-2">입고 처리</th>
+                  <th className="px-2 py-2 w-[8%] text-center">선택</th>
+                  <th className="px-2 py-2 w-[20%] text-center">주문번호</th>
+                  <th className="px-2 py-2 w-[15%] text-center">바코드</th>
+                  <th className="px-2 py-2 w-[22%] text-center">SKU</th>
+                  <th className="px-2 py-2 w-[28%] text-center">상품명</th>
+                  <th className="px-2 py-2 w-[7%] text-center">기대 수량</th>
                 </tr>
               </thead>
 
               <tbody>
-                {items.length === 0 ? (
+                {headerList.length === 0 && (
                   <tr>
                     <td
-                      className="py-10 text-center text-gray-500"
-                      colSpan={7}
+                      colSpan={6}
+                      className="py-6 text-center text-gray-500"
                     >
-                      스캔된 항목이 없습니다.
+                      입고 내역이 없습니다.
                     </td>
                   </tr>
-                ) : (
-                  items.map((row) => {
-                    const canProcess =
-                      typeof row.qty === "number" &&
-                      row.qty > 0 &&
-                      row.status === "완료대기";
-                    const isDone = row.status === "입고완료";
-                    return (
-                      <tr
-                        key={row.id}
-                        className="border-b border-gray-100 hover:bg-gray-50"
-                      >
-                        <td className="px-2 align-middle">
-                          <input
-                            type="checkbox"
-                            checked={!!checked[row.id]}
-                            onChange={(e) =>
-                              toggleCheck(row.id, e.currentTarget.checked)
-                            }
-                            aria-label={`select-${row.id}`}
-                          />
-                        </td>
-                        <td className="px-2 align-middle">{row.orderDate}</td>
-                        <td className="px-2 align-middle font-mono">
-                          {row.barcode}
-                        </td>
-                        <td className="px-2 align-middle">
-                          {row.sku ? (
-                            row.sku
-                          ) : (
-                            <span className="text-red-600 font-bold">
-                              등록 필요
-                            </span>
-                          )}
-                        </td>
-                        <td className="px-2 align-middle">
-                          {row.name ?? "-"}
-                        </td>
-                        <td className="px-2 align-middle text-right">
-                          <input
-                            ref={(el) => {
-                              qtyRefs.current[row.id] = el;
-                            }}
-                            type="number"
-                            inputMode="numeric"
-                            min={0}
-                            value={row.qty ?? ""}
-                            onChange={(e) => {
-                              const v = e.currentTarget.value;
-                              if (/^\d*$/.test(v)) {
-                                changeQty(
-                                  row.id,
-                                  v === "" ? undefined : Number(v)
-                                );
-                              }
-                            }}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") {
-                                e.preventDefault();
-                                const btn = document.querySelector(
-                                  `#confirm-btn-${row.id}`
-                                ) as HTMLButtonElement | null;
-                                btn?.focus();
-                              }
-                            }}
-                            className="w-[90px] rounded-md border px-2 py-1 text-right"
-                          />
-                        </td>
-                        <td className="px-2 align-middle text-center">
-                          {isDone ? (
-                            <span className="font-bold text-red-600">
-                              입고완료
-                            </span>
-                          ) : (
-                            <button
-                              id={`confirm-btn-${row.id}`}
-                              className={`rounded-md px-3 py-1.5 border ${
-                                canProcess
-                                  ? "bg-black text-white"
-                                  : "bg-gray-200 text-gray-600 cursor-not-allowed"
-                              }`}
-                              disabled={!canProcess}
-                              onClick={() => processRow(row.id)}
-                              title={
-                                canProcess
-                                  ? "이 행을 입고 처리합니다."
-                                  : row.status === "등록필요"
-                                  ? "바코드 등록 후 처리 가능합니다."
-                                  : "수량을 입력하거나 상태를 점검하세요."
-                              }
-                            >
-                              입고 처리
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })
                 )}
+
+                {headerList.map((h) => (
+                  <tr
+                    key={h.header_id}
+                    className="border-b hover:bg-gray-50 cursor-pointer"
+                    onClick={() => setSelectedHeader(h)}
+                  >
+                    <td className="px-2 py-2 text-center">
+                      <input
+                        type="radio"
+                        checked={selectedHeader?.header_id === h.header_id}
+                        onChange={() => setSelectedHeader(h)}
+                      />
+                    </td>
+                    <td className="px-2 py-2 truncate text-center">
+                      {h.order_no}
+                    </td>
+                    <td className="px-2 py-2 truncate text-center">
+                      {h.barcode ?? "-"}
+                    </td>
+                    <td className="px-2 py-2 truncate text-center">
+                      {h.sku ?? "-"}
+                    </td>
+                    <td className="px-2 py-2 truncate text-center">
+                      {h.name ?? "-"}
+                    </td>
+                    <td className="px-2 py-2 text-center">
+                      {h.expected_qty}
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
         </div>
 
-        {/* 안내 */}
-        <p className="text-xs text-gray-500">
-          참고: 더미 매핑 사용 중입니다. 실제 연동 시 바코드와 상품 매핑, 저장
-          API로 대체하세요.
-        </p>
+        {/* 3) 스캔 리스트 */}
+        <div className="border bg-white rounded-2xl shadow-sm">
+          <div className="border-b px-3 py-2 text-sm">스캔 목록</div>
 
-        {/* 바코드 등록 모달 */}
-        {showRegisterModal.open && (
-          <RegisterBarcodeModal
-            targetSku={showRegisterModal.targetSku}
-            targetName={showRegisterModal.targetName}
-            defaultBarcode={showRegisterModal.targetBarcode}
-            onClose={() =>
-              setShowRegisterModal({
-                open: false,
-                targetRowId: undefined,
-                targetSku: undefined,
-                targetName: undefined,
-                targetBarcode: undefined,
-              })
-            }
-            onSave={(sku, name, bc) => registerBarcode(sku, name, bc)}
-          />
-        )}
+          <div className="max-h-[480px] overflow-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-2 py-2">바코드</th>
+                  <th className="px-2 py-2">SKU</th>
+                  <th className="px-2 py-2">상품명</th>
+                  <th className="px-2 py-2 text-right">수량</th>
+                  <th className="px-2 py-2 text-center">처리</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                {items.length === 0 && (
+                  <tr>
+                    <td
+                      colSpan={5}
+                      className="py-6 text-center text-gray-500"
+                    >
+                      스캔 항목 없음
+                    </td>
+                  </tr>
+                )}
+
+                {items.map((row) => {
+                  const canProcess =
+                    row.status === "완료대기" &&
+                    typeof row.qty === "number" &&
+                    row.qty > 0;
+                  const isLoading = loadingRowId === row.id;
+
+                  return (
+                    <tr key={row.id} className="border-b">
+                      <td className="px-2 py-2">{row.barcode}</td>
+                      <td className="px-2 py-2">{row.sku ?? "-"}</td>
+                      <td className="px-2 py-2">{row.name ?? "-"}</td>
+
+                      <td className="px-2 py-2 text-right">
+                        <input
+                          ref={(el) => {
+                            qtyRefs.current[row.id] = el;
+                          }}
+                          type="number"
+                          className="w-20 border rounded-md px-2 py-1"
+                          value={row.qty ?? ""}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            if (/^\d*$/.test(v)) {
+                              changeQty(
+                                row.id,
+                                v ? Number(v) : undefined
+                              );
+                            }
+                          }}
+                        />
+                      </td>
+
+                      <td className="px-2 py-2 text-center">
+                        {row.status === "입고완료" ? (
+                          <span className="text-green-600 font-bold">
+                            완료
+                          </span>
+                        ) : (
+                          <button
+                            disabled={!canProcess || isLoading}
+                            onClick={() => void processRow(row)}
+                            className={
+                              canProcess && !isLoading
+                                ? "px-3 py-1 rounded-md bg-black text-white"
+                                : "px-3 py-1 rounded-md bg-gray-200 text-gray-500"
+                            }
+                          >
+                            {isLoading ? "처리중..." : "입고"}
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
 
-      {/* 토스트 메시지: 상단 중앙 */}
+      {/* 바코드 등록 모달 */}
+      <BarcodeRegisterModal
+        open={barcodeModalOpen}
+        form={barcodeForm}
+        saving={barcodeSaving}
+        error={barcodeModalError}
+        onChange={(next) => {
+          setBarcodeForm(next);
+          // 입력이 바뀌면 에러 메시지는 일단 지워준다
+          setBarcodeModalError(null);
+        }}
+        onClose={closeBarcodeRegisterModal}
+        onSubmit={submitBarcodeRegister}
+        onSkuLookup={(sku) => {
+          void handleSkuLookupInModal(sku);
+        }}
+      />
+
+      {/* 토스트 */}
       {toast && (
-        <div className="fixed top-4 left-1/2 z-50 -translate-x-1/2 transform">
-          <div className="rounded-full bg-black px-4 py-2 text-sm text-white shadow-lg">
-            {toast}
-          </div>
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 bg-black text-white px-4 py-2 rounded-full shadow-lg z-50 whitespace-pre-line">
+          {toast}
         </div>
       )}
     </>
-  );
-};
-
-// ────────────────────────────────────────────────────────────────
-// 바코드 등록 모달
-// - 바코드 / SKU / 상품명을 모두 입력 가능
-// - 기본값은 선택된 행의 값으로 채움
-const RegisterBarcodeModal: React.FC<{
-  targetSku?: string;
-  targetName?: string;
-  defaultBarcode?: string;
-  onClose: () => void;
-  onSave: (sku: string, name: string, barcode: string) => void;
-}> = ({ targetSku, targetName, defaultBarcode, onClose, onSave }) => {
-  const [sku, setSku] = useState(targetSku ?? "");
-  const [name, setName] = useState(targetName ?? "");
-  const [barcode, setBarcode] = useState(defaultBarcode ?? "");
-
-  const barcodeRef = useRef<HTMLInputElement>(null);
-  const skuRef = useRef<HTMLInputElement>(null);
-  const nameRef = useRef<HTMLInputElement>(null);
-  const saveBtnRef = useRef<HTMLButtonElement>(null);
-
-  useEffect(() => {
-    setTimeout(() => barcodeRef.current?.focus(), 0);
-  }, []);
-
-  const canSave =
-    sku.trim().length > 0 && name.trim().length > 0 && barcode.trim().length > 0;
-
-  const handleSave = () => {
-    if (!canSave) return;
-    onSave(sku.trim(), name.trim(), barcode.trim());
-  };
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/30"
-      role="dialog"
-      aria-modal="true"
-    >
-      <div className="w-[520px] rounded-2xl border bg-white shadow-lg">
-        <div className="border-b p-4 rounded-t-2xl">
-          <h2 className="text-lg font-semibold">바코드 등록</h2>
-          <p className="text-sm text-gray-600">
-            선택한 상품의 바코드, SKU, 상품명을 확인·수정한 뒤 저장하세요.
-          </p>
-        </div>
-
-        <div className="space-y-4 p-4">
-          {/* 바코드 */}
-          <div>
-            <label className="mb-1 block text-sm text-gray-700">바코드</label>
-            <input
-              ref={barcodeRef}
-              value={barcode}
-              onChange={(e) => setBarcode(e.currentTarget.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  skuRef.current?.focus();
-                }
-              }}
-              className="w-full rounded-xl border px-3 py-2 text-sm"
-              placeholder="예: 8801234567890"
-            />
-          </div>
-
-          {/* SKU */}
-          <div>
-            <label className="mb-1 block text-sm text-gray-700">SKU</label>
-            <input
-              ref={skuRef}
-              value={sku}
-              onChange={(e) => setSku(e.currentTarget.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  nameRef.current?.focus();
-                }
-              }}
-              className="w-full rounded-xl border px-3 py-2 text-sm"
-              placeholder="예: FD_SAMY_BULDAK_0200_01EA"
-            />
-          </div>
-
-          {/* 상품명 */}
-          <div>
-            <label className="mb-1 block text-sm text-gray-700">상품명</label>
-            <input
-              ref={nameRef}
-              value={name}
-              onChange={(e) => setName(e.currentTarget.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  if (canSave) {
-                    handleSave();
-                  } else {
-                    saveBtnRef.current?.focus();
-                  }
-                }
-              }}
-              className="w-full rounded-xl border px-3 py-2 text-sm"
-              placeholder="예: 삼양 불닭볶음면 200g"
-            />
-          </div>
-        </div>
-
-        <div className="flex justify-end gap-2 border-t p-4 rounded-b-2xl">
-          <button
-            onClick={onClose}
-            className="rounded-xl border px-3 py-2 hover:bg-gray-50"
-          >
-            취소
-          </button>
-          <button
-            ref={saveBtnRef}
-            onClick={handleSave}
-            disabled={!canSave}
-            className={`rounded-xl px-4 py-2 ${
-              canSave
-                ? "bg-black text-white"
-                : "cursor-not-allowed bg-gray-300 text-gray-600"
-            }`}
-            title={
-              canSave
-                ? "저장"
-                : "바코드, SKU, 상품명을 모두 입력하세요"
-            }
-          >
-            저장
-          </button>
-        </div>
-      </div>
-    </div>
   );
 };
 

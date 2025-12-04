@@ -1,10 +1,10 @@
 /* src/pages/outbound/cancel/OutboundCancelPage.tsx
- * 역할: 출고관리 > 출고취소 (조회 + 재출고/CSV)
- * 포인트:
- *  - 상단 키워드 대신 날짜 필터 박스(From/To)
- *  - 표 헤더: 체크박스 / 국가 / 주문번호 / 트래킹번호 / SKU / 상품명 / 출고수량 / 총가격
- *  - 선택 행 재출고 버튼 → /outbound/register/query 이동
- *  - 삭제 버튼 제거(요청 반영)
+ * 역할: 출고관리 > 출고취소 (조회 + 재출고/엑셀)
+ *
+ * 백엔드 연동:
+ *  - GET  /api/outbound/cancel/list     → outboundAdapter.fetchCancelList
+ *  - POST /api/outbound/cancel/reissue  → outboundAdapter.reissueFromCancel
+ *  - GET  /api/outbound/cancel/export   → outboundAdapter.exportCancelExcel
  */
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -22,13 +22,20 @@ import {
   SkeletonText,
 } from "@carbon/react";
 import { useNavigate } from "react-router-dom";
+import {
+  outboundAdapter,
+  type ActionEnvelope,
+  type OutboundCancelListResult,
+} from "@/api/adapters/outbound.adapter";
+import { handleError } from "@/utils/handleError";
 
 /* ────────────────────────────────────────────────────────────────
- * 타입, 더미 데이터, 헤더 정의
- *  - canceledAt은 화면 컬럼에는 없지만 날짜 필터에 사용
+ * 타입, 헤더 정의
  * ────────────────────────────────────────────────────────────────*/
 type Row = {
   id: string;
+  headerId: number;
+  itemId: number;
   country: string;
   orderNo: string;
   trackingNo: string;
@@ -36,66 +43,7 @@ type Row = {
   name: string;
   quantity: number;
   totalPrice: number;
-  canceledAt: string; // YYYY-MM-DD
 };
-
-const MOCK_ROWS: Row[] = [
-  {
-    id: "C-250101",
-    country: "SG",
-    orderNo: "SG20251022001",
-    trackingNo: "SING-TRK-10001",
-    sku: "FD_SAMY_BULDAKSA02_0200",
-    name: "불닭사리 200g",
-    quantity: 1,
-    totalPrice: 3000,
-    canceledAt: "2025-10-25",
-  },
-  {
-    id: "C-250102",
-    country: "MY",
-    orderNo: "MY20251023007",
-    trackingNo: "MY-EXP-883201",
-    sku: "FD_DSFS_MAXIMKAN05_MILDLOS030",
-    name: "맥심 모카라떼 30T",
-    quantity: 2,
-    totalPrice: 18000,
-    canceledAt: "2025-10-24",
-  },
-  {
-    id: "C-250103",
-    country: "PH",
-    orderNo: "PH20251023054",
-    trackingNo: "PH-LBC-776502",
-    sku: "FD_LOTTE_CHOCO_PIE12",
-    name: "초코파이 12입",
-    quantity: 1,
-    totalPrice: 4500,
-    canceledAt: "2025-10-24",
-  },
-  {
-    id: "C-250104",
-    country: "SG",
-    orderNo: "SG20251024012",
-    trackingNo: "SING-TRK-10028",
-    sku: "FD_SAMLIP_MINI_YAKGWA",
-    name: "삼립 미니약과",
-    quantity: 5,
-    totalPrice: 12500,
-    canceledAt: "2025-10-26",
-  },
-  {
-    id: "C-250105",
-    country: "TH",
-    orderNo: "TH20251024002",
-    trackingNo: "TH-KERRY-553001",
-    sku: "FD_OTTOGI_JINRAMEN_MILD5",
-    name: "진라면 순한맛 5입",
-    quantity: 2,
-    totalPrice: 6000,
-    canceledAt: "2025-10-23",
-  },
-];
 
 const ALL_HEADERS = [
   { key: "country", header: "국가" },
@@ -167,16 +115,16 @@ function DateFilterBox(props: {
 
 /* ────────────────────────────────────────────────────────────────
  * 상단 우측 액션 버튼
- *  - 재출고: 다건 가능 → 처리 후 /outbound/register/query 이동
- *  - 열 보이기 토글 + CSV
- *  - 삭제 버튼 제거(요청 반영)
+ *  - 재출고: 한 건 선택 기준
+ *  - 엑셀 내보내기: 선택된 헤더 기준
+ *  - 열 보이기
  * ────────────────────────────────────────────────────────────────*/
 function ButtonGroup(props: {
   selectedCount: number;
   visibleKeys: Set<string>;
   onToggleKey: (k: string) => void;
   onReopen?: () => void; // 재출고
-  onDownload?: () => void;
+  onDownload?: () => void; // 엑셀
 }) {
   const disNone = props.selectedCount === 0;
 
@@ -203,10 +151,13 @@ function ButtonGroup(props: {
         재출고
       </button>
       <button
-        className="rounded-xl border px-4 py-2 text-sm hover:bg-gray-50"
+        className={`rounded-xl px-4 py-2 text-sm ${
+          disNone ? "bg-gray-200 text-gray-500" : "border bg-white text-gray-800"
+        }`}
+        disabled={disNone}
         onClick={props.onDownload}
       >
-        다운로드(CSV)
+        엑셀 내보내기
       </button>
 
       <div className="relative" ref={menuRef}>
@@ -249,7 +200,7 @@ const AssistiveTextFix = () => (
       width: 1px !important;
       height: 1px !important;
       overflow: hidden !important;
-      clip: rect(1px, 1px, 1px) !important;
+      clip: rect(1px, 1px, 1px, 1px) !important;
       white-space: nowrap !important;
       border: 0 !important;
       padding: 0 !important;
@@ -288,7 +239,7 @@ export default function OutboundCancelPage() {
   });
 
   const [visibleKeys, setVisibleKeys] = useState<Set<string>>(
-    new Set(ALL_HEADERS.map((h) => h.key))
+    new Set(ALL_HEADERS.map((h) => h.key)),
   );
   const toggleKey = (k: string) =>
     setVisibleKeys((prev) => {
@@ -297,87 +248,107 @@ export default function OutboundCancelPage() {
       return next;
     });
 
-  /** 목록 조회 (현재는 더미 데이터 가공) */
-  async function fetchList(params: {
+  /* Row id → Row 매핑 (headerId 가져오기용) */
+  const rowMap = useMemo(() => {
+    const m = new Map<string, Row>();
+    rows.forEach((r) => m.set(r.id, r));
+    return m;
+  }, [rows]);
+
+// ─────────────────────────────────────────────
+// 목록 조회: /api/outbound/cancel/list
+// ─────────────────────────────────────────────
+async function fetchList(
+  options?: Partial<{
     page: number;
     pageSize: number;
-    sort?: { key?: string; dir?: "ASC" | "DESC" };
-    filter?: { from?: string; to?: string };
-  }) {
-    setLoading(true);
-    await new Promise((r) => setTimeout(r, 300));
+    filter: { from?: string; to?: string };
+  }>,
+) {
+  const nextPage = options?.page ?? page;
+  const nextPageSize = (options?.pageSize ?? pageSize) as 10 | 25;
+  const f = options?.filter ?? filter;
 
-    let data = [...MOCK_ROWS];
+  setLoading(true);
+  try {
+    const res = await outboundAdapter.fetchCancelList({
+      from_date: f.from,
+      to_date: f.to,
+      page: nextPage,
+      size: nextPageSize,
+    });
 
-    // 날짜 필터(취소일 기준)
-    const f = params.filter ?? {};
-    if (f.from) data = data.filter((r) => r.canceledAt >= f.from!);
-    if (f.to) data = data.filter((r) => r.canceledAt <= f.to!);
-
-    // 정렬
-    const s = params.sort;
-    if (s?.key) {
-      data.sort((a: any, b: any) => {
-        const av = a[s.key!];
-        const bv = b[s.key!];
-        if (av === bv) return 0;
-        const base = av > bv ? 1 : -1;
-        return s.dir === "DESC" ? -base : base;
-      });
+    if (!res.ok || !res.data) {
+      console.error("[OutboundCancel] list error", res.error);
+      setRows([]);
+      setTotalCount(0);
+      if (res.error) handleError(res.error);
+      return;
     }
 
-    // 페이징
-    const total = data.length;
-    const start = (params.page - 1) * params.pageSize;
-    setRows(data.slice(start, start + params.pageSize));
-    setTotalCount(total);
+    // 🔽 여기부터 수정
+    const raw = res.data as any;
+    const result = (raw.result ?? raw) as OutboundCancelListResult;
 
+    if (!result || !Array.isArray(result.items)) {
+      console.error("[OutboundCancel] invalid list payload", res.data);
+      setRows([]);
+      setTotalCount(0);
+      handleError({
+        code: "FRONT-UNEXPECTED-001",
+        message: "출고취소 목록 응답 형식이 올바르지 않습니다.",
+      } as any);
+      return;
+    }
+
+    const mapped: Row[] = result.items.map((item) => ({
+      id: `${item.header_id}-${item.item_id}`,
+      headerId: item.header_id,
+      itemId: item.item_id,
+      country: item.country,
+      orderNo: item.order_number,
+      trackingNo: item.tracking_number,
+      sku: item.sku,
+      name: item.product_name,
+      quantity: item.qty,
+      totalPrice: item.total_price,
+    }));
+
+    setRows(mapped);
+    setTotalCount(result.pagination?.count ?? mapped.length);
+  } catch (err) {
+    console.error("[OutboundCancel] list exception", err);
+    setRows([]);
+    setTotalCount(0);
+    handleError({
+      code: "FRONT-UNEXPECTED-001",
+      message: "출고취소 목록 조회 중 오류가 발생했습니다.",
+    } as any);
+  } finally {
     setLoading(false);
   }
+}
 
   useEffect(() => {
-    fetchList({ page, pageSize, sort, filter });
-  }, [page, pageSize, sort, filter]);
+    fetchList();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  // 현재 페이지 합계 (지금은 요약 텍스트에서 사용하지 않지만, 추후 확장 대비 유지)
+  // 현재 페이지 합계(for reference)
   const summary = useMemo(() => {
     const qty = rows.reduce((s, r) => s + (r.quantity || 0), 0);
     const amount = rows.reduce((s, r) => s + (r.totalPrice || 0), 0);
     return { qty, amount };
   }, [rows]);
-
-  // CSV 다운로드(표시 컬럼 기준)
-  const handleDownloadCSV = () => {
-    type K = keyof Row;
-    const cols = ALL_HEADERS.filter((h) => visibleKeys.has(h.key)).map(
-      (h) => h.key as K
-    );
-    const headerLine = ["id", ...cols].join(",");
-    const lines = rows.map((r) =>
-      [
-        '"' + r.id + '"',
-        ...cols.map((k) => `"${String(r[k]).replaceAll('"', '""')}"`),
-      ].join(",")
-    );
-    const csv = [headerLine, ...lines].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `outbound_cancel_${new Date()
-      .toISOString()
-      .slice(0, 10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
+  void summary; // for reference only
 
   // 표시 중인 헤더만 사용
   const visibleHeaders = useMemo(
     () => ALL_HEADERS.filter((h) => visibleKeys.has(h.key)),
-    [visibleKeys]
+    [visibleKeys],
   );
 
-  // Carbon rows로 변환(숫자 포맷 반영)
+  // Carbon rows로 변환
   const rowsForCarbon = rows.map((r) => {
     const base: any = { id: r.id };
     for (const h of visibleHeaders) {
@@ -395,7 +366,7 @@ export default function OutboundCancelPage() {
   // 총 페이지
   const maxPage = Math.max(1, Math.ceil(totalCount / pageSize));
 
-  // 헤더 클릭 시 정렬 상태 토글
+  // 헤더 클릭 시 정렬 상태 토글(프론트 정렬만, 서버 정렬은 이후 필요 시 추가)
   const wrapHeaderProps = (orig: any, header: any) => {
     const onClick = (e: any) => {
       if (orig?.onClick) orig.onClick(e);
@@ -405,7 +376,8 @@ export default function OutboundCancelPage() {
           prev.key !== key ? "ASC" : prev.dir === "ASC" ? "DESC" : "ASC";
         return { key, dir: nextDir };
       });
-      setPage(1);
+      // 정렬 바뀌면 1페이지로(지금은 프론트 정렬이지만 일단 재조회는 유지)
+      fetchList({ page: 1 });
     };
     return { ...orig, onClick };
   };
@@ -421,7 +393,7 @@ export default function OutboundCancelPage() {
     totalPrice: "120px",
   };
 
-  // 헤더 아이콘(색상 규칙 동일 유지)
+  // 헤더 아이콘
   const renderHeaderLabel = (headerKey: string, label: string) => {
     const isActive = sort.key === headerKey;
     const isDesc = isActive && sort.dir === "DESC";
@@ -451,10 +423,15 @@ export default function OutboundCancelPage() {
       <DateFilterBox
         value={filter}
         onChange={(v) => setFilter(v)}
-        onSubmit={() => setPage(1)}
-        onReset={() => {
-          setFilter({});
+        onSubmit={() => {
           setPage(1);
+          fetchList({ page: 1, filter });
+        }}
+        onReset={() => {
+          const empty: { from?: string; to?: string } = {};
+          setFilter(empty);
+          setPage(1);
+          fetchList({ page: 1, filter: empty });
         }}
       />
 
@@ -465,7 +442,124 @@ export default function OutboundCancelPage() {
         size="lg"
       >
         {({ rows, headers, getHeaderProps, getRowProps, getSelectionProps }) => {
-          const selectedCount = rows.filter((r: any) => r.isSelected).length;
+          const selectedRows = rows.filter((r: any) => r.isSelected);
+          const selectedCount = selectedRows.length;
+          const selectedIds = selectedRows.map((r: any) => String(r.id));
+          const selectedHeaderIds = Array.from(
+            new Set(
+              selectedIds
+                .map((id) => rowMap.get(id)?.headerId)
+                .filter((v): v is number => typeof v === "number"),
+            ),
+          );
+
+          // 재출고 클릭
+          const handleClickReopen = async () => {
+            if (selectedHeaderIds.length === 0) {
+              alert("재출고할 대상을 선택하세요.");
+              return;
+            }
+            if (selectedHeaderIds.length > 1) {
+              alert("재출고는 한 번에 한 건씩만 가능합니다.");
+              return;
+            }
+            const headerId = selectedHeaderIds[0];
+            if (!window.confirm("선택한 출고취소 건을 재출고하시겠습니까?")) {
+              return;
+            }
+
+            try {
+              setLoading(true);
+              const res = await outboundAdapter.reissueFromCancel({
+                header_ids: [headerId],
+                action: "reissue",
+              });
+              if (!res.ok || !res.data) {
+                if (res.error) {
+                  handleError(res.error);
+                } else {
+                  handleError({
+                    code: "FRONT-UNEXPECTED-001",
+                    message: "재출고 처리에 실패했습니다.",
+                  } as any);
+                }
+                return;
+              }
+
+              const envelope = res.data;
+              const result = envelope.result;
+              const orderNo = result?.order_number ?? "";
+
+              alert(
+                orderNo
+                  ? `주문번호 ${orderNo} 재출고 전표가 생성되었습니다.`
+                  : "재출고 전표가 생성되었습니다.",
+              );
+
+              // 목록 새로고침 + 출고등록 조회로 이동
+              fetchList({ page: 1 });
+              navigate("/outbound/register/query");
+            } catch (err) {
+              console.error("[OutboundCancel] reissue exception", err);
+              handleError({
+                code: "FRONT-UNEXPECTED-001",
+                message: "재출고 처리 중 오류가 발생했습니다.",
+              } as any);
+            } finally {
+              setLoading(false);
+            }
+          };
+
+          // 엑셀 내보내기 클릭
+          const handleClickExport = async () => {
+            if (selectedHeaderIds.length === 0) {
+              alert("엑셀로 내보낼 출고취소 건을 선택해 주세요.");
+              return;
+            }
+
+            const headerIdsStr = selectedHeaderIds.join(",");
+
+            try {
+              setLoading(true);
+              const res = await outboundAdapter.exportCancelExcel({
+                from_date: filter.from,
+                to_date: filter.to,
+                header_ids: headerIdsStr,
+              });
+
+              if (!res.ok || !res.data) {
+                if (res.error) {
+                  handleError(res.error);
+                } else {
+                  handleError({
+                    code: "FRONT-UNEXPECTED-001",
+                    message: "엑셀 내보내기에 실패했습니다.",
+                  } as any);
+                }
+                return;
+              }
+
+              const blob = res.data; // Blob
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              a.href = url;
+              a.download = `outbound_cancel_${new Date()
+                .toISOString()
+                .slice(0, 10)}.xlsx`;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+            } catch (err) {
+              console.error("[OutboundCancel] export exception", err);
+              handleError({
+                code: "FRONT-UNEXPECTED-001",
+                message: "엑셀 내보내기 중 오류가 발생했습니다.",
+              } as any);
+            } finally {
+              setLoading(false);
+            }
+          };
 
           return (
             <>
@@ -473,11 +567,8 @@ export default function OutboundCancelPage() {
                 selectedCount={selectedCount}
                 visibleKeys={visibleKeys}
                 onToggleKey={toggleKey}
-                onReopen={() => {
-                  alert(`더미: 선택 ${selectedCount}건 재출고 처리`);
-                  navigate("/outbound/register/query");
-                }}
-                onDownload={handleDownloadCSV}
+                onReopen={handleClickReopen}
+                onDownload={handleClickExport}
               />
 
               <TableContainer className="w-full overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-sm">
@@ -508,14 +599,16 @@ export default function OutboundCancelPage() {
                       <TableRow>
                         <TableSelectAll {...getSelectionProps()} />
                         {headers.map((header: any) => {
-                          const hp = getHeaderProps({
+                          const headerProps = getHeaderProps({
                             header,
                             isSortable: true,
                           });
+                          const { key, ...restProps } = headerProps as any;
+
                           return (
                             <TableHeader
                               key={header.key}
-                              {...wrapHeaderProps(hp, header)}
+                              {...wrapHeaderProps(restProps, header)}
                               className="text-gray-800 font-semibold text-base text-center"
                             >
                               {renderHeaderLabel(header.key, header.header)}
@@ -586,7 +679,6 @@ export default function OutboundCancelPage() {
                 </div>
 
                 <div className="flex flex-col gap-2 border-top border-gray-100 p-3 md:flex-row md:items-center md:justify-between">
-                  {/* ✅ 하단 요약: 총 건수만 표시 */}
                   <div className="text-sm text-gray-600">
                     총 <b>{fmtInt(totalCount)}</b>건
                   </div>
@@ -598,6 +690,7 @@ export default function OutboundCancelPage() {
                         const ps = Number(e.target.value) as 10 | 25;
                         setPageSize(ps);
                         setPage(1);
+                        fetchList({ page: 1, pageSize: ps });
                       }}
                     >
                       <option value={10}>10개씩</option>
@@ -607,7 +700,11 @@ export default function OutboundCancelPage() {
                       <button
                         className="rounded-md border px-2 py-1 disabled:opacity-40"
                         disabled={page <= 1 || loading}
-                        onClick={() => setPage((p) => Math.max(1, p - 1))}
+                        onClick={() => {
+                          const next = Math.max(1, page - 1);
+                          setPage(next);
+                          fetchList({ page: next });
+                        }}
                       >
                         이전
                       </button>
@@ -617,7 +714,11 @@ export default function OutboundCancelPage() {
                       <button
                         className="rounded-md border px-2 py-1 disabled:opacity-40"
                         disabled={page >= maxPage || loading}
-                        onClick={() => setPage((p) => p + 1)}
+                        onClick={() => {
+                          const next = Math.min(maxPage, page + 1);
+                          setPage(next);
+                          fetchList({ page: next });
+                        }}
                       >
                         다음
                       </button>

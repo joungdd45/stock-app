@@ -1,9 +1,19 @@
 // C:\dev\stock-app\stock-gui\src\pages\Stock\Status\StatusPage.tsx
-// 재고관리 > 재고현황 (TableBase 연동 / 더미데이터 포함 / 다건검색 + 조정 모달 + 엑셀 다운로드)
-// - 이 페이지에서만 체크박스 컬럼 완전 제거 (CSS 스코프)
+// 재고관리 > 재고현황
+// - TableBase 연동
+// - 백엔드 stockAdapter(status) 연동
+// - 다건검색(POST /api/stock/status/multi)
+// - 재고 조정 모달(POST /api/stock/status/action, action="adjust")
+// - 엑셀 다운로드(POST /api/stock/status/action, action="export")
+// - 이 페이지만 체크박스 컬럼 제거(CSS 스코프)
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import TableBase from "../../../components/common/table/TableBase";
+import {
+  stockAdapter,
+  type StockStatusItem,
+} from "@/api/adapters/stock.adapter";
+import { handleError } from "@/utils/handleError";
 
 /* ────────────────────────────────────────────────────────────────
  * 타입
@@ -14,40 +24,10 @@ type InventoryRow = {
   name: string;
   stockNow: number;
   stockAvail: number;
-  lastUnitPrice: number;
+  lastUnitPrice: number | null;
 };
 
 type SortDir = "ASC" | "DESC";
-
-/* ────────────────────────────────────────────────────────────────
- * 더미 데이터
- * ────────────────────────────────────────────────────────────────*/
-const MOCK_ROWS: InventoryRow[] = [
-  {
-    id: "INV-001",
-    sku: "FD_SAMY_BULDAKSA02_HAKBUL0200_01EA",
-    name: "삼양 불닭사리 핵불닭 200g",
-    stockNow: 320,
-    stockAvail: 310,
-    lastUnitPrice: 870,
-  },
-  {
-    id: "INV-002",
-    sku: "FD_DSFS_MAXIMKAN05_MILDLOS030_1BOX",
-    name: "맥심 카누 마일드 로스트 30입",
-    stockNow: 180,
-    stockAvail: 175,
-    lastUnitPrice: 11200,
-  },
-  {
-    id: "INV-003",
-    sku: "FD_OTTO_JINRAMYEON01EA",
-    name: "오뚜기 진라면 순한맛 120g",
-    stockNow: 950,
-    stockAvail: 930,
-    lastUnitPrice: 540,
-  },
-];
 
 /* ────────────────────────────────────────────────────────────────
  * 헤더 정의(TableBase 규격)
@@ -61,7 +41,11 @@ const TABLE_HEADERS = [
   { key: "adjust", header: "조정", width: "110px", sortable: false },
 ] as const;
 
-const NUMERIC_KEYS = new Set<keyof InventoryRow>(["stockNow", "stockAvail", "lastUnitPrice"]);
+const NUMERIC_KEYS = new Set<keyof InventoryRow>([
+  "stockNow",
+  "stockAvail",
+  "lastUnitPrice",
+]);
 
 /* ────────────────────────────────────────────────────────────────
  * 유틸
@@ -73,13 +57,13 @@ function parseTerms(input?: string): string[] {
   if (!input) return [];
   const terms = input
     .split(/[\n\r,;|\t ]+/g)
-    .map((s) => s.trim().toLowerCase())
+    .map((s) => s.trim())
     .filter(Boolean);
   return Array.from(new Set(terms));
 }
 
 /* ────────────────────────────────────────────────────────────────
- * 다건검색 모달
+ * 다건검색 모달 (SKU 기준)
  * ────────────────────────────────────────────────────────────────*/
 function BulkSearchModal({
   open,
@@ -103,8 +87,11 @@ function BulkSearchModal({
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/30 p-3 md:items-center">
       <div className="w-full max-w-xl rounded-2xl bg-white p-4 shadow-xl">
         <div className="mb-3 flex items-center justify-between">
-          <h3 className="text-base font-semibold">다건 검색</h3>
-          <button className="rounded-md px-2 py-1 text-sm text-gray-500 hover:bg-gray-100" onClick={onClose}>
+          <h3 className="text-base font-semibold">다건 검색 (SKU)</h3>
+          <button
+            className="rounded-md px-2 py-1 text-sm text-gray-500 hover:bg-gray-100"
+            onClick={onClose}
+          >
             닫기
           </button>
         </div>
@@ -112,17 +99,20 @@ function BulkSearchModal({
           <textarea
             className="h-48 w-full rounded-lg border px-3 py-2 text-sm"
             placeholder={
-              "여러 키워드를 줄바꿈/콤마/세미콜론/탭/공백/| 로 구분해 입력하세요.\n예)\nFD_SAMY_BULDAK\n진라면\nKANU 30"
+              "여러 SKU를 줄바꿈/콤마/세미콜론/탭/공백/| 로 구분해 입력하세요.\n예)\nsku-001\nEXIST-BULK-001\nNO-BARCODE-001"
             }
             value={val}
             onChange={(e) => setVal(e.target.value)}
           />
           <p className="mt-2 text-xs text-gray-500">
-            입력된 모든 토큰을 OR 조건으로 검색합니다. (SKU, 상품명 부분 일치)
+            입력된 SKU들을 기준으로 재고를 다건 조회합니다.
           </p>
         </div>
         <div className="mt-4 flex justify-end gap-2">
-          <button className="rounded-xl border px-4 py-2 text-sm hover:bg-gray-50" onClick={onClose}>
+          <button
+            className="rounded-xl border px-4 py-2 text-sm hover:bg-gray-50"
+            onClick={onClose}
+          >
             취소
           </button>
           <button
@@ -173,7 +163,10 @@ function AdjustModal({
       <div className="w-full max-w-lg rounded-2xl bg-white p-4 shadow-xl">
         <div className="mb-3 flex items-center justify-between">
           <h3 className="text-base font-semibold">재고 조정</h3>
-          <button className="rounded-md px-2 py-1 text-sm text-gray-500 hover:bg-gray-100" onClick={onClose}>
+          <button
+            className="rounded-md px-2 py-1 text-sm text-gray-500 hover:bg-gray-100"
+            onClick={onClose}
+          >
             닫기
           </button>
         </div>
@@ -184,14 +177,16 @@ function AdjustModal({
           </div>
 
           <label className="flex flex-col text-sm">
-            <span className="mb-1 text-gray-600">현 재고</span>
+            <span className="mb-1 text-gray-600">현 재고(최종 수량)</span>
             <input
               type="number"
               className="rounded-lg border px-3 py-2"
               value={Number.isFinite(qty) ? qty : 0}
               onChange={(e) => setQty(Number(e.target.value))}
             />
-            <span className="mt-1 text-xs text-gray-500">원하는 최종 수량을 입력하세요.</span>
+            <span className="mt-1 text-xs text-gray-500">
+              조정 후 최종 재고 수량을 입력하세요.
+            </span>
           </label>
 
           <label className="flex flex-col text-sm">
@@ -207,7 +202,10 @@ function AdjustModal({
         </div>
 
         <div className="mt-4 flex justify-end gap-2">
-          <button className="rounded-xl border px-4 py-2 text-sm hover:bg-gray-50" onClick={onClose}>
+          <button
+            className="rounded-xl border px-4 py-2 text-sm hover:bg-gray-50"
+            onClick={onClose}
+          >
             취소
           </button>
           <button
@@ -224,13 +222,10 @@ function AdjustModal({
 
 /* ────────────────────────────────────────────────────────────────
  * 이 페이지 전용 스타일 (체크박스 컬럼 제거)
- *  - colgroup 첫 번째 col
- *  - 헤더/바디의 체크박스 셀
  * ────────────────────────────────────────────────────────────────*/
 function StockStatusStyles() {
   return (
     <style>{`
-      /* 이 페이지 범위 안에서만 적용 */
       .stock-status-page table col:first-child {
         display: none !important;
       }
@@ -244,27 +239,115 @@ function StockStatusStyles() {
 }
 
 /* ────────────────────────────────────────────────────────────────
- * 메인
+ * 메인 컴포넌트
  * ────────────────────────────────────────────────────────────────*/
 export default function StatusPage() {
-  const [sort, setSort] = useState<{ key?: string; dir?: SortDir }>({ key: "sku", dir: "ASC" });
+  const [sort, setSort] = useState<{ key?: string; dir?: SortDir }>({
+    key: "sku",
+    dir: "ASC",
+  });
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
   const [filter, setFilter] = useState<any>({ keyword: "" });
 
+  const [loading, setLoading] = useState(false);
+  const [items, setItems] = useState<StockStatusItem[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+
   const [bulkOpen, setBulkOpen] = useState(false);
+  const [multiSkus, setMultiSkus] = useState<string[] | null>(null);
 
   const [adjustOpen, setAdjustOpen] = useState(false);
-  const [adjustTarget, setAdjustTarget] = useState<{ sku: string; current: number } | null>(null);
+  const [adjustTarget, setAdjustTarget] =
+    useState<{ sku: string; current: number } | null>(null);
 
+  const [reloadKey, setReloadKey] = useState(0);
+
+  /* 데이터 로딩 */
+  useEffect(() => {
+    let cancelled = false;
+
+    const fetchData = async () => {
+      setLoading(true);
+      try {
+        if (multiSkus && multiSkus.length > 0) {
+          // SKU 다건 조회
+          const res = await stockAdapter.multiStatus({
+            skus: multiSkus,
+            page,
+            size: pageSize,
+            sort_by: "sku",
+            order: sort.dir === "DESC" ? "desc" : "asc",
+          });
+          if (!cancelled) {
+            if (res.ok && res.data) {
+              setItems(res.data.items ?? []);
+              setTotalCount(res.data.count ?? res.data.items?.length ?? 0);
+            } else {
+              console.error("status multi error", res.error);
+              if (!res.ok && res.error) {
+                handleError(res.error);
+              }
+              setItems([]);
+              setTotalCount(0);
+            }
+          }
+        } else {
+          // 기본 재고 현황 목록
+          const res = await stockAdapter.getStatusList({
+            page,
+            size: pageSize,
+            keyword: filter.keyword ?? undefined,
+          });
+          if (!cancelled) {
+            if (res.ok && res.data) {
+              setItems(res.data.items ?? []);
+              setTotalCount(res.data.count ?? res.data.items?.length ?? 0);
+            } else {
+              console.error("status list error", res.error);
+              if (!res.ok && res.error) {
+                handleError(res.error);
+              }
+              setItems([]);
+              setTotalCount(0);
+            }
+          }
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+
+    fetchData();
+    return () => {
+      cancelled = true;
+    };
+  }, [page, pageSize, sort.dir, filter.keyword, multiSkus, reloadKey]);
+
+  // filter 초기화 시 다건검색 해제
+  useEffect(() => {
+    if (!filter || !filter.keyword) {
+      setMultiSkus(null);
+    }
+  }, [filter]);
+
+  /* 정렬 + 화면용 가공 (여기서 0재고 제거) */
   const processed = useMemo(() => {
-    const terms = parseTerms(filter.keyword);
-    let list = MOCK_ROWS.filter((r) => {
-      if (terms.length === 0) return true;
-      const sku = r.sku.toLowerCase();
-      const name = r.name.toLowerCase();
-      return terms.some((t) => sku.includes(t) || name.includes(t));
-    });
+    let list: InventoryRow[] = items
+      .map((it) => ({
+        id: it.sku,
+        sku: it.sku,
+        name: it.name,
+        stockNow: it.current_qty,
+        stockAvail: it.available_qty,
+        lastUnitPrice: it.last_price,
+      }))
+      // 🔥 재고가 전부 0인 항목은 숨김
+      .filter(
+        (r) =>
+          (r.stockNow ?? 0) > 0 ||
+          (r.stockAvail ?? 0) > 0,
+      );
 
     const key = sort.key;
     if (key && key !== "adjust") {
@@ -273,7 +356,7 @@ export default function StatusPage() {
         const bv = b[key as keyof InventoryRow] as any;
 
         if (NUMERIC_KEYS.has(key as keyof InventoryRow)) {
-          const diff = (Number(av) || 0) - (Number(bv) || 0);
+          const diff = (Number(av ?? 0) || 0) - (Number(bv ?? 0) || 0);
           return sort.dir === "DESC" ? -diff : diff;
         }
         const comp = String(av ?? "").localeCompare(String(bv ?? ""));
@@ -281,12 +364,9 @@ export default function StatusPage() {
       });
     }
 
-    const total = list.length;
-    const start = (page - 1) * pageSize;
-    const paged = list.slice(start, start + pageSize);
-
-    return { total, rows: paged };
-  }, [filter, sort, page, pageSize]);
+    // 여기서는 실제 화면에 보이는 건수 기준
+    return { total: list.length, rows: list };
+  }, [items, sort]);
 
   const tableRows = useMemo(
     () =>
@@ -296,7 +376,8 @@ export default function StatusPage() {
         name: r.name,
         stockNow: fmt(r.stockNow),
         stockAvail: fmt(r.stockAvail),
-        lastUnitPrice: fmt(r.lastUnitPrice),
+        lastUnitPrice:
+          r.lastUnitPrice != null ? fmt(r.lastUnitPrice) : "-",
         adjust: (
           <button
             className="rounded-lg bg-emerald-600 px-3 py-1 text-xs text-white"
@@ -309,27 +390,68 @@ export default function StatusPage() {
           </button>
         ),
       })),
-    [processed.rows]
+    [processed.rows],
   );
 
-  // 전체 재고현황 엑셀(CSV) 다운로드
-  const handleExport = () => {
-    const header = ["SKU", "상품명", "현 재고", "가용재고", "최근 단가"];
-    const lines = [
-      header.join(","),
-      ...MOCK_ROWS.map((r) => {
-        const safeName = `"${String(r.name).replace(/"/g, '""')}"`;
-        return [r.sku, safeName, r.stockNow, r.stockAvail, r.lastUnitPrice].join(",");
-      }),
-    ];
-    const csv = "\uFEFF" + lines.join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `stock_status_${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+  /* 엑셀 다운로드: status.action(action=export) */
+  const handleExport = async () => {
+    try {
+      const skusToExport = items
+        .map((it) => ({
+          sku: it.sku,
+          current_qty: it.current_qty,
+          available_qty: it.available_qty,
+        }))
+        // 엑셀도 0재고는 빼고 싶다면 같은 필터 적용
+        .filter(
+          (r) =>
+            (r.current_qty ?? 0) > 0 ||
+            (r.available_qty ?? 0) > 0,
+        )
+        .map((r) => r.sku);
+
+      if (!skusToExport.length) {
+        window.alert("내보낼 재고 데이터가 없습니다.");
+        return;
+      }
+
+      const res = await stockAdapter.statusAction({
+        action: "export",
+        selected_skus: skusToExport,
+        memo: "재고현황 엑셀 다운로드",
+      });
+
+      if (!res.ok || !res.data) {
+        console.error("status export error", res.error);
+        if (res.error) {
+          handleError(res.error);
+        } else {
+          window.alert("엑셀 다운로드 중 오류가 발생했습니다.");
+        }
+        return;
+      }
+
+      const { file_name, content_type, content_base64 } = res.data;
+      const byteString = window.atob(content_base64);
+      const byteNumbers = new Array(byteString.length);
+      for (let i = 0; i < byteString.length; i += 1) {
+        byteNumbers[i] = byteString.charCodeAt(i);
+      }
+      const byteArray = new Uint8Array(byteNumbers);
+      const blob = new Blob([byteArray], { type: content_type });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download =
+        file_name ||
+        `stock_status_${new Date().toISOString().slice(0, 10)}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("status export exception", err);
+      window.alert("엑셀 다운로드 처리 중 예외가 발생했습니다.");
+    }
   };
 
   return (
@@ -341,7 +463,7 @@ export default function StatusPage() {
       <TableBase
         rows={tableRows}
         headers={TABLE_HEADERS as any}
-        loading={false}
+        loading={loading}
         page={page}
         pageSize={pageSize}
         total={processed.total}
@@ -350,7 +472,7 @@ export default function StatusPage() {
         sort={sort}
         onSortChange={(next) => setSort(next)}
         filter={filter}
-        onFilterChange={setFilter}
+        onFilterChange={(v) => setFilter(v)}
         actions={
           <div className="flex gap-2">
             <button
@@ -369,28 +491,55 @@ export default function StatusPage() {
         }
       />
 
+      {/* 다건 검색 모달 */}
       <BulkSearchModal
         open={bulkOpen}
         defaultValue={filter.keyword}
         onClose={() => setBulkOpen(false)}
         onApply={(value) => {
+          const terms = parseTerms(value);
+          setMultiSkus(terms.length ? terms : null);
           setFilter({ keyword: value });
           setPage(1);
         }}
       />
 
+      {/* 재고 조정 모달 */}
       <AdjustModal
         open={adjustOpen}
         sku={adjustTarget?.sku}
         current={adjustTarget?.current}
         onClose={() => setAdjustOpen(false)}
-        onSave={(nextQty: number, reason?: string) => {
-          alert(
-            `더미 처리: ${adjustTarget?.sku} 재고를 ${nextQty}로 변경\n사유: ${
-              reason && reason.trim().length ? reason : "-"
-            }`
-          );
-          setAdjustOpen(false);
+        onSave={async (nextQty: number, reason?: string) => {
+          if (!adjustTarget?.sku) {
+            setAdjustOpen(false);
+            return;
+          }
+          try {
+            const res = await stockAdapter.statusAction({
+              action: "adjust",
+              sku: adjustTarget.sku,
+              final_qty: nextQty,
+              memo: reason,
+              selected_skus: [adjustTarget.sku],
+            });
+            if (!res.ok) {
+              console.error("status adjust error", res.error);
+              if (res.error) {
+                handleError(res.error);
+              } else {
+                window.alert("재고 조정 중 오류가 발생했습니다.");
+              }
+            } else {
+              window.alert("재고 조정이 완료되었습니다.");
+              setReloadKey((k) => k + 1);
+            }
+          } catch (err) {
+            console.error("status adjust exception", err);
+            window.alert("재고 조정 처리 중 예외가 발생했습니다.");
+          } finally {
+            setAdjustOpen(false);
+          }
         }}
       />
     </div>

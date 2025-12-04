@@ -1,37 +1,42 @@
 /**
  * UI: 출고 처리 (라운드 카드 스타일 + 스티키 헤더 테이블)
  * File: src/pages/Outbound/Process/ProcessPage.tsx
- *
- * - 상단 스캔 카드: 송장/바코드 + 중량(kg) + 완료 버튼
- * - 리스트 카드: SKU / 바코드 / 상품명 / 요구수량 / 스캔수량 / 잔여 / 상태
- * - 요구수량 초과 스캔 시 경고 및 차단
- * - 중량(kg) 미입력 시 완료 버튼 비활성화
- * - shipDate KST YYYY-MM-DD
  */
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  outboundAdapter,
+  type OutboundProcessInvoiceResult,
+  type OutboundProcessScanResult,
+  type OutboundProcessWeightResult,
+  type OutboundProcessConfirmResult,
+  type OutboundProcessStateResult,
+  type ProductLookupBySkuResult,
+} from "@/api/adapters/outbound.adapter";
+import { handleError } from "@/utils/handleError";
 
-// ────────────────────────────────────────────────────────────────
-// 타입
-type OutboundItem = {
+/* 타입 */
+
+type RowItem = {
   id: string;
   sku: string;
   name: string;
-  barcode: string; // 고정 표시용
+  barcode: string;
   requiredQty: number;
   scannedQty: number;
 };
 
 type Shipment = {
   invoiceNo: string;
-  shipDate: string; // KST YYYY-MM-DD
-  weightKg?: number;
-  items: OutboundItem[];
-  status: "대기" | "완료대기" | "출고완료";
+  shipDate: string;
+  weightG?: number;   // ✅ g 단위로 변경
+  items: RowItem[];
+  status: string;
+  overallStatus?: string;
 };
 
-// ────────────────────────────────────────────────────────────────
-// 헬퍼
+/* 헬퍼 */
+
 const uid = () => Math.random().toString(36).slice(2, 10);
 
 const todayKST = (): string => {
@@ -43,43 +48,82 @@ const todayKST = (): string => {
   return `${y}-${m}-${d}`;
 };
 
-// 더미: 송장번호 → 주문 품목 목록(상품 바코드 포함)
-async function mockFetchOrderByInvoice(invoiceNo: string): Promise<OutboundItem[]> {
-  const seed = Number(invoiceNo.replace(/\D/g, "").slice(-1) || "3");
-  const base: Array<{ sku: string; name: string; barcode: string }> = [
-    { sku: "FD_SAMY_BULDAK_0200_01EA", name: "삼양 불닭볶음면 200g", barcode: "880000000001" },
-    { sku: "FD_SAMLIP_MINIYAK_120_3PK", name: "삼립 미니약과 120g x3", barcode: "880000000002" },
-    { sku: "FD_MAXIM_KANU_MILD_030_1BOX", name: "맥심 카누 마일드 30입 1BOX", barcode: "880000000003" },
-  ];
-  return base.map((b, i) => ({
-    id: uid(),
-    sku: b.sku,
-    name: b.name,
-    barcode: b.barcode,
-    requiredQty: ((i + seed) % 3) + 1, // 1 to 3
-    scannedQty: 0,
-  }));
+/**
+ * apiHub 응답이
+ *  - data = { result: T }
+ *  - data = { item: T }
+ *  - data = T
+ * 세 경우 모두를 안전하게 처리
+ */
+function unwrapResult<T>(data: unknown): T | null {
+  if (!data) return null;
+  const anyData = data as any;
+  if (anyData.result) return anyData.result as T;
+  if (anyData.item) return anyData.item as T;
+  return anyData as T;
 }
 
-// 더미: 바코드 → SKU/상품명(스캔 매칭용)
-function mockResolveBarcode(code: string): { sku: string; name: string } | null {
-  const dict: Record<string, { sku: string; name: string }> = {
-    "880000000001": { sku: "FD_SAMY_BULDAK_0200_01EA", name: "삼양 불닭볶음면 200g" },
-    "880000000002": { sku: "FD_SAMLIP_MINIYAK_120_3PK", name: "삼립 미니약과 120g x3" },
-    "880000000003": { sku: "FD_MAXIM_KANU_MILD_030_1BOX", name: "맥심 카누 마일드 30입 1BOX" },
+function mapInvoiceToShipment(result: OutboundProcessInvoiceResult): Shipment {
+  return {
+    invoiceNo: result.invoice_no,
+    shipDate: todayKST(),
+    // ✅ 백엔드가 넘겨주는 g 값을 그대로 사용
+    weightG:
+      typeof result.weight_g === "number" && result.weight_g > 0
+        ? result.weight_g
+        : undefined,
+    status: result.status,
+    overallStatus: result.overall_status ?? undefined,
+    items: result.items.map((it) => ({
+      id: String(it.item_id ?? uid()),
+      sku: it.sku,
+      name: "",
+      barcode: "",
+      requiredQty: it.qty,
+      scannedQty: it.scanned_qty,
+    })),
   };
-  if (dict[code]) return dict[code];
-  if (/^\d{6,}$/.test(code)) {
-    const tail = Number(code.slice(-1));
-    if (tail % 3 === 1) return dict["880000000001"];
-    if (tail % 3 === 2) return dict["880000000002"];
-    return dict["880000000003"];
-  }
-  return null;
 }
 
-// ────────────────────────────────────────────────────────────────
-// 뱃지 컴포넌트 (일치/부족/과다)
+/**
+ * 송장 품목(SKU 리스트)에 대해 lookup_by_sku 호출해서
+ * 상품명/바코드 보강
+ */
+async function enrichShipmentWithProducts(
+  base: Shipment,
+): Promise<Shipment> {
+  const uniqueSkus = Array.from(
+    new Set(base.items.map((i) => i.sku).filter(Boolean)),
+  );
+  if (uniqueSkus.length === 0) return base;
+
+  const skuMap: Record<string, { name?: string; barcode?: string }> = {};
+
+  await Promise.all(
+    uniqueSkus.map(async (sku) => {
+      const res = await outboundAdapter.lookupProductBySku(sku);
+      if (!res.ok || !res.data) return;
+      const item = unwrapResult<ProductLookupBySkuResult>(res.data);
+      if (!item) return;
+      skuMap[sku] = {
+        name: item.name,
+        barcode: item.barcode ?? "",
+      };
+    }),
+  );
+
+  return {
+    ...base,
+    items: base.items.map((it) => ({
+      ...it,
+      name: skuMap[it.sku]?.name ?? it.name,
+      barcode: skuMap[it.sku]?.barcode ?? it.barcode,
+    })),
+  };
+}
+
+/* 뱃지 */
+
 function StatusBadge({ status }: { status: "ok" | "warn" | "over" }) {
   if (status === "ok") {
     return (
@@ -102,102 +146,330 @@ function StatusBadge({ status }: { status: "ok" | "warn" | "over" }) {
   );
 }
 
-// ────────────────────────────────────────────────────────────────
-// 메인
+/* 메인 */
+
 export default function ProcessPage() {
-  // 입력 refs
   const invoiceRef = useRef<HTMLInputElement>(null);
   const barcodeRef = useRef<HTMLInputElement>(null);
 
-  // 상태
   const [invoiceInput, setInvoiceInput] = useState("");
   const [barcodeInput, setBarcodeInput] = useState("");
+
   const [shipment, setShipment] = useState<Shipment | null>(null);
 
-  // 포커스 유틸
+  const [loadingInvoice, setLoadingInvoice] = useState(false);
+  const [loadingScan, setLoadingScan] = useState(false);
+  const [loadingConfirm, setLoadingConfirm] = useState(false);
+
   const focusInvoice = () => setTimeout(() => invoiceRef.current?.focus(), 0);
-  const focusBarcode = () => setTimeout(() => barcodeRef.current?.focus(), 0);
+  const focusBarcode = () =>
+    setTimeout(() => barcodeRef.current?.focus(), 0);
 
-  // 송장 엔터: 품목 로드
-  const handleInvoiceEnter = async () => {
-    const inv = invoiceInput.trim();
-    if (!inv) return focusInvoice();
-    const items = await mockFetchOrderByInvoice(inv);
-    setShipment({
-      invoiceNo: inv,
-      shipDate: todayKST(),
-      weightKg: undefined,
-      items,
-      status: "대기",
-    });
-    setBarcodeInput("");
-    focusBarcode();
-  };
+  /* 초기 핑 */
 
-  // 바코드 엔터: 수량 증가(초과 차단 + 경고)
-  const handleBarcodeEnter = () => {
-    if (!shipment) return focusInvoice();
-    const code = barcodeInput.trim();
-    if (!code) return focusBarcode();
-
-    const resolved = mockResolveBarcode(code);
-    if (!resolved) {
-      alert("등록되지 않은 바코드입니다. (더미 경고)");
-      setBarcodeInput("");
-      return focusBarcode();
-    }
-
-    const { sku } = resolved;
-
-    setShipment((prev) => {
-      if (!prev) return prev;
-      const nextItems = prev.items.map((it) => {
-        if (it.sku !== sku) return it;
-        if (it.scannedQty >= it.requiredQty) {
-          alert("해당 주문의 수량보다 많습니다.");
-          return it;
-        }
-        return { ...it, scannedQty: it.scannedQty + 1 };
-      });
-      return { ...prev, items: nextItems };
-    });
-
-    setBarcodeInput("");
-    focusBarcode();
-  };
-
-  // 완료 조건
-  const allMatch = useMemo(
-    () => !!shipment && shipment.items.every((it) => it.scannedQty === it.requiredQty),
-    [shipment]
-  );
-  const weightOk = useMemo(
-    () => !!shipment && typeof shipment.weightKg === "number" && (shipment.weightKg ?? 0) > 0,
-    [shipment]
-  );
-  const canComplete = !!shipment && allMatch && weightOk && shipment.status !== "출고완료";
-
-  const completeShipment = () => {
-    if (!shipment || !canComplete) return;
-    setShipment({ ...shipment, status: "출고완료" });
-    alert("출고 처리 완료되었습니다. (더미 처리)");
-    focusInvoice();
-  };
-
-  // 초기 포커스
   useEffect(() => {
     focusInvoice();
+    outboundAdapter.pingProcess().then((res) => {
+      if (!res.ok) {
+        handleError(res.error);
+      }
+    });
   }, []);
 
-  // 레이아웃: 라운드 카드 + 스티키 헤더 테이블
+  /* 송장 엔터: 품목 로드 */
+
+  const handleInvoiceEnter = async () => {
+    const inv = invoiceInput.trim();
+    if (!inv) {
+      focusInvoice();
+      return;
+    }
+
+    setLoadingInvoice(true);
+    try {
+      const res = await outboundAdapter.fetchProcessInvoice(inv);
+
+      if (!res.ok) {
+        handleError(res.error);
+        return;
+      }
+      if (!res.data) {
+        handleError({
+          code: "FRONT-UNEXPECTED-001",
+          message: "송장 품목을 불러오지 못했습니다.",
+        } as any);
+        return;
+      }
+
+      const result = unwrapResult<OutboundProcessInvoiceResult>(res.data);
+      if (!result || !result.items || result.items.length === 0) {
+        alert("해당 송장에 대한 출고 품목을 찾을 수 없습니다.");
+        return;
+      }
+
+      const mapped = mapInvoiceToShipment(result);
+      const enriched = await enrichShipmentWithProducts(mapped);
+
+      setShipment(enriched);
+      setBarcodeInput("");
+      focusBarcode();
+    } catch (err: any) {
+      console.error(err);
+      handleError(err as any);
+    } finally {
+      setLoadingInvoice(false);
+    }
+  };
+
+  /* 바코드 엔터: 스캔(+1) */
+
+  const handleBarcodeEnter = async () => {
+    if (!shipment) {
+      focusInvoice();
+      return;
+    }
+
+    const code = barcodeInput.trim();
+    if (!code) {
+      focusBarcode();
+      return;
+    }
+
+    setLoadingScan(true);
+    try {
+      const res = await outboundAdapter.scanProcessItem({
+        invoice_no: shipment.invoiceNo,
+        barcode: code,
+      });
+
+      if (!res.ok) {
+        handleError(res.error);
+        setBarcodeInput("");
+        focusBarcode();
+        return;
+      }
+      if (!res.data) {
+        handleError({
+          code: "FRONT-UNEXPECTED-001",
+          message: "스캔 처리에 실패했습니다.",
+        } as any);
+        setBarcodeInput("");
+        focusBarcode();
+        return;
+      }
+
+      const raw = res.data as any;
+      let scannedItem: any = null;
+
+      if (raw.result && raw.result.item) {
+        scannedItem = raw.result.item;
+      } else if (raw.item) {
+        scannedItem = raw.item;
+      } else {
+        if (
+          raw &&
+          typeof raw.sku === "string" &&
+          typeof raw.qty === "number" &&
+          typeof raw.scanned_qty === "number"
+        ) {
+          scannedItem = raw;
+        }
+      }
+
+      if (
+        !scannedItem ||
+        typeof scannedItem.sku !== "string" ||
+        typeof scannedItem.qty !== "number" ||
+        typeof scannedItem.scanned_qty !== "number"
+      ) {
+        alert("스캔 결과를 찾을 수 없습니다.");
+        setBarcodeInput("");
+        focusBarcode();
+        return;
+      }
+
+      setShipment((prev) => {
+        if (!prev) return prev;
+        const nextItems = prev.items.map((it) =>
+          it.sku === scannedItem.sku
+            ? {
+                ...it,
+                requiredQty: scannedItem.qty,
+                scannedQty: scannedItem.scanned_qty,
+              }
+            : it,
+        );
+        return { ...prev, items: nextItems };
+      });
+
+      setBarcodeInput("");
+      focusBarcode();
+    } catch (err: any) {
+      console.error(err);
+      handleError(err as any);
+    } finally {
+      setLoadingScan(false);
+    }
+  };
+
+  /* 중량 입력/블러 (g 단위) */
+
+  const handleWeightChange = (value: string) => {
+    setShipment((prev) =>
+      prev
+        ? {
+            ...prev,
+            weightG: value === "" ? undefined : Number(value),
+          }
+        : prev,
+    );
+  };
+
+  const handleWeightBlur = async () => {
+    if (!shipment || !shipment.weightG || shipment.weightG <= 0) return;
+
+    try {
+      const res = await outboundAdapter.setProcessWeight({
+        invoice_no: shipment.invoiceNo,
+        // ✅ 그대로 g 단위 전송
+        weight_g: Math.round(shipment.weightG),
+      });
+
+      if (!res.ok) {
+        handleError(res.error);
+        return;
+      }
+      if (!res.data) {
+        handleError({
+          code: "FRONT-UNEXPECTED-001",
+          message: "중량 설정에 실패했습니다.",
+        } as any);
+        return;
+      }
+
+      const r = unwrapResult<OutboundProcessWeightResult>(res.data);
+      if (!r) return;
+
+      setShipment((prev) =>
+        prev
+          ? {
+              ...prev,
+              weightG:
+                typeof r.weight_g === "number" && r.weight_g > 0
+                  ? r.weight_g
+                  : prev.weightG,
+            }
+          : prev,
+      );
+    } catch (err: any) {
+      console.error(err);
+      handleError(err as any);
+    }
+  };
+
+  /* 완료 조건 */
+
+  const allMatch = useMemo(
+    () =>
+      !!shipment &&
+      shipment.items.length > 0 &&
+      shipment.items.every((it) => it.scannedQty === it.requiredQty),
+    [shipment],
+  );
+
+  const weightOk = useMemo(
+    () =>
+      !!shipment &&
+      typeof shipment.weightG === "number" &&
+      (shipment.weightG ?? 0) > 0,
+    [shipment],
+  );
+
+  const canComplete =
+    !!shipment &&
+    allMatch &&
+    weightOk &&
+    shipment.status !== "completed" &&
+    shipment.status !== "출고완료";
+
+  /* 출고 처리 완료 */
+
+  const completeShipment = async () => {
+    if (!shipment || !canComplete) return;
+
+    setLoadingConfirm(true);
+    try {
+      const res = await outboundAdapter.confirmProcess({
+        invoice_no: shipment.invoiceNo,
+      });
+
+      if (!res.ok) {
+        handleError(res.error);
+        return;
+      }
+      if (!res.data) {
+        handleError({
+          code: "FRONT-UNEXPECTED-001",
+          message: "출고 처리에 실패했습니다.",
+        } as any);
+        return;
+      }
+
+      const confirmR = unwrapResult<OutboundProcessConfirmResult>(res.data);
+
+      const stateRes = await outboundAdapter.fetchProcessState(
+        shipment.invoiceNo,
+      );
+
+      if (stateRes.ok && stateRes.data) {
+        const st = unwrapResult<OutboundProcessStateResult>(stateRes.data);
+
+        if (st) {
+          setShipment((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  status: st.status ?? confirmR?.status ?? "completed",
+                  overallStatus: st.overall_status ?? prev.overallStatus,
+                  weightG:
+                    typeof st.weight_g === "number" && st.weight_g > 0
+                      ? st.weight_g
+                      : prev.weightG,
+                }
+              : prev,
+          );
+        } else {
+          setShipment((prev) =>
+            prev ? { ...prev, status: confirmR?.status ?? "completed" } : prev,
+          );
+        }
+      } else {
+        setShipment((prev) =>
+          prev ? { ...prev, status: confirmR?.status ?? "completed" } : prev,
+        );
+      }
+
+      alert("출고 처리 완료되었습니다.");
+      focusInvoice();
+    } catch (err: any) {
+      console.error(err);
+      handleError(err as any);
+    } finally {
+      setLoadingConfirm(false);
+    }
+  };
+
+  /* 렌더 */
+
+  const allRows = shipment?.items ?? [];
+
   return (
     <div className="p-4">
       {/* 상단 설명 카드 */}
       <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
         <h1 className="text-lg font-semibold">출고 처리</h1>
         <p className="mt-1 text-sm text-gray-600">
-          송장번호 입력 후 Enter → 제품 바코드 스캔. 모든 품목의 스캔수량이 요구수량과 일치하고
-          중량(kg)을 입력해야 완료됩니다.
+          송장 스캔 → 품목 로드 → 바코드 스캔으로 수량 일치 → 중량(g) 입력 → 출고 처리 완료
         </p>
       </div>
 
@@ -212,7 +484,7 @@ export default function ProcessPage() {
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   e.preventDefault();
-                  handleInvoiceEnter();
+                  void handleInvoiceEnter();
                 }
                 if (e.key === "Tab") {
                   e.preventDefault();
@@ -221,6 +493,7 @@ export default function ProcessPage() {
               }}
               placeholder="송장번호 스캔 또는 입력"
               className="w-full rounded-xl border px-3 py-2 md:w-[340px]"
+              disabled={loadingInvoice}
             />
             <input
               ref={barcodeRef}
@@ -229,32 +502,28 @@ export default function ProcessPage() {
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   e.preventDefault();
-                  handleBarcodeEnter();
+                  void handleBarcodeEnter();
                 }
               }}
               placeholder="제품 바코드 스캔"
               className="w-full rounded-xl border px-3 py-2 md:w-[420px]"
-              disabled={!shipment}
+              disabled={!shipment || loadingScan}
             />
           </div>
 
           <div className="flex items-center gap-3 md:ml-auto">
             <label className="flex items-center gap-2">
-              <span className="text-sm text-gray-700">중량(kg)</span>
+              <span className="text-sm text-gray-700">중량(g)</span>
               <input
                 type="number"
                 inputMode="decimal"
-                step="0.01"
+                step="1"
                 min={0}
-                value={shipment?.weightKg ?? ""}
-                onChange={(e) => {
-                  const v = e.currentTarget.value;
-                  setShipment((prev) =>
-                    prev ? { ...prev, weightKg: v === "" ? undefined : Number(v) } : prev
-                  );
-                }}
+                value={shipment?.weightG ?? ""}
+                onChange={(e) => handleWeightChange(e.currentTarget.value)}
+                onBlur={() => void handleWeightBlur()}
                 className="w-[120px] rounded-xl border px-3 py-2 text-right"
-                disabled={!shipment || shipment.status === "출고완료"}
+                disabled={!shipment}
               />
             </label>
 
@@ -264,21 +533,10 @@ export default function ProcessPage() {
                   ? "bg-black text-white"
                   : "bg-gray-200 text-gray-600 cursor-not-allowed"
               }`}
-              onClick={completeShipment}
-              disabled={!canComplete}
-              title={
-                canComplete
-                  ? "출고를 완료합니다."
-                  : !shipment
-                  ? "송장번호를 먼저 스캔하세요."
-                  : !allMatch
-                  ? "스캔수량이 요구수량과 일치하지 않습니다."
-                  : !weightOk
-                  ? "중량(kg)을 입력하세요."
-                  : "완료할 수 없습니다."
-              }
+              onClick={() => void completeShipment()}
+              disabled={!canComplete || loadingConfirm}
             >
-              출고 처리 완료
+              {loadingConfirm ? "처리 중..." : "출고 처리 완료"}
             </button>
           </div>
         </div>
@@ -290,6 +548,14 @@ export default function ProcessPage() {
               <span>
                 송장번호: <b>{shipment.invoiceNo}</b>
               </span>
+              <span>
+                상태: <b>{shipment.overallStatus ?? shipment.status}</b>
+              </span>
+              {shipment.weightG && shipment.weightG > 0 && (
+                <span>
+                  중량: <b>{shipment.weightG} g</b>
+                </span>
+              )}
             </div>
           ) : (
             <span>송장번호를 스캔하여 출고 품목을 불러오세요.</span>
@@ -300,61 +566,58 @@ export default function ProcessPage() {
       {/* 리스트 카드 */}
       <div className="rounded-2xl border border-gray-200 bg-white shadow-sm">
         <div className="max-h-[560px] overflow-auto rounded-2xl">
-          <table
-            className={[
-              "w-full table-fixed border-collapse text-sm",
-              "[&>thead>tr>th]:sticky [&>thead>tr>th]:top-0 [&>thead>tr>th]:z-10",
-              "[&>thead>tr]:bg-gray-50 [&>thead>tr>th]:bg-gray-50",
-              "[&>thead>tr>th]:border-b border-gray-200",
-              "[&>thead>tr>th]:py-3 [&>tbody>tr>td]:py-3",
-              "[&>thead>tr>th]:text-center [&>tbody>tr>td]:text-center",
-            ].join(" ")}
-          >
-            <colgroup>
-              <col style={{ width: "220px" }} />
-              <col style={{ width: "180px" }} />
-              <col style={{ width: "auto" }} />
-              <col style={{ width: "120px" }} />
-              <col style={{ width: "120px" }} />
-              <col style={{ width: "120px" }} />
-              <col style={{ width: "140px" }} />
-            </colgroup>
-
-            <thead>
+          <table className="w-full table-fixed border-collapse text-sm">
+            <thead className="bg-gray-50 sticky top-0 z-10">
               <tr>
-                <th className="text-gray-800">SKU</th>
-                <th className="text-gray-800">바코드</th>
-                <th className="text-gray-800">상품명</th>
-                <th className="text-gray-800">요구수량</th>
-                <th className="text-gray-800">스캔수량</th>
-                <th className="text-gray-800">잔여</th>
-                <th className="text-gray-800">상태</th>
+                <th className="px-3 py-2 text-left">SKU</th>
+                <th className="px-3 py-2 text-left">바코드</th>
+                <th className="px-3 py-2 text-left">상품명</th>
+                <th className="px-3 py-2 text-center">요구수량</th>
+                <th className="px-3 py-2 text-center">스캔수량</th>
+                <th className="px-3 py-2 text-center">잔여</th>
+                <th className="px-3 py-2 text-center">상태</th>
               </tr>
             </thead>
-
             <tbody>
-              {!shipment || shipment.items.length === 0 ? (
+              {allRows.length === 0 ? (
                 <tr>
                   <td className="py-10 text-center text-gray-500" colSpan={7}>
                     로드된 출고 품목이 없습니다.
                   </td>
                 </tr>
               ) : (
-                shipment.items.map((it) => {
+                allRows.map((it) => {
                   const remaining = it.requiredQty - it.scannedQty;
                   const status: "ok" | "warn" | "over" =
                     remaining === 0 ? "ok" : remaining < 0 ? "over" : "warn";
                   return (
-                    <tr key={it.id} className="border-b border-gray-100 hover:bg-gray-50">
-                      <td className="px-3 align-middle font-mono">{it.sku}</td>
-                      <td className="px-3 align-middle font-mono">{it.barcode}</td>
-                      <td className="px-3 align-middle">{it.name}</td>
-                      <td className="px-3 align-middle text-right">{it.requiredQty}</td>
-                      <td className="px-3 align-middle text-right">{it.scannedQty}</td>
-                      <td className="px-3 align-middle text-right">
+                    <tr
+                      key={it.id}
+                      className="border-b border-gray-100 hover:bg-gray-50"
+                    >
+                      <td className="px-3 py-2 align-middle font-mono">
+                        {it.sku}
+                      </td>
+                      <td className="px-3 py-2 align-middle font-mono">
+                        {it.barcode || (
+                          <span className="text-gray-400">-</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 align-middle">
+                        {it.name || (
+                          <span className="text-gray-400">상품명 없음</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 align-middle text-center">
+                        {it.requiredQty}
+                      </td>
+                      <td className="px-3 py-2 align-middle text-center">
+                        {it.scannedQty}
+                      </td>
+                      <td className="px-3 py-2 align-middle text-center">
                         {Math.max(remaining, 0)}
                       </td>
-                      <td className="px-3 align-middle">
+                      <td className="px-3 py-2 align-middle text-center">
                         <StatusBadge status={status} />
                       </td>
                     </tr>
@@ -371,7 +634,14 @@ export default function ProcessPage() {
             {shipment ? (
               <>
                 총 품목 <b>{shipment.items.length}</b>개 · 스캔 완료 품목{" "}
-                <b>{shipment.items.filter((x) => x.scannedQty === x.requiredQty).length}</b>개
+                <b>
+                  {
+                    shipment.items.filter(
+                      (x) => x.scannedQty === x.requiredQty,
+                    ).length
+                  }
+                </b>
+                개
               </>
             ) : (
               <>출고 품목을 로드하면 요약이 표시됩니다.</>
@@ -379,12 +649,6 @@ export default function ProcessPage() {
           </div>
         </div>
       </div>
-
-      {/* 안내 */}
-      <p className="mt-3 text-xs text-gray-500">
-        참고: 더미 매핑 사용 중. 바코드 예시 880000000001, 880000000002, 880000000003.
-        실제 연동 시 mockResolveBarcode / mockFetchOrderByInvoice를 API로 교체하세요.
-      </p>
     </div>
   );
 }

@@ -2,12 +2,13 @@
 # 페이지: 상품관리 > 상품등록
 # 역할:
 #   - 상품 목록 조회
+#   - SKU 단건 조회
 #   - 단건 등록
 #   - 수정
 #   - 선택 삭제
 #   - 묶음 매핑 단건 업데이트
 #   - 상품 대량 등록(bulk-excel, JSON rows 기준)
-# 단계: v1-6 (DB v1.6-r2: base_sku / pack_qty / is_bundle 반영)
+# 단계: v1-7 (DB v1.6-r2: base_sku / pack_qty / is_bundle 반영 + SKU 단건조회)
 # 규칙:
 #   - 전체수정
 #   - sync(Session 전용)
@@ -38,7 +39,7 @@ from backend.system.error_codes import DomainError
 
 
 PAGE_ID = "product.register"
-PAGE_VERSION = "v1-6"
+PAGE_VERSION = "v1-7"
 
 
 # ─────────────────────────────────────────────
@@ -94,7 +95,7 @@ class ProductRegisterService:
         """
         상품 목록 조회
         - deleted_at IS NULL 인 상품만 조회
-        - v1-6에서 base_sku / pack_qty / is_bundle 컬럼은
+        - v1-7에서 base_sku / pack_qty / is_bundle 컬럼은
           응답에 노출하지 않고 내부적으로만 사용 (필요 시 확장 가능)
         """
         stmt = (
@@ -130,10 +131,6 @@ class ProductRegisterService:
                     "weight": weight,
                     "barcode": r.barcode,
                     "is_bundle_related": True if bundle_exists else False,
-                    # 필요 시 확장용 필드 (GUI가 쓰지 않으면 무시)
-                    # "base_sku": getattr(r, "base_sku", None),
-                    # "pack_qty": getattr(r, "pack_qty", None),
-                    # "is_bundle": getattr(r, "is_bundle", False),
                 }
             )
 
@@ -141,6 +138,65 @@ class ProductRegisterService:
             "ok": True,
             "count": len(items),
             "items": items,
+        }
+
+    # ======================================================
+    # 1-1) SKU 단건 조회
+    #      - 입고/출고/모바일에서 SKU 기준으로 상품정보 조회
+    # ======================================================
+    def get_by_sku(self, *, sku: str) -> Dict[str, Any]:
+        """
+        SKU 기준 상품 단건 조회
+        - deleted_at IS NULL 인 상품만 대상
+        - 목록 조회와 동일한 필드 구조 중 단건만 반환
+        """
+        sku = (sku or "").strip()
+        if not sku:
+            raise DomainError(
+                "PRODUCT-VALID-005",
+                detail="sku는 필수입니다.",
+                ctx={"page_id": PAGE_ID},
+            )
+
+        product = self.session.execute(
+            select(self.Product).where(
+                self.Product.sku == sku,
+                self.Product.deleted_at.is_(None),
+            )
+        ).scalar_one_or_none()
+
+        if not product:
+            raise DomainError(
+                "PRODUCT-NOTFOUND-001",
+                detail="해당 SKU를 찾을 수 없습니다.",
+                ctx={"sku": sku},
+            )
+
+        last_inbound_unit_price = getattr(product, "last_inbound_unit_price", None)
+        weight = getattr(product, "weight", None)
+
+        bundle_exists = self.session.execute(
+            select(self.Bundle).where(
+                (
+                    (self.Bundle.bundle_sku == product.sku)
+                    | (self.Bundle.component_sku == product.sku)
+                ),
+                self.Bundle.deleted_at.is_(None),
+            )
+        ).first()
+
+        item = {
+            "sku": product.sku,
+            "name": product.name,
+            "last_inbound_price": last_inbound_unit_price,
+            "weight": weight,
+            "barcode": product.barcode,
+            "is_bundle_related": True if bundle_exists else False,
+        }
+
+        return {
+            "ok": True,
+            "item": item,
         }
 
     # ======================================================
@@ -459,10 +515,6 @@ class ProductRegisterService:
                 updated_at=now,
             )
             self.session.add(obj)
-
-        # 묶음 SKU 자체는 나중에 is_bundle 플래그를 활용할 수 있으나,
-        # 현재는 bundle 관계 존재 여부를 is_bundle_related로 표현하고 있어서
-        # is_bundle 컬럼은 강제하지 않는다. (확장 여지를 남겨둠)
 
         self.session.commit()
 

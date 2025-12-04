@@ -1,7 +1,7 @@
 # 📄 backend/main.py
 # 프로젝트 메인 엔트리 — 모든 라우터 연결 허브
 # 규칙: 전체수정 / 턴제 / 페이지우선 / 상단주석 / 핑은 system 전용
-# NOAH PATCH v1.8 (outbound.process service 연결 포함)
+# NOAH PATCH v1.9 (outbound.process 서비스 직접 DI 방식으로 정리)
 
 from fastapi import FastAPI, APIRouter, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,10 +25,20 @@ register_global_handlers(app)
 # CORS
 # ─────────────────────────────────────────────────────────────
 
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:8000",
+    "http://192.168.45.139:5174",
+    "https://pseudoallegoristic-sina-nonremedial.ngrok-free.dev",  # 🔹 추가
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,  # 쿠키/인증정보 포함 요청 허용
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -58,7 +68,7 @@ def api_ready():
 app.include_router(api)
 
 # ─────────────────────────────────────────────────────────────
-# Guard (지연 인증용)
+# Guard (지연 인증용 - 현재 미사용, 추후 확장 여지용)
 # ─────────────────────────────────────────────────────────────
 
 def guard(request: Request):
@@ -68,36 +78,6 @@ def guard(request: Request):
         raise
     except Exception:
         return True
-
-# ─────────────────────────────────────────────────────────────
-# ✅ 출고처리 서비스 DI 연결
-# ─────────────────────────────────────────────────────────────
-
-from backend.db.session import SessionLocal
-from backend.models import (
-    Product,
-    OutboundHeader,
-    OutboundItem,
-    InventoryLedger,
-    StockCurrent,
-)
-from backend.services.outbound.outbound_process_service import configure_outbound_process_service
-
-
-def _outbound_process_models():
-    return {
-        "Product": Product,
-        "OutboundHeader": OutboundHeader,
-        "OutboundItem": OutboundItem,
-        "InventoryLedger": InventoryLedger,
-        "StockCurrent": StockCurrent,
-    }
-
-
-configure_outbound_process_service(
-    session_factory=SessionLocal,
-    models_fn=_outbound_process_models,
-)
 
 # ─────────────────────────────────────────────────────────────
 # 도메인 라우터 연결 섹션

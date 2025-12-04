@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Iterable, Set
 
 from sqlalchemy import select
@@ -554,6 +555,10 @@ class InboundProcessService:
         norm_items = _normalize_confirm_items(items)
         norm_operator = _normalize_operator(operator)
 
+        # 📌 이번 확정 시점 기준 UTC 날짜 계산 (입고일로 사용)
+        now_utc = datetime.now(timezone.utc)
+        inbound_date = now_utc.date()
+
         # 1) 헤더 조회 (deleted_at NULL)
         stmt_header = select(InboundHeader).where(
             InboundHeader.id == norm_header_id,
@@ -708,6 +713,9 @@ class InboundProcessService:
             header_obj.status = "committed"
         if hasattr(header_obj, "updated_by"):
             header_obj.updated_by = norm_operator
+        # 📌 header에 inbound_date 컬럼이 있으면 이번 확정일로 세팅
+        if hasattr(header_obj, "inbound_date"):
+            header_obj.inbound_date = inbound_date
 
         for db_item in db_items:
             if hasattr(db_item, "status"):
@@ -726,6 +734,9 @@ class InboundProcessService:
                 qty_in=qty,
                 qty_out=0,
             )
+            # 📌 ledger에 process_date 컬럼이 있으면 동일한 입고일로 세팅
+            if hasattr(ledger, "process_date"):
+                ledger.process_date = inbound_date
             if hasattr(ledger, "created_by"):
                 ledger.created_by = norm_operator
             if hasattr(ledger, "updated_by"):
@@ -769,4 +780,6 @@ class InboundProcessService:
             "confirmed_count": len(norm_items),
             "total_qty": total_qty,
             "operator": norm_operator,
+            # 📌 프론트/입고완료 리스트에서 사용할 수 있는 입고일(YYYY-MM-DD)
+            "inbound_date": inbound_date.isoformat(),
         }

@@ -2,10 +2,17 @@
    ✅ 출고등록 > 등록 탭 (테이블 입력 + 붙여넣기 + 검증 + API 저장)
    - 붙여넣기 파서: 컨테이너 포커스 후 Ctrl+V
    - 체크박스 선택삭제
-   - 검증 후 POST /api/outbound/requests
-   - 저장중 버튼 비활성화, 성공 시 초기화
+   - 검증 후 outboundAdapter.registerForm 호출
+   - SKU 입력 시 inboundAdapter.lookupProductBySku로 상품명 자동 조회
 */
+
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  outboundAdapter,
+  type OutboundRegisterFormRequestDto,
+} from "@/api/adapters/outbound.adapter";
+import { inboundAdapter } from "@/api/adapters/inbound.adapter";
+import { handleError } from "@/utils/handleError";
 
 type RowItem = {
   id: string;
@@ -18,8 +25,6 @@ type RowItem = {
   totalPrice: number | "";
 };
 
-const API_ENDPOINT = "/api/outbound/requests";
-
 const uuid = () => Math.random().toString(36).slice(2, 10);
 const stripComma = (s: string) => s.replace(/[, ]+/g, "");
 const toNumber = (v: number | string | ""): number => {
@@ -28,7 +33,8 @@ const toNumber = (v: number | string | ""): number => {
   const n = Number(raw);
   return Number.isFinite(n) ? n : 0;
 };
-const fmt = (n: number | "") => (n === "" ? "" : new Intl.NumberFormat().format(n as number));
+const fmt = (n: number | "") =>
+  n === "" ? "" : new Intl.NumberFormat().format(n as number);
 
 const splitLine = (line: string): string[] => {
   if (line.includes("\t")) return line.split("\t");
@@ -54,32 +60,45 @@ const makeEmptyRow = (): RowItem => ({
   totalPrice: "",
 });
 const isEmptyRow = (r: RowItem) =>
-  !r.country && !r.orderNo && !r.trackingNo && !r.sku && !r.name && !r.quantity && !r.totalPrice;
+  !r.country &&
+  !r.orderNo &&
+  !r.trackingNo &&
+  !r.sku &&
+  !r.name &&
+  !r.quantity &&
+  !r.totalPrice;
 
-// SKU → 상품명 자동채움(mock)
-const PRODUCTS_CACHE: Record<string, string> = {
-  FD_SAMY_BULDAKSA02_0200: "불닭사리 200g",
-  FD_DSFS_MAXIMKAN05_MILDLOS030: "맥심 모카라떼 30T",
-  FD_LOTTE_CHOCO_PIE12: "초코파이 12입",
-  FD_SAMLIP_MINI_YAKGWA: "삼립 미니약과",
-  FD_OTTOGI_JINRAMEN_MILD5: "진라면 순한맛 5입",
-};
-async function fetchProductNameMock(sku: string): Promise<string | null> {
-  await new Promise((r) => setTimeout(r, 120));
-  return PRODUCTS_CACHE[sku] ?? null;
-}
+/* ─────────────────────────────────────────────
+ * SKU → 상품명 조회 훅
+ *   - inboundAdapter.lookupProductBySku 사용
+ *   - ApiResult<ProductLookupBySkuResultDto> 기반
+ *   - res.ok && res.data.ok && res.data.item 이면 item.name 반환
+ * ───────────────────────────────────────────── */
+
 function useProductName() {
   const inFlight = React.useRef<Record<string, Promise<string | null>>>({});
+
   const getName = async (sku: string): Promise<string | null> => {
-    if (!sku) return null;
-    if (PRODUCTS_CACHE[sku]) return PRODUCTS_CACHE[sku];
-    if (!inFlight.current[sku]) {
-      inFlight.current[sku] = fetchProductNameMock(sku).finally(() => delete inFlight.current[sku]);
+    const key = sku.trim();
+    if (!key) return null;
+
+    if (!inFlight.current[key]) {
+      inFlight.current[key] = (async () => {
+        const res = await inboundAdapter.lookupProductBySku(key);
+        if (!res.ok) return null;
+        const data = res.data;
+        if (!data?.ok || !data.item) return null;
+        return data.item.name ?? null;
+      })();
     }
-    const name = await inFlight.current[sku];
-    if (name) PRODUCTS_CACHE[sku] = name;
+
+    const name = await inFlight.current[key];
+    if (!name) {
+      delete inFlight.current[key];
+    }
     return name;
   };
+
   return { getName };
 }
 
@@ -108,8 +127,17 @@ export default function RegisterFormPage() {
 
   const onCellChange = async (
     id: string,
-    field: keyof Pick<RowItem, "country" | "orderNo" | "trackingNo" | "sku" | "name" | "quantity" | "totalPrice">,
-    value: string
+    field: keyof Pick<
+      RowItem,
+      | "country"
+      | "orderNo"
+      | "trackingNo"
+      | "sku"
+      | "name"
+      | "quantity"
+      | "totalPrice"
+    >,
+    value: string,
   ) => {
     setRows((prev) =>
       prev.map((r) =>
@@ -123,22 +151,26 @@ export default function RegisterFormPage() {
                   ? value.replace(/[^\d.]/g, "")
                   : value,
             }
-          : r
-      )
+          : r,
+      ),
     );
 
-    // SKU 자동 상품명
-    if (field === "sku" && value) {
-      const name = await getName(value.trim());
-      if (name) {
-        setRows((prev) =>
-          prev.map((r) => (r.id === id && (!r.name || r.name.trim() === "") ? { ...r, name } : r))
-        );
-      }
+    if (field === "sku") {
+      const sku = value.trim();
+      if (!sku) return;
+      const name = await getName(sku);
+      if (!name) return;
+
+      setRows((prev) =>
+        prev.map((r) =>
+          r.id === id && (!r.name || r.name.trim() === "")
+            ? { ...r, name }
+            : r,
+        ),
+      );
     }
   };
 
-  // 붙여넣기: 완전 빈 상태면 대체, 아니면 이어붙이기
   const handlePaste = async (e: React.ClipboardEvent) => {
     const text = e.clipboardData.getData("text/plain") ?? "";
     const lines = text
@@ -163,7 +195,12 @@ export default function RegisterFormPage() {
         totalPriceStr = "",
       ] = cells;
 
-      if ([country, orderNo, trackingNo, sku, name, quantityStr, totalPriceStr].every((v) => v === "")) continue;
+      if (
+        [country, orderNo, trackingNo, sku, name, quantityStr, totalPriceStr].every(
+          (v) => v === "",
+        )
+      )
+        continue;
 
       parsed.push({
         id: uuid(),
@@ -183,28 +220,35 @@ export default function RegisterFormPage() {
         if (!r.sku || r.name?.trim()) return r;
         const name = await getName(r.sku.trim());
         return name ? { ...r, name } : r;
-      })
+      }),
     );
 
     setRows((prev) => {
-      const prevAllEmpty = prev.length > 0 && prev.every((r) => isEmptyRow(r));
+      const prevAllEmpty =
+        prev.length > 0 && prev.every((r) => isEmptyRow(r));
       return prevAllEmpty ? withNames : [...prev, ...withNames];
     });
     setChecked(new Set());
   };
 
-  // 합계: 총 수량만 사용
   const totalQty = useMemo(
     () => rows.reduce((acc, r) => acc + toNumber(r.quantity), 0),
-    [rows]
+    [rows],
   );
 
-  // 간단 검증
   const validate = (items: RowItem[]) => {
     const invalid = items.filter((r) => {
       const qty = toNumber(r.quantity);
       const total = toNumber(r.totalPrice);
-      return !r.country?.trim() || !r.orderNo?.trim() || !r.sku?.trim() || qty <= 0 || total < 0;
+      return (
+        !r.country?.trim() ||
+        !r.orderNo?.trim() ||
+        !r.trackingNo?.trim() ||
+        !r.sku?.trim() ||
+        !r.name?.trim() ||
+        qty <= 0 ||
+        total < 0
+      );
     });
     return { ok: invalid.length === 0, invalid };
   };
@@ -219,39 +263,39 @@ export default function RegisterFormPage() {
     if (!ok) {
       const first = invalid[0];
       alert(
-        `필수값이 비어있거나 잘못된 행이 있습니다.\n국가, 주문번호, SKU, 출고수량, 총 가격을 확인해주세요.\n문제 행 SKU: ${first.sku || "(빈 값)"}`
+        `필수값이 비어있거나 잘못된 행이 있습니다.\n국가, 주문번호, 트래킹번호, SKU, 상품명, 출고수량, 총 가격을 확인해주세요.\n문제 행 SKU: ${
+          first.sku || "(빈 값)"
+        }`,
       );
       return;
     }
 
-    const payload = {
+    const payload: OutboundRegisterFormRequestDto = {
       items: rows.map((r) => ({
         country: r.country.trim(),
-        order_no: r.orderNo.trim(),
-        tracking_no: r.trackingNo.trim(),
+        order_number: r.orderNo.trim(),
+        tracking_number: r.trackingNo.trim(),
         sku: r.sku.trim(),
-        name: r.name.trim(),
-        quantity: toNumber(r.quantity),
+        product_name: r.name.trim(),
+        qty: toNumber(r.quantity),
         total_price: toNumber(r.totalPrice),
       })),
     };
 
     try {
       setIsSubmitting(true);
-      const res = await fetch(API_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+      const res = await outboundAdapter.registerForm(payload);
+
       if (!res.ok) {
-        const msg = await res.text().catch(() => "");
-        throw new Error(msg || `HTTP ${res.status}`);
+        handleError(res.error);
+        return;
       }
-      alert("출고 등록이 완료됐어요.");
+
+      alert("출고 등록이 완료되었습니다.");
       clearAll();
     } catch (err: any) {
       console.error(err);
-      alert(`저장 중 오류가 발생했어요.\n사유: ${String(err?.message || err)}`);
+      handleError(err as any);
     } finally {
       setIsSubmitting(false);
     }
@@ -275,14 +319,20 @@ export default function RegisterFormPage() {
         >
           선택 삭제
         </button>
-        <button onClick={clearAll} disabled={isSubmitting} className="px-3 py-2 rounded-lg border text-sm">
+        <button
+          onClick={clearAll}
+          disabled={isSubmitting}
+          className="px-3 py-2 rounded-lg border text-sm"
+        >
           초기화
         </button>
         <button
           onClick={onSubmitRegister}
           disabled={isSubmitting}
           className={`px-3 py-2 rounded-lg border text-sm font-semibold ${
-            isSubmitting ? "bg-gray-300 text-gray-600 cursor-wait" : "bg-black text-white"
+            isSubmitting
+              ? "bg-gray-300 text-gray-600 cursor-wait"
+              : "bg-black text-white"
           }`}
         >
           {isSubmitting ? "저장 중..." : "출고 등록"}
@@ -304,9 +354,12 @@ export default function RegisterFormPage() {
                 <th className="px-2 py-2 w-[40px] text-center">
                   <input
                     type="checkbox"
-                    checked={rows.length > 0 && checked.size === rows.length}
+                    checked={
+                      rows.length > 0 && checked.size === rows.length
+                    }
                     onChange={(e) => {
-                      if (e.target.checked) setChecked(new Set(rows.map((r) => r.id)));
+                      if (e.target.checked)
+                        setChecked(new Set(rows.map((r) => r.id)));
                       else setChecked(new Set());
                     }}
                     disabled={isSubmitting}
@@ -324,7 +377,10 @@ export default function RegisterFormPage() {
             <tbody>
               {rows.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="text-center text-sm text-gray-500 py-8">
+                  <td
+                    colSpan={8}
+                    className="text-center text-sm text-gray-500 py-8"
+                  >
                     입력할 행이 없습니다.
                   </td>
                 </tr>
@@ -351,7 +407,9 @@ export default function RegisterFormPage() {
                         type="text"
                         placeholder="예: SG"
                         value={r.country}
-                        onChange={(e) => onCellChange(r.id, "country", e.target.value)}
+                        onChange={(e) =>
+                          onCellChange(r.id, "country", e.target.value)
+                        }
                         className="w-full border rounded-lg px-2 py-1 text-sm"
                         disabled={isSubmitting}
                       />
@@ -361,7 +419,9 @@ export default function RegisterFormPage() {
                         type="text"
                         placeholder="주문번호"
                         value={r.orderNo}
-                        onChange={(e) => onCellChange(r.id, "orderNo", e.target.value)}
+                        onChange={(e) =>
+                          onCellChange(r.id, "orderNo", e.target.value)
+                        }
                         className="w-full border rounded-lg px-2 py-1 text-sm"
                         disabled={isSubmitting}
                       />
@@ -371,7 +431,9 @@ export default function RegisterFormPage() {
                         type="text"
                         placeholder="트래킹번호"
                         value={r.trackingNo}
-                        onChange={(e) => onCellChange(r.id, "trackingNo", e.target.value)}
+                        onChange={(e) =>
+                          onCellChange(r.id, "trackingNo", e.target.value)
+                        }
                         className="w-full border rounded-lg px-2 py-1 text-sm"
                         disabled={isSubmitting}
                       />
@@ -380,7 +442,9 @@ export default function RegisterFormPage() {
                       <input
                         type="text"
                         value={r.sku}
-                        onChange={(e) => onCellChange(r.id, "sku", e.target.value)}
+                        onChange={(e) =>
+                          onCellChange(r.id, "sku", e.target.value)
+                        }
                         className="w-full border rounded-lg px-2 py-1 text-sm font-mono"
                         disabled={isSubmitting}
                       />
@@ -389,7 +453,9 @@ export default function RegisterFormPage() {
                       <input
                         type="text"
                         value={r.name}
-                        onChange={(e) => onCellChange(r.id, "name", e.target.value)}
+                        onChange={(e) =>
+                          onCellChange(r.id, "name", e.target.value)
+                        }
                         className="w-full border rounded-lg px-2 py-1 text-sm"
                         disabled={isSubmitting}
                       />
@@ -398,7 +464,9 @@ export default function RegisterFormPage() {
                       <input
                         inputMode="numeric"
                         value={r.quantity}
-                        onChange={(e) => onCellChange(r.id, "quantity", e.target.value)}
+                        onChange={(e) =>
+                          onCellChange(r.id, "quantity", e.target.value)
+                        }
                         className="w-full border rounded-lg px-2 py-1 text-sm text-right"
                         disabled={isSubmitting}
                       />
@@ -407,7 +475,9 @@ export default function RegisterFormPage() {
                       <input
                         inputMode="decimal"
                         value={r.totalPrice}
-                        onChange={(e) => onCellChange(r.id, "totalPrice", e.target.value)}
+                        onChange={(e) =>
+                          onCellChange(r.id, "totalPrice", e.target.value)
+                        }
                         className="w-full border rounded-lg px-2 py-1 text-sm text-right"
                         disabled={isSubmitting}
                       />

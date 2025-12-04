@@ -2,55 +2,34 @@
 // 대시보드 > 월간 현황
 // - FilterBox 숨김(CSS)
 // - actions: 월 선택 + 적용/초기화/엑셀 내보내기
-// - 선택 월을 from/to로 매핑
+// - 선택 월 기준으로 조회
 // - 매출 컬럼 제거
 // - 체크박스 컬럼은 재고현황(StatusPage)와 동일한 방식으로 CSS 숨김
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import TableBase from "../../../components/common/table/TableBase";
+import {
+  reportsAdapter,
+  type ReportsMonthlyItem,
+  type ReportsMonthlyExcelResult,
+} from "@/api/adapters/reports.adapter";
+import { handleError } from "@/utils/handleError";
 
 type SortDir = "ASC" | "DESC";
-type SalesRow = { date: string; sku: string; name: string; qty: number; revenue: number };
-type AggRow = { id: string; sku: string; name: string; shippedQty: number; revenue: number };
-type FilterState = { from?: string; to?: string };
 
-/* ────────────────────────────────────────────────────────────────
- * 더미 데이터
- * ────────────────────────────────────────────────────────────────*/
-const SALES: SalesRow[] = [
-  {
-    date: "2025-09-03",
-    sku: "FD_DSFS_MAXIMKAN05_MILDLOS030_1BOX",
-    name: "맥심 카누 마일드 로스트 30입",
-    qty: 40,
-    revenue: 1200000,
-  },
-  {
-    date: "2025-10-18",
-    sku: "FD_SAMY_BULDAKSA02_HAKBUL0200_01EA",
-    name: "삼양 불닭사리 핵불닭 200g",
-    qty: 60,
-    revenue: 540000,
-  },
-  {
-    date: "2025-10-20",
-    sku: "FD_PULM_DUMPLING_BULGOGI_01EA",
-    name: "풀무원 얇은피만두 불고기",
-    qty: 28,
-    revenue: 252000,
-  },
-  {
-    date: "2025-10-05",
-    sku: "FD_OTTO_JINRAMYEON01EA",
-    name: "오뚜기 진라면 순한맛 120g",
-    qty: 52,
-    revenue: 280800,
-  },
-];
+type FilterState = {
+  from?: string;
+  to?: string;
+};
 
-/* ────────────────────────────────────────────────────────────────
- * 헤더 정의 (매출 제거)
- * ────────────────────────────────────────────────────────────────*/
+type TableRow = {
+  id: string;
+  rank: number;
+  sku: string;
+  name: string;
+  shippedQty: string;
+};
+
 const TABLE_HEADERS = [
   { key: "rank", header: "순위", width: "84px", sortable: false },
   { key: "sku", header: "SKU", width: "300px" },
@@ -58,23 +37,19 @@ const TABLE_HEADERS = [
   { key: "shippedQty", header: "출고수량", width: "120px" },
 ] as const;
 
-const SORTABLE_KEYS = new Set<keyof AggRow>(["sku", "name", "shippedQty"]);
-const NUMERIC_KEYS = new Set<keyof AggRow>(["shippedQty", "revenue"]);
 const fmt = (v: number) => v.toLocaleString();
 const dim = (y: number, m: number) => new Date(y, m, 0).getDate();
 
-/* ────────────────────────────────────────────────────────────────
- * 이 페이지 전용 스타일 (체크박스 컬럼 제거 + FilterBox/정렬아이콘 숨김)
- * ────────────────────────────────────────────────────────────────*/
+/* ────────────────────────────────────────────────
+ * 이 페이지 전용 스타일
+ * ────────────────────────────────────────────────*/
 function MonthlyStyles() {
   return (
     <style>{`
-      /* FilterBox(2번째 자식) 숨김 */
       .monthly-page .noah-tablebase > *:nth-child(2){
         display:none !important;
       }
 
-      /* 정렬 아이콘/설명 + 커스텀 ▲▼ 텍스트 숨김 */
       .monthly-page .cds--table-sort__icon,
       .monthly-page .cds--table-sort__icon-unsorted,
       .monthly-page .bx--table-sort__icon,
@@ -85,7 +60,6 @@ function MonthlyStyles() {
         display:none !important;
       }
 
-      /* 재고현황 페이지와 동일하게 체크박스 컬럼(colgroup 첫번째 + 체크박스 셀) 제거 */
       .monthly-page table col:first-child {
         display: none !important;
       }
@@ -98,119 +72,169 @@ function MonthlyStyles() {
   );
 }
 
-/* ────────────────────────────────────────────────────────────────
+/* ────────────────────────────────────────────────
+ * base64 엑셀 다운로드
+ * ────────────────────────────────────────────────*/
+function downloadBase64File(file: ReportsMonthlyExcelResult) {
+  try {
+    const byteChars = atob(file.content_base64);
+    const len = byteChars.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = byteChars.charCodeAt(i);
+    }
+
+    const blob = new Blob([bytes], { type: file.content_type });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = file.file_name || "monthly_report.xlsx";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    console.error("[Monthly] 엑셀 다운로드 실패", e);
+    alert("엑셀 파일을 저장하는 중 오류가 발생했습니다.");
+  }
+}
+
+/* ────────────────────────────────────────────────
  * 메인 컴포넌트
- * ────────────────────────────────────────────────────────────────*/
+ * ────────────────────────────────────────────────*/
 export default function MonthlyPage() {
   const today = new Date();
-  const defaultMonth = `${today.getFullYear()}-${String(
+  const defaultMonthStr = `${today.getFullYear()}-${String(
     today.getMonth() + 1
   ).padStart(2, "0")}`;
 
+  // 화면 상단 month input
+  const [selectedMonth, setSelectedMonth] = useState(defaultMonthStr);
+
+  // TableBase용 필터(from/to) – UI 표현용
   const [filter, setFilter] = useState<FilterState>({});
-  const [selectedMonth, setSelectedMonth] = useState(defaultMonth);
+
+  // 실제 API 호출용 year/month
+  const [queryYear, setQueryYear] = useState(today.getFullYear());
+  const [queryMonth, setQueryMonth] = useState(today.getMonth() + 1);
 
   const [sort, setSort] = useState<{ key?: string; dir?: SortDir }>({
     key: "shippedQty",
     dir: "DESC",
   });
+
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
 
-  const applyMonth = () => {
-    const [y, m] = selectedMonth.split("-").map(Number);
-    const last = dim(y, m);
-    const mm = String(m).padStart(2, "0");
-    setFilter({
-      from: `${y}-${mm}-01`,
-      to: `${y}-${mm}-${String(last).padStart(2, "0")}`,
+  const [items, setItems] = useState<ReportsMonthlyItem[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+  const [loading, setLoading] = useState(false);
+
+  /* ─────────────────────────────────────────────
+   * 서버에서 월간현황 조회
+   * ───────────────────────────────────────────── */
+  const fetchMonthly = async () => {
+    setLoading(true);
+    const res = await reportsAdapter.fetchMonthlyList({
+      year: queryYear,
+      month: queryMonth,
+      page,
+      size: pageSize,
     });
+
+    if (!res.ok || !res.data) {
+      setItems([]);
+      setTotalCount(0);
+      setLoading(false);
+      return handleError(res.error);
+    }
+
+    setItems(res.data.items ?? []);
+    setTotalCount(res.data.count ?? 0);
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    fetchMonthly();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queryYear, queryMonth, page, pageSize]);
+
+  /* ─────────────────────────────────────────────
+   * 액션: 적용 / 초기화 / 엑셀
+   * ───────────────────────────────────────────── */
+  const applyMonth = () => {
+    const [yStr, mStr] = selectedMonth.split("-");
+    const year = Number(yStr);
+    const month = Number(mStr);
+    if (!year || !month) {
+      alert("올바른 년·월을 선택해 주세요.");
+      return;
+    }
+
+    // TableBase 필터(from/to) 갱신 – 표시용
+    const last = dim(year, month);
+    const mm = String(month).padStart(2, "0");
+    setFilter({
+      from: `${year}-${mm}-01`,
+      to: `${year}-${mm}-${String(last).padStart(2, "0")}`,
+    });
+
+    // 실제 조회용 쿼리
+    setQueryYear(year);
+    setQueryMonth(month);
     setPage(1);
   };
 
   const resetAll = () => {
+    const [yStr, mStr] = defaultMonthStr.split("-");
+    const year = Number(yStr);
+    const month = Number(mStr);
+
+    setSelectedMonth(defaultMonthStr);
     setFilter({});
+    setQueryYear(year);
+    setQueryMonth(month);
     setPage(1);
   };
 
-  const aggregated = useMemo(() => {
-    const from = filter.from ? new Date(filter.from) : null;
-    const to = filter.to ? new Date(filter.to) : null;
-
-    const ranged = SALES.filter((s) => {
-      const d = new Date(s.date);
-      if (from && d < from) return false;
-      if (to && d > to) return false;
-      return true;
+  const handleExport = async () => {
+    const res = await reportsAdapter.exportMonthlyExcel({
+      year: queryYear,
+      month: queryMonth,
     });
 
-    const map = new Map<string, AggRow>();
-    for (const s of ranged) {
-      const k = `${s.sku}__${s.name}`;
-      const prev = map.get(k);
-      if (prev) {
-        prev.shippedQty += s.qty;
-        prev.revenue += s.revenue;
-      } else {
-        map.set(k, {
-          id: k,
-          sku: s.sku,
-          name: s.name,
-          shippedQty: s.qty,
-          revenue: s.revenue,
-        });
-      }
+    if (!res.ok || !res.data) {
+      return handleError(res.error);
     }
 
-    let list = Array.from(map.values());
-    const key = sort.key as keyof AggRow | undefined;
-    if (key && SORTABLE_KEYS.has(key)) {
-      list.sort((a, b) => {
-        const av = a[key] as any;
-        const bv = b[key] as any;
-        if (NUMERIC_KEYS.has(key)) {
-          const diff = (Number(av) || 0) - (Number(bv) || 0);
-          return sort.dir === "DESC" ? -diff : diff;
-        }
-        const comp = String(av ?? "").localeCompare(String(bv ?? ""));
-        return sort.dir === "DESC" ? -comp : comp;
-      });
-    }
-    return list;
-  }, [filter.from, filter.to, sort]);
+    downloadBase64File(res.data);
+  };
 
-  const processed = useMemo(() => {
-    const total = aggregated.length;
-    const start = (page - 1) * pageSize;
-    return {
-      total,
-      rows: aggregated.slice(start, start + pageSize),
-    };
-  }, [aggregated, page, pageSize]);
-
-  const rows = useMemo(
-    () =>
-      processed.rows.map((r, i) => ({
-        id: r.id,
-        rank: (page - 1) * pageSize + i + 1,
-        sku: r.sku,
-        name: r.name,
-        shippedQty: fmt(r.shippedQty),
-      })),
-    [processed.rows, page, pageSize]
-  );
+  /* ─────────────────────────────────────────────
+   * 테이블 표현용 가공 (순위 계산)
+   * ───────────────────────────────────────────── */
+  const tableRows: TableRow[] = useMemo(() => {
+    return items.map((item, idx) => ({
+      id: `${item.sku}-${idx}`,
+      rank: (page - 1) * pageSize + idx + 1,
+      sku: item.sku,
+      name: item.name,
+      shippedQty: fmt(item.shipped_qty),
+    }));
+  }, [items, page, pageSize]);
 
   return (
     <div className="p-4 monthly-page">
       <MonthlyStyles />
 
       <TableBase
-        rows={rows}
+        rows={tableRows}
         headers={TABLE_HEADERS as any}
-        loading={false}
+        loading={loading}
         page={page}
         pageSize={pageSize}
-        total={processed.total}
+        total={totalCount}
         onPageChange={setPage}
         onPageSizeChange={setPageSize}
         sort={sort}
@@ -242,7 +266,7 @@ export default function MonthlyPage() {
             </button>
             <button
               className="rounded-xl border px-3 py-2 text-sm hover:bg-gray-50"
-              onClick={() => alert("엑셀 내보내기(추후 연동)")}
+              onClick={handleExport}
             >
               엑셀 내보내기
             </button>

@@ -1,17 +1,24 @@
 // C:\dev\stock-app\stock-gui\src\pages\Stock\History\HistoryPage.tsx
 // 재고관리 > 재고이력
-// - 가로 스크롤 제거: 컬럼폭 최적화 + 긴 텍스트 줄바꿈
-// - 이 페이지만 체크박스 컬럼 제거 (CSS 스코프)
-// - 상단 우측에 엑셀 다운로드 버튼 추가
+// - 재고 수불부(입고·출고·조정) 타임라인 조회
+// - 상단: 기간(from/to) + 키워드(SKU, 상품명 등) 필터
+// - 하단: 처리일자 / 내용 / SKU / 상품명 / 입고수량 / 출고수량 / 현 재고 / 최근 단가 / 메모 / 처리자
+// - 가로 스크롤 최소화(컬럼 폭 조정 + 긴 텍스트 줄바꿈)
+// - 이 페이지만 체크박스 컬럼 제거(CSS 스코프)
+// - 상단 우측 엑셀 다운로드 버튼: 백엔드 /api/stock/history/export 사용
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import TableBase from "../../../components/common/table/TableBase";
+import {
+  stockAdapter,
+  type StockHistoryListItem,
+} from "@/api/adapters/stock.adapter";
 
 type HistoryType = "입고" | "출고" | "조정";
 
 type HistoryRow = {
   id: string;
-  date: string; // 원본 "YYYY-MM-DD HH:mm"
+  date: string; // "YYYY-MM-DD"
   type: HistoryType;
   sku: string;
   name: string;
@@ -19,55 +26,12 @@ type HistoryRow = {
   outQty: number;
   stockNow: number;
   unitPrice: number;
-  memo?: string;
+  memo: string;
   actor: string;
 };
 
 type SortDir = "ASC" | "DESC";
 
-const MOCK_ROWS: HistoryRow[] = [
-  {
-    id: "HIS-0001",
-    date: "2025-10-26 09:10",
-    type: "입고",
-    sku: "FD_SAMY_BULDAKSA02_HAKBUL0200_01EA",
-    name: "삼양 불닭사리 핵불닭 200g",
-    inQty: 200,
-    outQty: 0,
-    stockNow: 1120,
-    unitPrice: 870,
-    memo: "",
-    actor: "관리자",
-  },
-  {
-    id: "HIS-0002",
-    date: "2025-10-26 10:22",
-    type: "출고",
-    sku: "FD_DSFS_MAXIMKAN05_MILDLOS030_1BOX",
-    name: "맥심 카누 마일드 로스트 30입",
-    inQty: 0,
-    outQty: 12,
-    stockNow: 168,
-    unitPrice: 11200,
-    memo: "",
-    actor: "직원명",
-  },
-  {
-    id: "HIS-0003",
-    date: "2025-10-26 11:05",
-    type: "조정",
-    sku: "FD_OTTO_JINRAMYEON01EA",
-    name: "오뚜기 진라면 순한맛 120g",
-    inQty: 0,
-    outQty: 0,
-    stockNow: 945,
-    unitPrice: 540,
-    memo: "월간 실사 차이 반영",
-    actor: "대표명",
-  },
-];
-
-// ✅ 컬럼 폭을 보수적으로 축소 (총합↓) + 긴 컬럼은 줄바꿈으로 해결
 const TABLE_HEADERS = [
   { key: "date", header: "처리일자", width: "112px" },
   { key: "type", header: "내용", width: "72px" },
@@ -104,6 +68,21 @@ function StockHistoryStyles() {
   );
 }
 
+// 백엔드 → 화면용 Row 매핑
+const mapFromApi = (item: StockHistoryListItem): HistoryRow => ({
+  id: String(item.ledger_id),
+  date: item.process_date, // "YYYY-MM-DD"
+  type: item.event_label as HistoryType, // "입고" / "출고" / "조정"
+  sku: item.sku,
+  name: item.product_name,
+  inQty: item.qty_in,
+  outQty: item.qty_out,
+  stockNow: item.current_stock,
+  unitPrice: item.last_unit_price ?? 0,
+  memo: item.memo ?? "",
+  actor: item.handler ?? "",
+});
+
 export default function HistoryPage() {
   const [sort, setSort] = useState<{ key?: string; dir?: SortDir }>({
     key: "date",
@@ -111,19 +90,65 @@ export default function HistoryPage() {
   });
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
-  // TableBase의 FilterBox와 맞추기 위해 any로 관리 (from/to/keyword 확장 가능)
+
+  // TableBase의 FilterBox와 맞추기 위해 any 사용 (from/to/keyword)
   const [filter, setFilter] = useState<any>({});
 
-  const processed = useMemo(() => {
-    let list = [...MOCK_ROWS];
+  const [rows, setRows] = useState<HistoryRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
 
-    // 정렬
+  // 목록 조회
+  useEffect(() => {
+    const fetchList = async () => {
+      setLoading(true);
+      try {
+        const res = await stockAdapter.getHistoryList({
+          from_date: filter.from || undefined,
+          to_date: filter.to || undefined,
+          keyword: filter.keyword || undefined,
+          page,
+          size: pageSize,
+        });
+
+        if (res.ok && res.data) {
+          const result = res.data;
+          setTotal(result.count ?? 0);
+          setRows(result.items.map(mapFromApi));
+        } else {
+          setTotal(0);
+          setRows([]);
+          // 에러 메시지는 허브에서 가공된 message 그대로 사용
+          if (res.error?.message) {
+            window.alert(res.error.message);
+          } else {
+            window.alert("재고 이력 조회 중 오류가 발생했습니다.");
+          }
+          // 디버깅용 로그
+          window.console.error("[StockHistory] list error", res.error);
+        }
+      } catch (e) {
+        setTotal(0);
+        setRows([]);
+        window.alert("재고 이력 조회 중 예외가 발생했습니다.");
+        window.console.error("[StockHistory] list exception", e);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchList();
+  }, [page, pageSize, filter.from, filter.to, filter.keyword]);
+
+  const processed = useMemo(() => {
+    let list = [...rows];
+
     const key = sort.key as keyof HistoryRow | undefined;
     if (key) {
       list = list.sort((a, b) => {
         if (key === "date") {
-          const av = new Date(a.date.replace(" ", "T"));
-          const bv = new Date(b.date.replace(" ", "T"));
+          const av = new Date(a.date);
+          const bv = new Date(b.date);
           const diff = av.getTime() - bv.getTime();
           return sort.dir === "DESC" ? -diff : diff;
         }
@@ -138,19 +163,15 @@ export default function HistoryPage() {
       });
     }
 
-    // 페이지네이션
-    const total = list.length;
-    const start = (page - 1) * pageSize;
-    const paged = list.slice(start, start + pageSize);
-    return { total, rows: paged };
-  }, [sort, page, pageSize]);
+    return { total, rows: list };
+  }, [rows, sort, total]);
 
-  // 🔎 긴 텍스트는 줄바꿈 허용(span으로 감싸 Tailwind 클래스 적용)
+  // 긴 텍스트 줄바꿈 허용
   const tableRows = useMemo(
     () =>
       processed.rows.map((r) => ({
         id: r.id,
-        date: r.date.split(" ")[0], // 시간 제거
+        date: r.date, // 이미 "YYYY-MM-DD"
         type: r.type,
         sku: <span className="whitespace-normal break-all leading-6">{r.sku}</span>,
         name: <span className="whitespace-normal break-words leading-6">{r.name}</span>,
@@ -158,59 +179,58 @@ export default function HistoryPage() {
         outQty: fmtNum(r.outQty),
         stockNow: fmtNum(r.stockNow),
         unitPrice: fmtNum(r.unitPrice),
-        memo: <span className="whitespace-normal break-words leading-6">{r.memo ?? ""}</span>,
+        memo: (
+          <span className="whitespace-normal break-words leading-6">
+            {r.memo ?? ""}
+          </span>
+        ),
         actor: r.actor,
       })),
     [processed.rows]
   );
 
-  // ✅ 재고이력 전체 엑셀(CSV) 다운로드 (가짜 데이터 기준, 나중에 API 결과로 교체)
-  const handleExport = () => {
-    const header = [
-      "처리일자",
-      "내용",
-      "SKU",
-      "상품명",
-      "입고수량",
-      "출고수량",
-      "현 재고",
-      "최근 단가",
-      "메모",
-      "처리자",
-    ];
+  // 엑셀 다운로드: /api/stock/history/export 사용
+  const handleExport = async () => {
+    try {
+      const res = await stockAdapter.exportHistory({
+        from_date: filter.from || undefined,
+        to_date: filter.to || undefined,
+        keyword: filter.keyword || undefined,
+        // export는 보통 전체 대상이므로 page/size는 전달하지 않음
+      } as any);
 
-    const lines = [
-      header.join(","),
-      ...MOCK_ROWS.map((r) => {
-        const safeName = `"${String(r.name).replace(/"/g, '""')}"`;
-        const safeMemo = `"${String(r.memo ?? "").replace(/"/g, '""')}"`;
-        return [
-          r.date,
-          r.type,
-          r.sku,
-          safeName,
-          r.inQty,
-          r.outQty,
-          r.stockNow,
-          r.unitPrice,
-          safeMemo,
-          r.actor,
-        ].join(",");
-      }),
-    ];
+      if (!res.ok || !res.data) {
+        if (res.error?.message) {
+          window.alert(res.error.message);
+        } else {
+          window.alert("엑셀 다운로드 중 오류가 발생했습니다.");
+        }
+        window.console.error("[StockHistory] export error", res.error);
+        return;
+      }
 
-    const csv = "\uFEFF" + lines.join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `stock_history_${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+      const { file_name, content_type, content_base64 } = res.data;
+
+      const binary = atob(content_base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      const blob = new Blob([bytes], { type: content_type || "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file_name || `stock_history_${new Date().toISOString().slice(0, 10)}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      window.alert("엑셀 다운로드 중 예외가 발생했습니다.");
+      window.console.error("[StockHistory] export exception", e);
+    }
   };
 
   return (
-    // 컨테이너에서 가로 넘침 차단
     <div className="stock-history-page p-4 w-full overflow-x-hidden">
       <StockHistoryStyles />
 
@@ -220,12 +240,15 @@ export default function HistoryPage() {
         <TableBase
           rows={tableRows}
           headers={TABLE_HEADERS as any}
-          loading={false}
+          loading={loading}
           page={page}
           pageSize={pageSize}
           total={processed.total}
-          onPageChange={setPage}
-          onPageSizeChange={setPageSize}
+          onPageChange={(nextPage) => setPage(nextPage)}
+          onPageSizeChange={(ps) => {
+            setPageSize(ps);
+            setPage(1);
+          }}
           sort={sort}
           onSortChange={setSort}
           filter={filter}
@@ -234,6 +257,7 @@ export default function HistoryPage() {
             <button
               className="rounded-xl bg-gray-900 px-3 py-2 text-sm text-white hover:bg-gray-950"
               onClick={handleExport}
+              disabled={loading}
             >
               엑셀 다운로드
             </button>

@@ -2,10 +2,10 @@
 # 페이지: 출고 취소(OutboundCancelPage)
 # 역할:
 #   1) 출고완료 → 출고취소된 목록 조회
-#   2) 취소된 출고건을 출고등록 상태로 재출고 처리
+#   2) 취소된 출고건을 출고등록 상태(draft)로 재출고 처리
 #   3) 엑셀(xlsx) 다운로드
 #
-# 단계: v1.0 (Full Implementation) / 재고이찌 구조 통일 적용
+# 단계: v1.3 (reissue 시 기존 canceled 전표를 draft 로 복구 + tracking_number 유지)
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ except ImportError:
 # 페이지 메타
 # ─────────────────────────────────────────────────────────
 PAGE_ID = "outbound.cancel"
-PAGE_VERSION = "v1.0"
+PAGE_VERSION = "v1.3"
 
 
 # ─────────────────────────────────────────────────────────
@@ -48,6 +48,40 @@ class Pagination:
 
 
 # ─────────────────────────────────────────────────────────
+# 내부 유틸: current_user 정규화
+# ─────────────────────────────────────────────────────────
+def _normalize_user_identifier(user: Any) -> str:
+    """
+    router에서 dict(payload)나 Pydantic 모델, 문자열 등
+    어떤 형태로 넘어와도 DB에는 username(또는 sub) 같은 단일 문자열만 저장되도록 정규화.
+    """
+    if user is None:
+        return ""
+
+    # 이미 문자열인 경우
+    if isinstance(user, str):
+        return user
+
+    # dict(payload)인 경우
+    if isinstance(user, dict):
+        for key in ("username", "sub", "id"):
+            value = user.get(key)
+            if value is not None:
+                return str(value)
+        # 그래도 없으면 통째로 str 처리
+        return str(user)
+
+    # Pydantic TokenPayload 같은 객체
+    if hasattr(user, "username"):
+        return str(getattr(user, "username"))
+    if hasattr(user, "sub"):
+        return str(getattr(user, "sub"))
+
+    # 기타: 그냥 문자열 변환
+    return str(user)
+
+
+# ─────────────────────────────────────────────────────────
 # 서비스 클래스
 # ─────────────────────────────────────────────────────────
 class OutboundCancelService:
@@ -55,16 +89,17 @@ class OutboundCancelService:
     출고 취소 도메인 서비스
 
     - 출고취소 목록 조회
-    - 재출고 처리
+    - 재출고 처리(기존 canceled 전표를 draft 로 복구, tracking_number 유지)
     - 엑셀 다운로드
     """
 
     page_id: str = PAGE_ID
     page_version: str = PAGE_VERSION
 
-    def __init__(self, *, db: Session, current_user: str):
+    def __init__(self, *, db: Session, current_user: Any):
         self.db = db
-        self.current_user = current_user
+        # ✅ 여기서 한 번만 문자열로 정규화해서 사용
+        self.current_user: str = _normalize_user_identifier(current_user)
 
     # ─────────────────────────────────────────────────────
     # 1) 출고취소 목록 조회
@@ -179,7 +214,9 @@ class OutboundCancelService:
     # ─────────────────────────────────────────────────────
     def reissue(self, *, header_ids: List[int]) -> Dict[str, Any]:
         """
-        취소된 outbound_header를 새 전표로 복사하여 draft 상태로 생성
+        취소된 outbound_header를 다시 draft 상태로 되살려
+        출고등록(등록 탭)에서 재작업할 수 있도록 복구한다.
+        (tracking_number 는 유지)
         """
 
         if not header_ids:
@@ -198,6 +235,7 @@ class OutboundCancelService:
 
         header_id = header_ids[0]
 
+        # 1) canceled 헤더 조회
         src_header: Optional[m.OutboundHeader] = (
             self.db.query(m.OutboundHeader)
             .filter(
@@ -215,6 +253,7 @@ class OutboundCancelService:
                 ctx={"header_id": header_id},
             )
 
+        # 2) 품목 조회
         src_items: List[m.OutboundItem] = (
             self.db.query(m.OutboundItem)
             .filter(
@@ -231,48 +270,36 @@ class OutboundCancelService:
                 ctx={"header_id": header_id},
             )
 
-        # 새 헤더 생성 (draft 상태)
-        new_header = m.OutboundHeader(
-            outbound_date=None,
-            order_number=src_header.order_number,
-            channel=src_header.channel,
-            country=src_header.country,
-            tracking_number=None,
-            status="draft",
-            receiver_name=src_header.receiver_name,
-            created_by=self.current_user,
-            memo=src_header.memo,
-            weight_g=None,
-            updated_by=self.current_user,
-        )
+        # 3) 헤더를 draft 로 되돌리기
+        #    - outbound_date: 새 출고 확정 전까지 None
+        #    - tracking_number: 유지 (송장번호는 그대로 사용)
+        #    - weight_g: 재계측 전까지 None
+        #    - status: 'draft'
+        now = datetime.utcnow()
 
-        self.db.add(new_header)
-        self.db.flush()  # new_header.id 확보
+        src_header.outbound_date = None
+        # src_header.tracking_number 는 그대로 둔다
+        src_header.weight_g = None
+        src_header.status = "draft"
+        src_header.updated_by = self.current_user
+        src_header.updated_at = now
 
+        # 4) 품목 스캔수량 초기화
         item_count = 0
-
-        for src_item in src_items:
-            new_item = m.OutboundItem(
-                header_id=new_header.id,
-                sku=src_item.sku,
-                qty=src_item.qty,
-                scanned_qty=0,
-                sales_price=src_item.sales_price,
-                sales_total=src_item.sales_total,
-                currency=src_item.currency,
-                updated_by=self.current_user,
-            )
-
-            self.db.add(new_item)
+        for item in src_items:
+            item.scanned_qty = 0
+            item.updated_by = self.current_user
+            item.updated_at = now
             item_count += 1
 
         self.db.commit()
 
+        # 프론트와의 계약 유지: new_header_id 는 복구된 헤더 id 사용
         return {
             "action": "reissue",
             "source_header_id": src_header.id,
-            "new_header_id": new_header.id,
-            "order_number": new_header.order_number,
+            "new_header_id": src_header.id,
+            "order_number": src_header.order_number,
             "item_count": item_count,
         }
 

@@ -5,11 +5,15 @@
     - .env
     - .env.sample
     - .gitignore
+    - .tmp-backend.tar197879059
+    - .tmp-backend.tar751528395
     - Sync_To_Ext.bat
     - Sync_To_Local.bat
     - alembic.ini
     - alembic.ini.backup
+    - backend.tar
     - commands.txt
+    - docker-compose.dev.yml
     - docker-compose.yml
     - generate_structure.py
     - project_structure.txt
@@ -36,9 +40,11 @@
     📁 models/
         - audit_log.py
 📁 backend/
+    - Dockerfile
     - __init__.py
     - main.py
     - models.py
+    - requirements.txt
     📁 db/
         - __init__.py
         - session.py
@@ -142,6 +148,8 @@
     📁 alembic/
         📁 versions/
             - a308224d50cc_init_schema_v1_3_final.py
+📁 nginx/
+    - nginx.conf
 📁 ops/
     📁 backup/
         - backup_db.ps1
@@ -160,11 +168,13 @@
                 - apiClient.ts
 📁 stock-app/
 📁 stock-gui/
+    - .dockerignore
     - .env
     - .gitignore
     - Dockerfile
     - README.md
     - eslint.config.js
+    - frontend.tar
     - generate_structure.py
     - index.html
     - package-lock.json
@@ -182,6 +192,21 @@
         - App.tsx
         - index.css
         - main.tsx
+        📁 api/
+            📁 adapters/
+                - inbound.adapter.ts
+                - login.adapter.ts
+                - main.adapter.ts
+                - outbound.adapter.ts
+                - products.adapter.ts
+                - reports.adapter.ts
+                - settings.adapter.ts
+                - stock.adapter.ts
+            📁 hub/
+                - apiHub.ts
+                - front_error_codes.ts
+                - hub.types.ts
+                - index.ts
         📁 components/
             📁 common/
                 - ButtonGroup.tsx
@@ -221,17 +246,12 @@
             📁 api/
                 - index.ts
             📁 connectors/
-                - useTableConnector.ts
-                📁 adapters/
-                    - ledger.adapter.ts
-                    - product.adapter.ts
-                    - report.adapter.ts
-                    - settings.adapter.ts
-                    - stock.adapter.ts
             📁 hooks/
                 - useApi.ts
             📁 utils/
                 - helpers.ts
+        📁 openapi/
+            - backend-openapi.json
         📁 pages/
             📁 Dashboard/
                 - DashboardPage.tsx
@@ -292,6 +312,83 @@
             - product.ts
         📁 utils/
             - formatter.ts
+            - handleError.ts
+📁 stock-mobile/
+    - .env
+    - .gitignore
+    - README.md
+    - components.json
+    - eslint.config.js
+    - index.html
+    - package.json
+    - pnpm-lock.yaml
+    - postcss.config.js
+    - structure.txt
+    - tailwind.config.js
+    - tsconfig.app.json
+    - tsconfig.json
+    - tsconfig.node.json
+    - vite.config.ts
+    📁 public/
+        - vite.svg
+    📁 src/
+        - App.css
+        - App.tsx
+        - index.css
+        - main.tsx
+        📁 api/
+            📁 adapters/
+                - inbound.adapter.ts
+                - login.adapter.ts
+                - main.adapter.ts
+                - outbound.adapter.ts
+                - products.adapter.ts
+                - reports.adapter.ts
+                - settings.adapter.ts
+                - stock.adapter.ts
+            📁 hub/
+                - apiHub.ts
+                - front_error_codes.ts
+                - hub.types.ts
+                - index.ts
+        📁 assets/
+            - react.svg
+        📁 auth/
+            - RequireAuth.tsx
+            - auth.tsx
+            - useAuth.tsx
+        📁 components/
+            📁 layout/
+                - AppShell.tsx
+            📁 ui/
+                - button.tsx
+                - input.tsx
+                - label.tsx
+                - toast.tsx
+                - toaster.tsx
+        📁 hooks/
+            - use-toast.ts
+        📁 lib/
+            - apiClient.ts
+            - utils.ts
+        📁 pages/
+            📁 inbound/
+                - InboundBarcodeScanPage.tsx
+                - InboundListPage.tsx
+            📁 login/
+                - LoginPage.tsx
+            📁 main/
+                - MainPage.tsx
+            📁 outbound/
+                - OutboundInvoiceScanPage.tsx
+                - OutboundListPage.tsx
+                - OutboundScanPage.tsx
+            📁 stock/
+                - StockBarcodeScanPage.tsx
+                - StockStatusPage.tsx
+        📁 utils/
+            - formatter.ts
+            - handleError.ts
 📁 tools/
     - apply_schema_sql.py
     - envcheck.py
@@ -579,6 +676,17 @@
             - 8faa628179f5_init_schema_v1_3_final.cpython-313.pyc
             - a8f4f8d36d7e_init_schema_v1_3_reset.cpython-313.pyc
             - e227ae327327_init_schema_v1_3_clean.cpython-313.pyc
+    📁 stock-gui-backup/
+        📁 src/
+            📁 lib/
+                📁 connectors/
+                    - useTableConnector.ts
+                    📁 adapters/
+                        - ledger.adapter.ts
+                        - product.adapter.ts
+                        - report.adapter.ts
+                        - settings.adapter.ts
+                        - stock.adapter.ts
 📁 _restored_from_backup/
 📁 _snapshot_20251031_005153/
     - .dockerignore

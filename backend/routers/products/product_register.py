@@ -1,7 +1,7 @@
 # 📄 backend/routers/products/product_register.py
 # 페이지: 상품관리 — 상품 등록(CreatePage.tsx)
 # 역할: 요청 → 가드 → DTO파싱 → 서비스 호출 → 응답
-# 단계: v1-6 (등록/조회/수정/삭제 + 묶음매핑 + bulk rows + DB v1.6-r2 대응)
+# 단계: v1-7 (등록/조회/수정/삭제 + 묶음매핑 + bulk rows + DB v1.6-r2 대응 + SKU 단건조회)
 #
 # ✅ 라우터 원칙
 # - 비즈니스 로직 없음(계산/검증/트랜잭션 금지)
@@ -12,6 +12,10 @@
 # - DB product 테이블에 base_sku / pack_qty 추가
 # - 라우터는 스펙을 노출하지 않고, 서비스에서 기본값 처리:
 #   - 신규 상품: base_sku = sku, pack_qty = 1, is_bundle = false 로 등록
+#
+# ✅ v1-7 변경 요약
+# - SKU 기준 단건 조회 엔드포인트 추가 (/lookup-by-sku)
+#   - 입고/출고/모바일 등에서 SKU만으로 상품명/단가 조회 용도
 
 from __future__ import annotations
 
@@ -30,7 +34,7 @@ from backend.security.guard import guard
 # 페이지 메타
 # ──────────────────────────────────────────
 PAGE_ID = "product.register"
-PAGE_VERSION = "v1-6"
+PAGE_VERSION = "v1-7"
 
 ROUTE_PREFIX = "/api/products/register"
 ROUTE_TAGS = ["product_register"]
@@ -180,13 +184,13 @@ def ping():
     """
     상태 확인용 핑 엔드포인트
     - stage:
-      - router+db+bundle+bulk+base_sku/pack
+      - router+db+bundle+bulk+base_sku/pack+lookup_by_sku
     """
     return PingResponse(
         ok=True,
         page=PAGE_ID,
         version=PAGE_VERSION,
-        stage="router+db+bundle+bulk+base_sku/pack",
+        stage="router+db+bundle+bulk+base_sku/pack+lookup_by_sku",
     )
 
 
@@ -219,6 +223,27 @@ async def list_items(
         result = svc.list_items()
     except DomainError as exc:
         raise exc
+    return ActionResponse(ok=True, data=ActionData(result=result))
+
+
+# ──────────────────────────────────────────
+# 1-1) SKU 단건 조회  → svc.get_by_sku
+# ──────────────────────────────────────────
+@product_register.get("/lookup-by-sku", response_model=ActionResponse)
+async def lookup_by_sku(
+    sku: str = Query(..., description="조회할 SKU"),
+    svc: ProductRegisterService = Depends(get_service),
+):
+    """
+    SKU 기준 상품 단건 조회
+    - 입고/출고/모바일 등에서 SKU만으로 상품명/단가 조회 용도
+    - 예) /api/products/register/lookup-by-sku?sku=NO-BARCODE-001
+    """
+    try:
+        result = svc.get_by_sku(sku=sku)
+    except DomainError as exc:
+        raise exc
+
     return ActionResponse(ok=True, data=ActionData(result=result))
 
 

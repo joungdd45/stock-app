@@ -1,57 +1,29 @@
 // src/pages/dashboard/Weekly/WeeklyPage.tsx
 // 대시보드 > 주간 현황
 // - FilterBox 완전 숨김(CSS) + actions에 월/주/적용/초기화/엑셀 버튼
-// - 선택 월·주를 from/to로 매핑
+// - 선택 월·주 기준으로 백엔드 /api/reports/weekly 호출
+// - 응답 range_from/range_to를 from/to로 매핑
 // - 총 매출 열 제거
 // - 체크박스 컬럼은 Stock Status와 동일하게 CSS로 완전 숨김
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import TableBase from "../../../components/common/table/TableBase";
+import {
+  reportsAdapter,
+  type ReportsWeeklyItem,
+  type ReportsWeeklyListResult,
+} from "@/api/adapters/reports.adapter";
+import { handleError } from "@/utils/handleError";
 
 type SortDir = "ASC" | "DESC";
-type SalesRow = { date: string; sku: string; name: string; qty: number; revenue: number };
-type AggRow = { id: string; sku: string; name: string; shippedQty: number; revenue: number };
 type FilterState = { from?: string; to?: string };
 
-/* ────────────────────────────────────────────────────────────────
- * 더미 데이터
- * ────────────────────────────────────────────────────────────────*/
-const SALES: SalesRow[] = [
-  { date: "2025-10-01", sku: "FD_OTTO_JINRAMYEON01EA", name: "오뚜기 진라면 순한맛 120g", qty: 40, revenue: 216000 },
-  { date: "2025-10-03", sku: "FD_SAMY_BULDAKSA02_HAKBUL0200_01EA", name: "삼양 불닭사리 핵불닭 200g", qty: 22, revenue: 198000 },
-  { date: "2025-10-07", sku: "FD_SAMY_BULDAKSA02_HAKBUL0200_01EA", name: "삼양 불닭사리 핵불닭 200g", qty: 18, revenue: 162000 },
-  { date: "2025-10-09", sku: "FD_NONG_SHIN_RAMYUN120_01EA", name: "농심 신라면 120g", qty: 28, revenue: 154000 },
-  { date: "2025-10-12", sku: "FD_HAIT_SAEUKKANG090_01EA", name: "해태 새우깡 90g", qty: 30, revenue: 126000 },
-  { date: "2025-10-13", sku: "FD_PEPSI_ZERO_033L_CAN_01EA", name: "펩시 제로 330ml 캔", qty: 26, revenue: 104000 },
-  { date: "2025-10-15", sku: "FD_BING_SUJEONGWA_238_01EA", name: "빙 수정과 238ml", qty: 19, revenue: 76000 },
-  { date: "2025-10-18", sku: "FD_LOTTE_PEpero05_ALMOND_01EA", name: "롯데 빼빼로 아몬드", qty: 33, revenue: 181500 },
-  { date: "2025-10-22", sku: "FD_PULM_DUMPLING_BULGOGI_01EA", name: "풀무원 얇은피만두 불고기", qty: 27, revenue: 243000 },
-  { date: "2025-10-26", sku: "FD_SAMY_RICECAKE_TTEOKBOKKI_01EA", name: "삼양 즉석 떡볶이", qty: 24, revenue: 204000 },
-];
-
-/* ────────────────────────────────────────────────────────────────
- * 헤더 정의 (매출 제거)
- * ────────────────────────────────────────────────────────────────*/
 const TABLE_HEADERS = [
   { key: "rank", header: "순위", width: "84px", sortable: false },
   { key: "sku", header: "SKU", width: "300px" },
   { key: "name", header: "상품명", width: "300px" },
   { key: "shippedQty", header: "출고수량", width: "120px" },
 ] as const;
-
-const SORTABLE_KEYS = new Set<keyof AggRow>(["sku", "name", "shippedQty"]);
-const NUMERIC_KEYS = new Set<keyof AggRow>(["shippedQty", "revenue"]);
-const fmt = (v: number) => v.toLocaleString();
-const dim = (y: number, m: number) => new Date(y, m, 0).getDate();
-const weekRange = (y: number, m1to12: number, w: number) => {
-  const s = (w - 1) * 7 + 1;
-  const e = Math.min(s + 6, dim(y, m1to12));
-  const mm = String(m1to12).padStart(2, "0");
-  return {
-    from: `${y}-${mm}-${String(s).padStart(2, "0")}`,
-    to: `${y}-${mm}-${String(e).padStart(2, "0")}`,
-  };
-};
 
 /* ────────────────────────────────────────────────────────────────
  * 이 페이지 전용 스타일 (체크박스 컬럼 제거 + FilterBox/정렬아이콘 숨김)
@@ -88,6 +60,9 @@ function WeeklyStyles() {
   );
 }
 
+/* 숫자 포맷 공통 헬퍼 */
+const formatNumber = (v?: number | null) => (v ?? 0).toLocaleString();
+
 /* ────────────────────────────────────────────────────────────────
  * 메인 컴포넌트
  * ────────────────────────────────────────────────────────────────*/
@@ -97,7 +72,6 @@ export default function WeeklyPage() {
     today.getMonth() + 1
   ).padStart(2, "0")}`;
 
-  const [filter, setFilter] = useState<FilterState>({});
   const [selectedMonth, setSelectedMonth] = useState(defaultMonth);
   const [selectedWeek, setSelectedWeek] = useState(1);
 
@@ -107,84 +81,134 @@ export default function WeeklyPage() {
   });
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
+  const [loading, setLoading] = useState(false);
 
-  const applyRange = () => {
-    const [y, m] = selectedMonth.split("-").map(Number);
-    const { from, to } = weekRange(y, m, selectedWeek);
-    setFilter({ from, to });
-    setPage(1);
+  const [result, setResult] = useState<ReportsWeeklyListResult | null>(null);
+
+  const filter: FilterState = useMemo(
+    () =>
+      result
+        ? {
+            from: result.range_from,
+            to: result.range_to,
+          }
+        : {},
+    [result]
+  );
+
+  const items: ReportsWeeklyItem[] = result?.items ?? [];
+  const total = result?.total ?? 0;
+
+  const buildParams = (override?: {
+    year?: number;
+    month?: number;
+    week?: number;
+    page?: number;
+    pageSize?: number;
+  }) => {
+    const [yStr, mStr] = selectedMonth.split("-");
+    const base = {
+      year: Number(override?.year ?? Number(yStr)),
+      month: Number(override?.month ?? Number(mStr)),
+      week: Number(override?.week ?? selectedWeek),
+      page: Number(override?.page ?? page),
+      pageSize: Number(override?.pageSize ?? pageSize),
+    };
+    return base;
   };
 
-  const resetAll = () => {
-    setFilter({});
-    setPage(1);
-  };
+  const fetchWeekly = async (override?: {
+    year?: number;
+    month?: number;
+    week?: number;
+    page?: number;
+    pageSize?: number;
+  }) => {
+    const params = buildParams(override);
 
-  const aggregated = useMemo(() => {
-    const from = filter.from ? new Date(filter.from) : null;
-    const to = filter.to ? new Date(filter.to) : null;
-
-    const ranged = SALES.filter((s) => {
-      const d = new Date(s.date);
-      if (from && d < from) return false;
-      if (to && d > to) return false;
-      return true;
+    setLoading(true);
+    const res = await reportsAdapter.fetchWeeklyList({
+      year: params.year,
+      month: params.month,
+      week: params.week,
+      page: params.page,
+      page_size: params.pageSize,
+      sort: "qty_desc", // 기본: 출고수량 내림차순
     });
 
-    const map = new Map<string, AggRow>();
-    for (const s of ranged) {
-      const k = `${s.sku}__${s.name}`;
-      const prev = map.get(k);
-      if (prev) {
-        prev.shippedQty += s.qty;
-        prev.revenue += s.revenue;
-      } else {
-        map.set(k, {
-          id: k,
-          sku: s.sku,
-          name: s.name,
-          shippedQty: s.qty,
-          revenue: s.revenue,
-        });
-      }
+    if (!res.ok || !res.data) {
+      setResult(null);
+      setLoading(false);
+      return handleError(res.error);
     }
 
-    let list = Array.from(map.values());
-    const key = sort.key as keyof AggRow | undefined;
-    if (key && SORTABLE_KEYS.has(key)) {
-      list.sort((a, b) => {
-        const av = a[key] as any;
-        const bv = b[key] as any;
-        if (NUMERIC_KEYS.has(key)) {
-          const diff = (Number(av) || 0) - (Number(bv) || 0);
-          return sort.dir === "DESC" ? -diff : diff;
-        }
-        const comp = String(av ?? "").localeCompare(String(bv ?? ""));
-        return sort.dir === "DESC" ? -comp : comp;
-      });
-    }
-    return list;
-  }, [filter.from, filter.to, sort]);
+    setResult(res.data);
+    setPage(params.page);
+    setPageSize(params.pageSize);
+    setLoading(false);
+  };
 
-  const processed = useMemo(() => {
-    const total = aggregated.length;
-    const start = (page - 1) * pageSize;
-    return {
-      total,
-      rows: aggregated.slice(start, start + pageSize),
-    };
-  }, [aggregated, page, pageSize]);
+  const handleApply = () => {
+    // 선택된 월/주 기준으로 1페이지부터 재조회
+    fetchWeekly({ page: 1 });
+  };
+
+  const handleReset = () => {
+    const resetMonth = defaultMonth;
+    const resetWeek = 1;
+    const [yStr, mStr] = resetMonth.split("-");
+
+    setSelectedMonth(resetMonth);
+    setSelectedWeek(resetWeek);
+    setPage(1);
+    setPageSize(10);
+
+    fetchWeekly({
+      year: Number(yStr),
+      month: Number(mStr),
+      week: resetWeek,
+      page: 1,
+      pageSize: 10,
+    });
+  };
+
+  const handleExport = async () => {
+    const params = buildParams({});
+
+    const res = await reportsAdapter.exportWeeklyExcel({
+      year: params.year,
+      month: params.month,
+      week: params.week,
+      query: undefined,
+      page: undefined,
+      page_size: undefined,
+      sort: "qty_desc",
+    });
+
+    if (!res.ok) {
+      return handleError(res.error);
+    }
+
+    // 실제 파일 다운로드 처리는 apiHub/인터셉터 쪽에서 담당한다고 가정
+    alert("주간 현황 엑셀 내보내기를 시작했습니다.");
+  };
+
+  // 첫 진입 시 기본 월/1주 기준 조회
+  useEffect(() => {
+    fetchWeekly();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const tableRows = useMemo(
     () =>
-      processed.rows.map((r, i) => ({
-        id: r.id,
-        rank: (page - 1) * pageSize + i + 1,
-        sku: r.sku,
-        name: r.name,
-        shippedQty: fmt(r.shippedQty),
+      items.map((item, idx) => ({
+        id: `${item.sku}-${idx}`,
+        rank: (page - 1) * pageSize + idx + 1,
+        sku: item.sku,
+        name: item.name,
+        shippedQty: formatNumber(item.shipped_qty),
       })),
-    [processed.rows, page, pageSize]
+    [items, page, pageSize]
   );
 
   return (
@@ -194,16 +218,23 @@ export default function WeeklyPage() {
       <TableBase
         rows={tableRows}
         headers={TABLE_HEADERS as any}
-        loading={false}
+        loading={loading}
         page={page}
         pageSize={pageSize}
-        total={processed.total}
-        onPageChange={setPage}
-        onPageSizeChange={setPageSize}
+        total={total}
+        onPageChange={(nextPage: number) => {
+          setPage(nextPage);
+          fetchWeekly({ page: nextPage });
+        }}
+        onPageSizeChange={(nextSize: number) => {
+          setPage(1);
+          setPageSize(nextSize);
+          fetchWeekly({ page: 1, pageSize: nextSize });
+        }}
         sort={sort}
         onSortChange={(next) => {
           setSort(next);
-          setPage(1);
+          // 정렬은 일단 프론트만 사용 (백엔드 sort는 qty_desc 고정)
         }}
         filter={filter}
         onFilterChange={() => {}}
@@ -225,24 +256,23 @@ export default function WeeklyPage() {
               <option value={3}>3주</option>
               <option value={4}>4주</option>
               <option value={5}>5주</option>
+              <option value={6}>6주</option>
             </select>
             <button
               className="rounded-xl border px-3 py-2 text-sm hover:bg-gray-50"
-              onClick={applyRange}
+              onClick={handleApply}
             >
               적용
             </button>
             <button
               className="rounded-xl border px-3 py-2 text-sm hover:bg-gray-50"
-              onClick={resetAll}
+              onClick={handleReset}
             >
               초기화
             </button>
             <button
               className="rounded-xl border px-3 py-2 text-sm hover:bg-gray-50"
-              onClick={() =>
-                alert("엑셀 내보내기(추후 CSV/XLSX 연동)")
-              }
+              onClick={handleExport}
             >
               엑셀 내보내기
             </button>

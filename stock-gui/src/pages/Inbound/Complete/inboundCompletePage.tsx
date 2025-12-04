@@ -1,32 +1,40 @@
 /**
  * 📄 src/pages/Inbound/Complete/CompletePage.tsx
  * 역할: 입고관리 > 입고 완료 (조회 + 수정/삭제/엑셀 다운로드)
- * UI: RegisterQueryPage 스타일과 동일한 버튼 디자인(rounded-xl 등)
- *
- * 참고:
- * - 현재 TableBase에 선택 콜백이 없어 실제 선택행 정보는 받을 수 없음.
- * - 지금은 테스트용으로 "현재 페이지의 첫 번째 행"을 기준으로 수정/삭제 처리.
- * - [DUMMY START] to [DUMMY END] 더미 블록은 API 연동 시 통째로 교체.
+ * - 백엔드 연동:
+ *   - GET  /api/inbound/complete/list
+ *   - POST /api/inbound/complete/update
+ *   - POST /api/inbound/complete/delete
+ *   - POST /api/inbound/complete/export-xlsx
  */
 
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useState, useEffect, useCallback } from "react";
 import TableBase, { type TableHeaderDef } from "../../../components/common/table/TableBase";
+import { inboundAdapter } from "@/api/adapters/inbound.adapter";
+import { handleError } from "@/utils/handleError";
 
 // ───────────────────────────────────────────────────────────────
 // 정렬/필터 상태 타입
 type SortDir = "ASC" | "DESC";
 type SortState = { key?: string; dir?: SortDir };
 
-// 데이터 타입
+// ✅ FilterBox(FilterValue)와 동일 구조, null 제거
+type FilterState = {
+  from?: string; // YYYY-MM-DD (또는 undefined)
+  to?: string;
+  keyword?: string;
+};
+
+// 화면용 행 타입
 type CompleteRow = {
-  id: string;
-  date: string;        // 입고일
-  sku: string;         // SKU
-  name: string;        // 상품명
-  quantity: number;    // 입고 수량
-  totalPrice: number;  // 총 단가(총액)
-  unitPrice: number;   // 개당 단가
-  supplier: string;    // 입고처
+  id: string; // item_id (string 변환)
+  date: string; // 입고일 (YYYY-MM-DD 또는 "")
+  sku: string; // SKU
+  name: string; // 상품명
+  quantity: number; // 입고 수량
+  totalPrice: number; // 총 단가(총액, number)
+  unitPrice: number; // 개당 단가(number, total/qty)
+  supplier: string; // 입고처
 };
 
 // 테이블 헤더
@@ -43,146 +51,284 @@ const HEADERS: TableHeaderDef[] = [
 // 포맷터
 const fmtInt = (n: number) => n.toLocaleString("ko-KR");
 const fmtCurrency = (n: number) =>
-  new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 0 }).format(n);
+  new Intl.NumberFormat("ko-KR", {
+    maximumFractionDigits: 0,
+  }).format(n);
 
-// ⛳ 더미 데이터 원본
-// ======================= [DUMMY START] =======================
-const DUMMY_ROWS: CompleteRow[] = [
-  {
-    id: "done-003",
-    date: "2025-10-22",
-    sku: "SN_MINIYAKGWA_03",
-    name: "삼립 미니약과 (3봉)",
-    quantity: 5,
-    totalPrice: 42500,
-    unitPrice: 8500,
-    supplier: "삼립",
-  },
-  {
-    id: "done-002",
-    date: "2025-10-21",
-    sku: "FD_BULDAK_200",
-    name: "불닭볶음면 200g",
-    quantity: 10,
-    totalPrice: 150000,
-    unitPrice: 15000,
-    supplier: "삼양식품",
-  },
-  {
-    id: "done-001",
-    date: "2025-10-20",
-    sku: "FD_MAXIM_001",
-    name: "맥심 모카골드 100T",
-    quantity: 3,
-    totalPrice: 39000,
-    unitPrice: 13000,
-    supplier: "동진상회",
-  },
-];
-// ======================== [DUMMY END] ========================
+// 백엔드 → 화면용 매핑
+const mapFromApi = (item: {
+  item_id: number;
+  inbound_date: string | null;
+  sku: string;
+  product_name: string;
+  qty: number;
+  total_price: string;
+  unit_price: string;
+  supplier_name: string;
+}): CompleteRow => {
+  const qty = item.qty ?? 0;
+  const total = Number(item.total_price ?? 0);
+  const unit = qty > 0 ? total / qty : Number(item.unit_price ?? 0) || 0;
+
+  return {
+    id: String(item.item_id),
+    date: item.inbound_date ?? "",
+    sku: item.sku,
+    name: item.product_name,
+    quantity: qty,
+    totalPrice: total,
+    unitPrice: unit,
+    supplier: item.supplier_name,
+  };
+};
 
 // ───────────────────────────────────────────────────────────────
 export default function CompletePage() {
   // 페이지네이션/정렬/필터
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
+  const [total, setTotal] = useState(0);
   const [sort, setSort] = useState<SortState>({ key: "date", dir: "DESC" });
-  const [filter, setFilter] = useState<Record<string, any>>({});
+  const [filter, setFilter] = useState<FilterState>({});
 
-  // 실제 화면 데이터
-  const [data, setData] = useState<CompleteRow[]>(DUMMY_ROWS);
+  // 실제 페이지 단위 데이터(백엔드에서 받은 rows)
+  const [rawRows, setRawRows] = useState<CompleteRow[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  // 선택된 item_id 목록 (string)
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
 
   // 수정 모달 상태
   const [isEditOpen, setIsEditOpen] = useState(false);
   const [editForm, setEditForm] = useState<CompleteRow | null>(null);
 
-  const loading = false;
+  // ──────────────────────
+  // 목록 조회
+  // ──────────────────────
+  const loadList = useCallback(async () => {
+    setLoading(true);
+    try {
+      // ✅ 여기에서만 undefined → null 로 변환해서 백엔드에 전달
+      const params = {
+        start_date: filter.from ? filter.from : null,
+        end_date: filter.to ? filter.to : null,
+        keyword: filter.keyword ? filter.keyword : null,
+        page,
+        size: pageSize,
+      };
 
-  // 정렬
-  const sorted = useMemo(() => {
-    if (!sort.key) return data;
+      const res = await inboundAdapter.completeList(params);
+      if (!res.ok) {
+        console.error("[InboundComplete] list error", res.error);
+        if (res.error) handleError(res.error);
+        setRawRows([]);
+        setTotal(0);
+        return;
+      }
+
+      const result = res.data;
+      const items = (result?.items ?? []).map(mapFromApi);
+      setRawRows(items);
+      setTotal(result?.count ?? 0);
+    } catch (e) {
+      console.error("[InboundComplete] list exception", e);
+      // 예외는 공통 코드가 아니라서 일반 메시지 유지
+      window.alert("입고완료 목록 조회 중 예기치 못한 오류가 발생했습니다.");
+      setRawRows([]);
+      setTotal(0);
+    } finally {
+      setLoading(false);
+      setSelectedIds([]); // 조회할 때마다 선택 초기화
+    }
+  }, [filter.from, filter.to, filter.keyword, page, pageSize]);
+
+  useEffect(() => {
+    loadList();
+  }, [loadList]);
+
+  // ──────────────────────
+  // 정렬 + 표시용 가공
+  // ──────────────────────
+  const sortedRows = useMemo(() => {
+    if (!sort.key) return rawRows;
     const dir = sort.dir === "DESC" ? -1 : 1;
-    return [...data].sort((a: any, b: any) => {
+    return [...rawRows].sort((a: any, b: any) => {
       const ak = a[sort.key!];
       const bk = b[sort.key!];
       if (ak === bk) return 0;
       return ak > bk ? dir : -dir;
     });
-  }, [data, sort]);
+  }, [rawRows, sort]);
 
-  // 페이징
-  const total = sorted.length;
-  const start = (page - 1) * pageSize;
-  const pageRows = sorted.slice(start, start + pageSize);
-
-  // 표시용 가공
-  const rows = useMemo(
+  const displayRows = useMemo(
     () =>
-      pageRows.map((r) => ({
+      sortedRows.map((r) => ({
         ...r,
         quantity: fmtInt(r.quantity),
         totalPrice: fmtCurrency(r.totalPrice),
         unitPrice: fmtCurrency(r.unitPrice),
       })),
-    [pageRows]
+    [sortedRows],
   );
 
   // ──────────────────────
-  // 이벤트 핸들러: 수정/삭제
+  // 선택된 행 기반 헬퍼
+  // ──────────────────────
+  const getSingleSelectedRow = (): CompleteRow | null => {
+    if (selectedIds.length !== 1) return null;
+    const id = selectedIds[0];
+    return rawRows.find((r) => r.id === id) ?? null;
+  };
+
+  const getSelectedItemIds = (): number[] => {
+    return selectedIds
+      .map((id) => Number(id))
+      .filter((n) => Number.isFinite(n) && n > 0);
+  };
+
+  // ──────────────────────
+  // 이벤트 핸들러: 수정/삭제/엑셀
   // ──────────────────────
   const handleOpenEdit = () => {
-    if (pageRows.length === 0) {
-      window.alert("수정할 항목이 없습니다.");
+    if (selectedIds.length === 0) {
+      window.alert("수정할 입고완료 항목을 선택해 주세요.");
+      return;
+    }
+    if (selectedIds.length > 1) {
+      window.alert("수정은 한 번에 1건만 가능합니다. 1건만 선택해 주세요.");
       return;
     }
 
-    // TODO: TableBase 선택 연동 전까지는 첫 번째 행 기준
-    const target = pageRows[0];
+    const target = getSingleSelectedRow();
+    if (!target) {
+      window.alert("선택한 항목을 찾을 수 없습니다.");
+      return;
+    }
+
     setEditForm({ ...target });
     setIsEditOpen(true);
   };
 
-  const handleDelete = () => {
-    if (pageRows.length === 0) {
-      window.alert("삭제할 항목이 없습니다.");
+  const handleDelete = async () => {
+    const itemIds = getSelectedItemIds();
+    if (itemIds.length === 0) {
+      window.alert("삭제할 입고완료 항목을 선택해 주세요.");
       return;
     }
 
-    // TODO: TableBase 선택 연동 전까지는 첫 번째 행 기준
-    const target = pageRows[0];
-
-    const ok = window.confirm(
-      `현재 페이지의 첫 번째 항목\n[${target.date}] ${target.sku}를 삭제할까요?`
-    );
+    const ok = window.confirm(`선택한 ${itemIds.length}건의 입고완료 내역을 삭제할까요?`);
     if (!ok) return;
 
-    setData((prev) => prev.filter((row) => row.id !== target.id));
+    try {
+      const res = await inboundAdapter.completeDelete({ item_ids: itemIds });
+      if (!res.ok) {
+        console.error("[InboundComplete] delete error", res.error);
+        if (res.error) handleError(res.error);
+        return;
+      }
+
+      await loadList();
+    } catch (e) {
+      console.error("[InboundComplete] delete exception", e);
+      window.alert("입고완료 내역 삭제 중 예기치 못한 오류가 발생했습니다.");
+    }
   };
 
+  // 수정 폼 입력 핸들러
   const handleEditChange = (field: keyof CompleteRow, value: string) => {
     if (!editForm) return;
 
+    // 수량/금액/단가 숫자 입력
     if (field === "quantity" || field === "totalPrice" || field === "unitPrice") {
       const num = value === "" ? 0 : Number(value.replace(/[, ]/g, ""));
       if (Number.isNaN(num)) return;
-      setEditForm({ ...editForm, [field]: num });
+
+      let nextQuantity = editForm.quantity;
+      let nextTotal = editForm.totalPrice;
+
+      if (field === "quantity") {
+        nextQuantity = num;
+      } else if (field === "totalPrice") {
+        nextTotal = num;
+      }
+
+      let nextUnit = editForm.unitPrice;
+      if (nextQuantity > 0) {
+        nextUnit = Math.floor(nextTotal / nextQuantity);
+      }
+
+      setEditForm({
+        ...editForm,
+        quantity: nextQuantity,
+        totalPrice: nextTotal,
+        unitPrice: nextUnit,
+      });
       return;
     }
 
     setEditForm({ ...editForm, [field]: value });
   };
 
-  const handleEditSave = () => {
+  const handleEditSave = async () => {
     if (!editForm) return;
 
-    setData((prev) =>
-      prev.map((row) => (row.id === editForm.id ? { ...editForm } : row))
-    );
-    setIsEditOpen(false);
+    const itemIdNum = Number(editForm.id);
+    if (!Number.isFinite(itemIdNum) || itemIdNum <= 0) {
+      window.alert("수정 대상 ID가 올바르지 않습니다.");
+      return;
+    }
+
+    const payload = {
+      item_id: itemIdNum,
+      qty: editForm.quantity,
+      total_price: editForm.totalPrice,
+      inbound_date: editForm.date || undefined,
+      supplier_name: editForm.supplier || undefined,
+    };
+
+    try {
+      const res = await inboundAdapter.completeUpdate(payload);
+      if (!res.ok) {
+        console.error("[InboundComplete] update error", res.error);
+        if (res.error) handleError(res.error);
+        return;
+      }
+
+      setIsEditOpen(false);
+      await loadList();
+    } catch (e) {
+      console.error("[InboundComplete] update exception", e);
+      window.alert("입고완료 내역 수정 중 예기치 못한 오류가 발생했습니다.");
+    }
   };
 
   const handleEditCancel = () => {
     setIsEditOpen(false);
+  };
+
+  const handleExportXlsx = async () => {
+    const itemIds = getSelectedItemIds();
+    if (itemIds.length === 0) {
+      window.alert("엑셀로 내보낼 입고완료 항목을 선택해 주세요.");
+      return;
+    }
+
+    try {
+      const res = await inboundAdapter.completeExportXlsx({ item_ids: itemIds });
+      if (!res.ok) {
+        console.error("[InboundComplete] export-xlsx error", res.error);
+        if (res.error) handleError(res.error);
+        return;
+      }
+
+      console.log("[InboundComplete] export-xlsx result (for reference)", res.data);
+      window.alert(
+        "엑셀 다운로드 요청이 완료되었습니다. (파일 저장 방식은 추후 구현 예정입니다.)",
+      );
+    } catch (e) {
+      console.error("[InboundComplete] export-xlsx exception", e);
+      window.alert("엑셀 다운로드 처리 중 예기치 못한 오류가 발생했습니다.");
+    }
   };
 
   // ────────────────────────────────────────────────────────────
@@ -193,6 +339,7 @@ export default function CompletePage() {
       <button
         className="rounded-xl px-4 py-2 text-sm bg-gray-900 text-white hover:bg-black"
         onClick={handleOpenEdit}
+        disabled={loading}
       >
         수정
       </button>
@@ -200,23 +347,23 @@ export default function CompletePage() {
       <button
         className="rounded-xl px-4 py-2 text-sm bg-red-600 text-white hover:bg-red-700"
         onClick={handleDelete}
+        disabled={loading}
       >
         삭제
       </button>
 
       <button
         className="rounded-xl border px-4 py-2 text-sm hover:bg-gray-50"
-        onClick={() => {
-          // TODO: onDownloadCSV
-        }}
+        onClick={handleExportXlsx}
+        disabled={loading}
       >
-        다운로드(CSV)
+        엑셀 다운로드
       </button>
 
       <button
         className="rounded-xl border px-3 py-2 text-sm hover:bg-gray-50"
         onClick={() => {
-          // TODO: toggle column menu
+          // 열 보이기 토글은 컬럼 설정 기능 확정 후 구현
         }}
       >
         열 보이기
@@ -227,14 +374,12 @@ export default function CompletePage() {
   // ────────────────────────────────────────────────────────────
   return (
     <div className="p-4 flex flex-col gap-3">
-      {/* 상단 제목(셸에서 넣지 않았다면 노출) */}
       <h2 className="text-base font-semibold">입고관리 - 입고 완료</h2>
 
       <TableBase
         headers={HEADERS}
-        rows={rows}
+        rows={displayRows}
         loading={loading}
-        // 페이지네이션
         page={page}
         pageSize={pageSize}
         total={total}
@@ -243,23 +388,19 @@ export default function CompletePage() {
           setPageSize(ps);
           setPage(1);
         }}
-        // 정렬
         sort={sort}
         onSortChange={(next) => {
           setSort(next);
-          setPage(1);
         }}
-        // 필터
         filter={filter}
         onFilterChange={(v) => {
-          setFilter(v);
+          setFilter(v as FilterState);
           setPage(1);
         }}
-        // 툴바 우측 액션
         actions={actions}
+        onSelectionChange={(ids) => setSelectedIds(ids)}
       />
 
-      {/* 수정 모달 */}
       {isEditOpen && editForm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
           <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl">
@@ -277,25 +418,25 @@ export default function CompletePage() {
                 />
               </div>
 
-              {/* SKU */}
+              {/* SKU (읽기 전용) */}
               <div className="flex items-center gap-3">
                 <label className="w-24 text-sm text-gray-600">SKU</label>
                 <input
                   type="text"
-                  className="flex-1 rounded-md border px-3 py-2 text-sm"
+                  className="flex-1 rounded-md border px-3 py-2 text-sm bg-gray-50"
                   value={editForm.sku}
-                  onChange={(e) => handleEditChange("sku", e.target.value)}
+                  readOnly
                 />
               </div>
 
-              {/* 상품명 */}
+              {/* 상품명 (읽기 전용) */}
               <div className="flex items-center gap-3">
                 <label className="w-24 text-sm text-gray-600">상품명</label>
                 <input
                   type="text"
-                  className="flex-1 rounded-md border px-3 py-2 text-sm"
+                  className="flex-1 rounded-md border px-3 py-2 text-sm bg-gray-50"
                   value={editForm.name}
-                  onChange={(e) => handleEditChange("name", e.target.value)}
+                  readOnly
                 />
               </div>
 
@@ -311,7 +452,7 @@ export default function CompletePage() {
               </div>
 
               {/* 총 단가 */}
-              <div className="flex items-center gap-3">
+              <div className="flex items센터 gap-3">
                 <label className="w-24 text-sm text-gray-600">총 단가</label>
                 <input
                   type="text"
