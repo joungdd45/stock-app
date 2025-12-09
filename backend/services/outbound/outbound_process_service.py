@@ -1,8 +1,8 @@
 # 📄 backend/services/outbound/outbound_process_service.py
 # 페이지: 출고 처리(스캔 탭)
 # 역할: 송장 로드, 상품 스캔, 중량 저장, 출고 확정, 상태 조회
-# v2.6 — canceled 송장도 picking으로 전환 지원 + 출고확정 시 outbound_date/ship_date 동기화(KST)
-#        + 모든 응답에 header.status 포함
+# v2.7 — canceled 송장도 picking으로 전환 지원 + 출고확정 시 outbound_date/ship_date 동기화(KST)
+#        + 모든 응답에 header.status 포함 + 논리삭제 행(헤더/아이템) 완전 차단
 
 from __future__ import annotations
 from typing import Dict, Any, List, Optional
@@ -15,7 +15,7 @@ from backend.system.error_codes import DomainError
 import backend.models as models_module
 
 PAGE_ID = "outbound.process"
-PAGE_VERSION = "v2.6"
+PAGE_VERSION = "v2.7"
 
 
 # ─────────────────────────────────────────
@@ -103,9 +103,11 @@ def _normalize_weight(weight_g: Any) -> int:
 # 조회 유틸
 # ─────────────────────────────────────────
 def _get_header(session: Session, OutboundHeader, invoice_no: str):
+    # 🔒 논리삭제된 헤더는 완전히 제외
     stmt = select(OutboundHeader).where(
         (OutboundHeader.order_number == invoice_no)
-        | (OutboundHeader.tracking_number == invoice_no)
+        | (OutboundHeader.tracking_number == invoice_no),
+        OutboundHeader.deleted_at.is_(None),
     )
 
     header = session.execute(stmt).scalars().first()
@@ -167,14 +169,17 @@ class OutboundProcessService:
             session.add(header)
             session.commit()
 
-        # Product 와 조인해서 product_name 포함
+        # Product 와 조인해서 product_name 포함 (논리삭제 아이템은 제외)
         stmt = (
             select(
                 OutboundItem,
                 Product.name.label("product_name"),
             )
             .join(Product, Product.sku == OutboundItem.sku, isouter=True)
-            .where(OutboundItem.header_id == header.id)
+            .where(
+                OutboundItem.header_id == header.id,
+                OutboundItem.deleted_at.is_(None),
+            )
         )
         rows = session.execute(stmt).all()
 
@@ -200,8 +205,7 @@ class OutboundProcessService:
                     "scanned_qty": scanned,
                     "status": _build_status(it),
                     # 🔹 프론트에서 사용하는 필드명: product_name
-                    "product_name": product_name
-                    or getattr(it, "product_name", None),
+                    "product_name": product_name or getattr(it, "product_name", None),
                 }
             )
 
@@ -239,9 +243,11 @@ class OutboundProcessService:
                 ctx={"page_id": PAGE_ID, "current_status": header.status},
             )
 
-        product = session.execute(
-            select(Product).where(Product.barcode == barcode)
-        ).scalars().first()
+        product = (
+            session.execute(select(Product).where(Product.barcode == barcode))
+            .scalars()
+            .first()
+        )
 
         if not product:
             raise DomainError(
@@ -250,12 +256,17 @@ class OutboundProcessService:
                 ctx={"barcode": barcode},
             )
 
-        item = session.execute(
-            select(OutboundItem).where(
-                OutboundItem.header_id == header.id,
-                OutboundItem.sku == product.sku,
+        item = (
+            session.execute(
+                select(OutboundItem).where(
+                    OutboundItem.header_id == header.id,
+                    OutboundItem.sku == product.sku,
+                    OutboundItem.deleted_at.is_(None),  # 🔒 논리삭제 아이템 제외
+                )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
 
         if not item:
             raise DomainError(
@@ -342,11 +353,24 @@ class OutboundProcessService:
                 ctx={"current_status": header.status},
             )
 
-        items = session.execute(
-            select(OutboundItem).where(
-                OutboundItem.header_id == header.id
+        # 🔒 논리삭제되지 않은 아이템만 대상으로 확정
+        items = (
+            session.execute(
+                select(OutboundItem).where(
+                    OutboundItem.header_id == header.id,
+                    OutboundItem.deleted_at.is_(None),
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
+
+        if not items:
+            raise DomainError(
+                "OUTBOUND-STATE-451",
+                detail="출고 확정할 품목이 없습니다.",
+                ctx={"page_id": PAGE_ID, "header_id": header.id},
+            )
 
         for it in items:
             if it.qty != it.scanned_qty:
@@ -362,9 +386,13 @@ class OutboundProcessService:
 
         # 재고 차감 및 이력
         for it in items:
-            stock = session.execute(
-                select(StockCurrent).where(StockCurrent.sku == it.sku)
-            ).scalars().first()
+            stock = (
+                session.execute(
+                    select(StockCurrent).where(StockCurrent.sku == it.sku)
+                )
+                .scalars()
+                .first()
+            )
 
             if not stock or stock.qty_on_hand < it.qty:
                 raise DomainError(
@@ -418,11 +446,16 @@ class OutboundProcessService:
         invoice_no = _normalize_invoice_no(invoice_no)
         header = _get_header(session, OutboundHeader, invoice_no)
 
-        items = session.execute(
-            select(OutboundItem).where(
-                OutboundItem.header_id == header.id
+        items = (
+            session.execute(
+                select(OutboundItem).where(
+                    OutboundItem.header_id == header.id,
+                    OutboundItem.deleted_at.is_(None),
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
         total_qty = sum([i.qty for i in items])
         total_scanned = sum([i.scanned_qty for i in items])

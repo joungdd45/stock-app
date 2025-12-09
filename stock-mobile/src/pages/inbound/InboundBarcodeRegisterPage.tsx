@@ -103,7 +103,7 @@ const InboundBarcodeRegisterPage: React.FC = () => {
         await codeReader.decodeFromVideoDevice(
           undefined,
           videoRef.current!,
-          (result, err) => {
+          (result) => {
             if (!active) return;
             if (!result) return;
 
@@ -281,9 +281,7 @@ const InboundBarcodeRegisterPage: React.FC = () => {
           <div className="text-center text-sm leading-5">
             <div style={{ color: COLORS.textGray }}>바코드 등록</div>
             <div
-              className={`mt-1 ${
-                ready ? "font-bold" : ""
-              } text-sm`}
+              className={`mt-1 ${ready ? "font-bold" : ""} text-sm`}
               style={{ color: ready ? "#000000" : COLORS.textGray }}
             >
               바코드 등록 준비 완료
