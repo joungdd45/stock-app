@@ -19,20 +19,14 @@ const STORAGE_KEY = "stock.scan.result";
 
 const StockBarcodeScanPage: React.FC = () => {
   const nav = useNavigate();
-
   const [submitting, setSubmitting] = useState(false);
-
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
-
   const [flash, setFlash] = useState(false);
   const [lastBarcode, setLastBarcode] = useState<string | null>(null);
-
   const [scannedBarcode, setScannedBarcode] = useState<string | null>(null);
-  const [scanned, setScanned] = useState(false); // 🔥 1회 스캔 여부
-
+  const [scanned, setScanned] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
-
   const beepRef = useRef<HTMLAudioElement | null>(null);
   const [audioReady, setAudioReady] = useState(false);
 
@@ -41,11 +35,9 @@ const StockBarcodeScanPage: React.FC = () => {
     setTimeout(() => setToast(null), 1200);
   };
 
-  // 🔊 오디오 언락
   useEffect(() => {
     const unlockAudio = () => {
       if (!beepRef.current) beepRef.current = new Audio("/beep.mp3");
-
       beepRef.current
         .play()
         .then(() => {
@@ -54,7 +46,6 @@ const StockBarcodeScanPage: React.FC = () => {
           setAudioReady(true);
         })
         .catch(() => {});
-
       window.removeEventListener("click", unlockAudio);
     };
 
@@ -62,7 +53,6 @@ const StockBarcodeScanPage: React.FC = () => {
     return () => window.removeEventListener("click", unlockAudio);
   }, []);
 
-  // 🔍 카메라 + 스캔(1회 인식 후 멈춤)
   useEffect(() => {
     if (!videoRef.current) return;
 
@@ -83,39 +73,32 @@ const StockBarcodeScanPage: React.FC = () => {
         await codeReader.decodeFromVideoDevice(
           undefined,
           videoRef.current!,
-          (result, err) => {
+          (result) => {
             if (!active) return;
-            if (scanned) return; // 🔥 이미 스캔 완료 → 무시
-
+            if (scanned) return;
             if (!result) return;
 
             const rawText = result.getText();
             const scannedText = String(rawText ?? "").trim();
 
-            // 🔥 중복 스캔 방지
             if (lastBarcode === scannedText) return;
 
-            // 정상 인식
             setLastBarcode(scannedText);
             setScannedBarcode(scannedText);
-            setScanned(true); // 🔥 1회 스캔 완료 플래그
+            setScanned(true);
 
-            // flash
             setFlash(true);
             setTimeout(() => setFlash(false), 200);
 
-            // 삡 소리
             if (audioReady && beepRef.current) {
               beepRef.current.currentTime = 0;
               beepRef.current.play().catch(() => {});
             }
 
-            // 진동
             if (navigator.vibrate) navigator.vibrate(100);
 
             showToast("바코드 인식 완료");
 
-            // 🔥 카메라 완전 정지
             if (stream) {
               stream.getTracks().forEach((t) => t.stop());
             }
@@ -143,7 +126,6 @@ const StockBarcodeScanPage: React.FC = () => {
     };
   }, [lastBarcode, audioReady, scanned]);
 
-  // 재고 조회
   const handleCheckStock = () => {
     if (submitting) return;
     if (!scannedBarcode) {
@@ -153,7 +135,6 @@ const StockBarcodeScanPage: React.FC = () => {
 
     setSubmitting(true);
 
-    // TODO: 나중에 stockAdapter.status 연결
     const dummy: StockRow = {
       name: `스캔: ${scannedBarcode}`,
       stock: 10,
@@ -176,7 +157,6 @@ const StockBarcodeScanPage: React.FC = () => {
       )}
 
       <div className="space-y-3">
-        {/* 안내 카드 */}
         <Card className="p-3 space-y-1">
           <div className="text-xs font-medium" style={{ color: COLORS.textGray }}>
             바코드 스캔
@@ -185,7 +165,6 @@ const StockBarcodeScanPage: React.FC = () => {
             카메라에 바코드를 맞추면 자동으로 인식되며,
             1회 스캔 후 카메라가 자동으로 멈춥니다.
           </div>
-
           {lastBarcode && (
             <div className="text-[10px]" style={{ color: COLORS.textGray }}>
               마지막 스캔값: {lastBarcode}
@@ -193,7 +172,6 @@ const StockBarcodeScanPage: React.FC = () => {
           )}
         </Card>
 
-        {/* 카메라 뷰 */}
         <div className="relative w-full h-80 bg-black/70 rounded-2xl overflow-hidden">
           <video
             ref={videoRef}
@@ -203,7 +181,6 @@ const StockBarcodeScanPage: React.FC = () => {
             playsInline
           />
 
-          {/* 모서리 뷰파인더 */}
           <div className="absolute inset-3 pointer-events-none">
             <div
               className={`absolute top-0 left-0 w-5 h-5 border-t-4 border-l-4 rounded-tl-lg ${
@@ -227,7 +204,6 @@ const StockBarcodeScanPage: React.FC = () => {
             />
           </div>
 
-          {/* 중앙 가이드 */}
           <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-7 w-20 border-t-2 border-b-2 border-white/75" />
 
           <div className="absolute inset-x-0 bottom-2 flex flex-col items-center gap-1 text-white text-[10px]">
@@ -236,7 +212,6 @@ const StockBarcodeScanPage: React.FC = () => {
           </div>
         </div>
 
-        {/* 버튼들 */}
         <Card className="p-3 space-y-3">
           <button
             type="button"

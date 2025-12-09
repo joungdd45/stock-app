@@ -313,6 +313,9 @@ export default function CompletePage() {
         return;
       }
 
+      // ✅ 여기 한 줄 추가
+      console.log("outbound-complete raw data >>>", res.data);      
+
       const payload: any = res.data;
       const result = payload.result ?? payload;
 

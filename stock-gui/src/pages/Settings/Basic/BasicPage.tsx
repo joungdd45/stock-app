@@ -19,11 +19,18 @@ type NewUserForm = {
   username: string; // ID(이메일 아님)
   name: string;
   role: Role;
+  password: string;
+  passwordConfirm: string;
 };
 
 type AppSettings = {
   pageSize: number;
   theme: "라이트" | "다크";
+};
+
+type PasswordForm = {
+  password: string;
+  passwordConfirm: string;
 };
 
 const STORAGE_KEY = "settings.app";
@@ -83,7 +90,19 @@ export default function BasicPage() {
     username: "",
     name: "",
     role: "manager",
+    password: "",
+    passwordConfirm: "",
   });
+
+  // 비밀번호 수정 모달 상태
+  const [isPasswordModalOpen, setIsPasswordModalOpen] = useState(false);
+  const [passwordTargetUser, setPasswordTargetUser] =
+    useState<SettingsBasicUserItem | null>(null);
+  const [passwordForm, setPasswordForm] = useState<PasswordForm>({
+    password: "",
+    passwordConfirm: "",
+  });
+  const [isSavingPassword, setIsSavingPassword] = useState(false);
 
   // 사용자 목록 조회
   const fetchUsers = async () => {
@@ -114,8 +133,18 @@ export default function BasicPage() {
     };
 
   const handleCreateUser = async () => {
-    if (!newUser.username.trim() || !newUser.name.trim()) {
+    if (!newUser.name.trim() || !newUser.username.trim()) {
       alert("이름과 아이디를 입력하세요.");
+      return;
+    }
+
+    if (!newUser.password.trim() || !newUser.passwordConfirm.trim()) {
+      alert("비밀번호와 확인 비밀번호를 입력하세요.");
+      return;
+    }
+
+    if (newUser.password !== newUser.passwordConfirm) {
+      alert("비밀번호와 확인 비밀번호가 일치하지 않습니다.");
       return;
     }
 
@@ -124,6 +153,7 @@ export default function BasicPage() {
       username: newUser.username.trim(),
       name: newUser.name.trim(),
       role: newUser.role,
+      // 비밀번호 전달은 서비스/라우터/어댑터 정리 후 연동 예정
     });
     setIsSavingUser(false);
 
@@ -137,7 +167,13 @@ export default function BasicPage() {
     }
 
     setUsers((prev) => [...prev, res.data]);
-    setNewUser({ username: "", name: "", role: "manager" });
+    setNewUser({
+      username: "",
+      name: "",
+      role: "manager",
+      password: "",
+      passwordConfirm: "",
+    });
     alert("사용자가 추가되었습니다.");
   };
 
@@ -204,6 +240,63 @@ export default function BasicPage() {
 
     setUsers((prev) => prev.filter((u) => u.id !== user.id));
     alert("사용자가 삭제되었습니다.");
+  };
+
+  // ───────────────────────────────────────────────────────────
+  // 비밀번호 수정 모달 관련 핸들러
+  const openPasswordModal = (user: SettingsBasicUserItem) => {
+    setPasswordTargetUser(user);
+    setPasswordForm({ password: "", passwordConfirm: "" });
+    setIsPasswordModalOpen(true);
+  };
+
+  const closePasswordModal = () => {
+    if (isSavingPassword) return;
+    setIsPasswordModalOpen(false);
+    setPasswordTargetUser(null);
+    setPasswordForm({ password: "", passwordConfirm: "" });
+  };
+
+  const handlePasswordFormChange =
+    (field: keyof PasswordForm) =>
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const value = e.target.value;
+      setPasswordForm((prev) => ({
+        ...prev,
+        [field]: value,
+      }));
+    };
+
+  const handleChangePassword = async () => {
+    if (!passwordTargetUser) return;
+
+    const pwd = passwordForm.password.trim();
+    const confirm = passwordForm.passwordConfirm.trim();
+
+    if (!pwd || !confirm) {
+      alert("비밀번호와 확인 비밀번호를 입력하세요.");
+      return;
+    }
+
+    if (pwd !== confirm) {
+      alert("비밀번호와 확인 비밀번호가 일치하지 않습니다.");
+      return;
+    }
+
+    setIsSavingPassword(true);
+    try {
+      // TODO: 서비스/라우터/어댑터 작업 후 실제 API 연동 예정
+      // 예: await settingsAdapter.updateUserPassword(passwordTargetUser.id, { new_password: pwd });
+      alert(
+        `사용자 '${passwordTargetUser.username}'의 비밀번호가 수정되었다고 가정합니다. (백엔드 연동 예정)`,
+      );
+      closePasswordModal();
+    } catch (e) {
+      console.error(e);
+      alert("비밀번호 수정 중 오류가 발생했습니다.");
+    } finally {
+      setIsSavingPassword(false);
+    }
   };
 
   // ───────────────────────────────────────────────────────────
@@ -319,6 +412,27 @@ export default function BasicPage() {
             </select>
           </div>
 
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+            <input
+              type="password"
+              className="border rounded-lg px-3 py-2"
+              placeholder="비밀번호"
+              value={newUser.password}
+              onChange={handleNewUserChange("password")}
+            />
+            <input
+              type="password"
+              className="border rounded-lg px-3 py-2"
+              placeholder="비밀번호 확인"
+              value={newUser.passwordConfirm}
+              onChange={handleNewUserChange("passwordConfirm")}
+            />
+          </div>
+
+          <p className="mt-2 text-xs text-gray-500">
+            관리자 PC에서만 계정 생성과 비밀번호 설정·수정이 가능합니다.
+          </p>
+
           <div className="mt-3">
             <button
               onClick={handleCreateUser}
@@ -366,7 +480,10 @@ export default function BasicPage() {
                             type="checkbox"
                             className="rounded"
                             checked={u.is_active}
-                            onChange={handleUserFieldChange(u.id, "is_active")}
+                            onChange={handleUserFieldChange(
+                              u.id,
+                              "is_active",
+                            )}
                           />
                           <span>활성화</span>
                         </label>
@@ -396,6 +513,12 @@ export default function BasicPage() {
                         className="px-2 py-1 rounded bg-gray-900 text-white"
                       >
                         저장
+                      </button>
+                      <button
+                        onClick={() => openPasswordModal(u)}
+                        className="px-2 py-1 rounded border border-blue-400 text-blue-600"
+                      >
+                        비밀번호 수정
                       </button>
                       <button
                         onClick={() => handleDeleteUser(u)}
@@ -433,7 +556,7 @@ export default function BasicPage() {
               />
             </label>
 
-            <label className="flex flex_col text-sm flex-col">
+            <label className="flex flex-col text-sm">
               <span className="mb-1 text-gray-600">테마</span>
               <select
                 className="border rounded-lg px-3 py-2"
@@ -467,6 +590,61 @@ export default function BasicPage() {
           </p>
         </section>
       </div>
+
+      {/* 비밀번호 수정 모달 */}
+      {isPasswordModalOpen && passwordTargetUser && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-lg">
+            <h3 className="text-base font-semibold mb-2">비밀번호 수정</h3>
+            <p className="text-xs text-gray-500 mb-3">
+              선택한 계정의 비밀번호를 관리자 PC에서 직접 수정합니다.
+            </p>
+            <div className="mb-3 text-sm">
+              <div className="flex items-center gap-2">
+                <span className="text-gray-500 text-xs">ID</span>
+                <span className="font-mono text-xs">
+                  {passwordTargetUser.username}
+                </span>
+                <span className="inline-flex items-center rounded bg-gray-100 px-2 py-0.5 text-[10px]">
+                  {ROLE_LABEL[passwordTargetUser.role]}
+                </span>
+              </div>
+            </div>
+            <div className="space-y-2">
+              <input
+                type="password"
+                className="w-full border rounded-lg px-3 py-2 text-sm"
+                placeholder="새 비밀번호"
+                value={passwordForm.password}
+                onChange={handlePasswordFormChange("password")}
+              />
+              <input
+                type="password"
+                className="w-full border rounded-lg px-3 py-2 text-sm"
+                placeholder="새 비밀번호 확인"
+                value={passwordForm.passwordConfirm}
+                onChange={handlePasswordFormChange("passwordConfirm")}
+              />
+            </div>
+            <div className="mt-4 flex justify-end gap-2 text-xs">
+              <button
+                onClick={closePasswordModal}
+                disabled={isSavingPassword}
+                className="px-3 py-1.5 rounded-xl border border-gray-300 text-gray-700 disabled:opacity-60"
+              >
+                취소
+              </button>
+              <button
+                onClick={handleChangePassword}
+                disabled={isSavingPassword}
+                className="px-3 py-1.5 rounded-xl bg-gray-900 text-white disabled:opacity-60"
+              >
+                {isSavingPassword ? "저장 중..." : "비밀번호 저장"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

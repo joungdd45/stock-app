@@ -1,5 +1,5 @@
-﻿# 📄 docker-compose.yml (전체수정)
-# 목표: Postgres + Redis + FastAPI(uvicorn backend.main:app)
+# 📄 docker-compose.yml (전체수정)
+# 목적: Postgres + Redis + FastAPI + Nginx(PC+모바일 분기)
 
 services:
   postgres:
@@ -70,6 +70,19 @@ services:
       interval: 10s
       timeout: 3s
       retries: 12
+
+  nginx:
+    image: nginx:1.27
+    container_name: stockapp-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
+      - ./nginx/cert:/etc/nginx/cert
+      - ./stock-gui/dist:/usr/share/nginx/html
+      - ./stock-mobile/dist:/usr/share/nginx/html/m
 
 networks:
   default:

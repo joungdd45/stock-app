@@ -26,8 +26,8 @@ interface InboundPayload {
   unit_price: number;
   total_price: number;
   supplier_name: string;
-  status: string; // draft | committed
-  barcode?: string; // ✅ 선택값: 이 전표에 연결된 바코드 (없으면 검증 생략)
+  status: string;
+  barcode?: string;
 }
 
 const InboundBarcodeScanPage: React.FC = () => {
@@ -35,43 +35,34 @@ const InboundBarcodeScanPage: React.FC = () => {
   const { search } = useLocation();
   const sp = new URLSearchParams(search);
 
-  // 리스트에서 넘어온 전체 row JSON
   const raw = sp.get("payload") ?? "";
   const row: InboundPayload | null = raw ? JSON.parse(raw) : null;
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
 
-  // 수량: 문자열로 관리해서 ""(빈값) 허용
   const [qtyText, setQtyText] = useState<string>("");
 
-  // ✅ 바코드 정상 스캔 여부
   const [scannedOk, setScannedOk] = useState(false);
-  // ✅ 한 번 정상 인식 후 스캔 잠금
   const [locked, setLocked] = useState(false);
 
-  // 스캔 피드백 상태
   const [flash, setFlash] = useState(false);
   const [lastBarcode, setLastBarcode] = useState<string | null>(null);
 
-  // 토스트 상태
   const [toast, setToast] = useState<string | null>(null);
 
-  // 오디오 관련
   const beepRef = useRef<HTMLAudioElement | null>(null);
   const [audioReady, setAudioReady] = useState(false);
 
-  // 🔔 토스트 헬퍼
   const showToast = (msg: string) => {
     setToast(msg);
     setTimeout(() => setToast(null), 1200);
   };
 
-  // 🔊 사용자 첫 터치에서 오디오 언락 (브라우저 자동재생 제한 우회)
   useEffect(() => {
     const unlockAudio = () => {
       if (!beepRef.current) {
-        beepRef.current = new Audio("/beep.mp3"); // 📁 public/beep.mp3 필요
+        beepRef.current = new Audio("/beep.mp3");
       }
       beepRef.current
         .play()
@@ -80,9 +71,7 @@ const InboundBarcodeScanPage: React.FC = () => {
           if (beepRef.current) beepRef.current.currentTime = 0;
           setAudioReady(true);
         })
-        .catch((e) => {
-          console.warn("오디오 언락 실패:", e);
-        });
+        .catch((e) => console.warn("오디오 언락 실패:", e));
 
       window.removeEventListener("click", unlockAudio);
     };
@@ -91,11 +80,10 @@ const InboundBarcodeScanPage: React.FC = () => {
     return () => window.removeEventListener("click", unlockAudio);
   }, []);
 
-  // 🔍 카메라 + 바코드 스캐너 세팅
   useEffect(() => {
     if (!row) return;
     if (!videoRef.current) return;
-    if (locked) return; // ✅ 한 번 인식 후에는 더 이상 스캔 시작하지 않음
+    if (locked) return;
 
     const codeReader = new BrowserMultiFormatReader();
     readerRef.current = codeReader;
@@ -106,46 +94,33 @@ const InboundBarcodeScanPage: React.FC = () => {
         await codeReader.decodeFromVideoDevice(
           undefined,
           videoRef.current!,
-          (result, err) => {
+          (result) => {
             if (!active) return;
-            if (locked) return; // ✅ 잠금 상태에서는 콜백 즉시 무시
+            if (locked) return;
             if (!result) return;
 
             const rawText = result.getText();
 
-            // 비교용 값 정리
             const scanned = String(rawText ?? "").trim();
             const expected = row.barcode;
             const expectedNorm = String(expected ?? "").trim();
 
             console.log("바코드 인식 raw:", rawText);
             console.log("바코드 expected:", row.barcode);
-            console.log(
-              "비교용 → scanned:",
-              scanned,
-              " / expectedNorm:",
-              expectedNorm,
-            );
 
-            // 기준값이 있는 경우에만 검증 (없는 경우 검증 생략하고 그냥 통과)
-            if (expectedNorm) {
-              if (scanned !== expectedNorm) {
-                setLastBarcode(scanned);
-                showToast("해당 상품이 아닙니다.");
-                return;
-              }
+            if (expectedNorm && scanned !== expectedNorm) {
+              setLastBarcode(scanned);
+              showToast("해당 상품이 아닙니다.");
+              return;
             }
 
-            // 같은 정상 바코드 연속 스캔은 무시 (잠금 전 단계용)
             if (scanned === lastBarcode) return;
 
             setLastBarcode(scanned);
 
-            // ✅ 정상 스캔 피드백 (flash)
             setFlash(true);
             setTimeout(() => setFlash(false), 200);
 
-            // ✅ 삡 소리 (언락된 경우에만)
             if (audioReady && beepRef.current) {
               beepRef.current.currentTime = 0;
               beepRef.current
@@ -153,10 +128,8 @@ const InboundBarcodeScanPage: React.FC = () => {
                 .catch((e) => console.warn("beep 재생 실패:", e));
             }
 
-            // ✅ 진동
             if (navigator.vibrate) navigator.vibrate(100);
 
-            // ✅ 정상 스캔 완료 플래그 + 스캔 잠금
             setScannedOk(true);
             setLocked(true);
             active = false;
@@ -173,10 +146,7 @@ const InboundBarcodeScanPage: React.FC = () => {
       active = false;
       try {
         (readerRef.current as any)?.reset?.();
-      } catch {
-        // 무시
-      }
-      // 카메라 스트림 정리
+      } catch {}
       if (videoRef.current && videoRef.current.srcObject) {
         const stream = videoRef.current.srcObject as MediaStream;
         stream.getTracks().forEach((t) => t.stop());
@@ -198,21 +168,12 @@ const InboundBarcodeScanPage: React.FC = () => {
     );
   }
 
-  const {
-    header_id,
-    item_id,
-    order_no,
-    name,
-    sku,
-    qty: plannedQty,
-    barcode,
-  } = row;
+  const { header_id, item_id, order_no, name, sku, qty: plannedQty, barcode } =
+    row;
 
-  // 🔢 렌더링용 파생값: 문자열 수량 → 숫자
   const qtyNumber = Number(qtyText || "0");
 
   const handleInbound = async () => {
-    // 이중 방어
     if (!scannedOk || !Number.isFinite(qtyNumber) || qtyNumber <= 0) {
       showToast("수량을 입력해 주세요.");
       return;
@@ -221,14 +182,8 @@ const InboundBarcodeScanPage: React.FC = () => {
     try {
       const res = await inboundAdapter.processConfirm({
         header_id,
-        items: [
-          {
-            item_id,
-            sku,
-            qty: qtyNumber, // ✅ 숫자로 전송
-          },
-        ],
-        operator: "MOBILE", // 추후 로그인 사용자로 교체
+        items: [{ item_id, sku, qty: qtyNumber }],
+        operator: "MOBILE",
       });
 
       if (!res.ok) {
@@ -246,7 +201,6 @@ const InboundBarcodeScanPage: React.FC = () => {
 
   return (
     <AppShell title="입고 바코드 스캔">
-      {/* 🧀 토스트 */}
       {toast && (
         <div
           className="fixed top-4 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-xl text-white text-sm shadow-md"
@@ -257,12 +211,8 @@ const InboundBarcodeScanPage: React.FC = () => {
       )}
 
       <div className="space-y-3">
-        {/* 대상 상품 정보 */}
         <Card className="p-3 space-y-1">
-          <div
-            className="text-xs font-medium"
-            style={{ color: COLORS.textGray }}
-          >
+          <div className="text-xs font-medium" style={{ color: COLORS.textGray }}>
             대상 상품
           </div>
           <div
@@ -289,7 +239,6 @@ const InboundBarcodeScanPage: React.FC = () => {
           )}
         </Card>
 
-        {/* 뷰파인더 + 카메라 영상 */}
         <div className="relative w-full h-80 rounded-2xl overflow-hidden bg-black/70">
           <video
             ref={videoRef}
@@ -299,7 +248,6 @@ const InboundBarcodeScanPage: React.FC = () => {
             playsInline
           />
 
-          {/* 모서리 뷰파인더 (스캔 시 빨간색 flash) */}
           <div className="absolute inset-3 pointer-events-none">
             <div
               className={`absolute top-0 left-0 w-5 h-5 border-t-4 border-l-4 rounded-tl-lg ${
@@ -330,7 +278,6 @@ const InboundBarcodeScanPage: React.FC = () => {
           </div>
         </div>
 
-        {/* 입고 예정 수량 + 실제 입력 수량 + 입고 처리 */}
         <Card className="p-3 space-y-3">
           <div className="flex items-center justify-between gap-3">
             <span
@@ -362,10 +309,7 @@ const InboundBarcodeScanPage: React.FC = () => {
                 />
               </div>
               {!scannedOk && (
-                <span
-                  className="text-[10px]"
-                  style={{ color: COLORS.textGray }}
-                >
+                <span className="text-[10px]" style={{ color: COLORS.textGray }}>
                   바코드를 먼저 스캔하면 수량 입력이 가능합니다.
                 </span>
               )}

@@ -108,8 +108,7 @@ async function fetchSummary(): Promise<ApiResult<MainSummaryResult>> {
 async function fetchCalendar(
   params: MainCalendarQueryDto
 ): Promise<ApiResult<MainCalendarResult>> {
-  // year, month를 쿼리 파라미터로 전달하는 형태로 가정
-  return apiHub.get<MainCalendarResult>(MAIN_CALENDAR_URL, params);
+  return apiHub.get<MainCalendarResult>(MAIN_CALENDAR_URL, { params });
 }
 
 /* ─────────────────────────────────────────────

@@ -1,7 +1,7 @@
 # 📄 backend/routers/settings/settings_basic.py
 # 페이지: 설정 > 기본설정(BasicPage.tsx)
 # 역할: 프론트 요청 수신 → 가드/의존성 → 서비스 호출 → 응답 포맷 래핑
-# 단계: v2.1 (사용자설정 + 페이지설정 전체 구현, 공용 guard 연동) / 구조 통일 작업지침 v2 적용
+# 단계: v2.2 (사용자설정 + 페이지설정 + 비밀번호 생성/수정, 공용 guard 연동)
 #
 # ✅ 라우터 원칙
 # - 요청 받기, 인증/가드, 입력 파싱, 서비스 호출, 응답 반환, 문서화만 담당
@@ -26,7 +26,7 @@ from backend.security.guard import guard  # ✅ 공용 가드 사용
 # 페이지 메타
 # ─────────────────────────────────────────────────────────
 PAGE_ID = "settings.basic"
-PAGE_VERSION = "v2.1"
+PAGE_VERSION = "v2.2"
 
 ROUTE_PREFIX = "/api/settings/basic"
 ROUTE_TAGS = ["settings_basic"]
@@ -47,6 +47,7 @@ def get_service(
     - 인증은 backend.security.guard.guard 공용 가드를 사용
     """
     return SettingsBasicService(session=session, user=user)
+
 
 # ─────────────────────────────────────────────────────────
 # 공통 응답 래퍼 — 라우터 전용
@@ -69,6 +70,7 @@ class PingResponse(ResponseBase):
     version: str
     stage: str
 
+
 # ─────────────────────────────────────────────────────────
 # 도메인 전용 DTO — 기본설정 전용
 # ─────────────────────────────────────────────────────────
@@ -82,13 +84,19 @@ class PageSettingsBody(BaseModel):
 class UserCreateBody(BaseModel):
     username: str = Field(..., description="로그인 ID (이메일 아님)")
     name: Optional[str] = Field(default=None, description="사용자 이름")
-    role: str = Field(..., description="권한 (관리자 / 직원 / 조회 또는 admin/manager/user)")
+    role: str = Field(..., description="권한 (관리자/직원/조회 또는 admin/manager/user)")
+    password: str = Field(..., description="초기 비밀번호 (관리자가 직접 설정)")
 
 
 class UserUpdateBody(BaseModel):
     name: Optional[str] = Field(default=None, description="사용자 이름")
-    role: Optional[str] = Field(default=None, description="권한 (관리자 / 직원 / 조회 또는 admin/manager/user)")
+    role: Optional[str] = Field(default=None, description="권한 (관리자/직원/조회 또는 admin/manager/user)")
     is_active: Optional[bool] = Field(default=None, description="계정 활성 여부")
+
+
+class UserPasswordUpdateBody(BaseModel):
+    new_password: str = Field(..., description="새 비밀번호 (관리자가 재설정)")
+
 
 # ─────────────────────────────────────────────────────────
 # [system] 핑
@@ -109,10 +117,10 @@ def ping():
         stage="implemented",
     )
 
+
 # ─────────────────────────────────────────────────────────
 # A. 사용자 설정 영역 (좌측 표)
 # ─────────────────────────────────────────────────────────
-
 @settings_basic.get(
     "/users",
     response_model=ActionResponse,
@@ -142,7 +150,7 @@ async def list_users(
 @settings_basic.post(
     "/users",
     response_model=ActionResponse,
-    summary="[관리자] 사용자 추가",
+    summary="[관리자] 사용자 추가(비밀번호 포함)",
     responses={
         403: {"description": "FORBIDDEN"},
         422: {"description": "VALID"},
@@ -156,6 +164,7 @@ async def create_user(
     [관리자] 사용자 추가
     - username 중복 체크
     - role 유효성 검증
+    - 비밀번호는 관리자만 직접 설정
     """
     try:
         result_dict = await svc.create_user(payload=payload.dict())
@@ -186,11 +195,46 @@ async def update_user(
     """
     [관리자] 사용자 정보 수정
     - 이름/권한/활성여부 수정
+    - 비밀번호는 별도 엔드포인트에서만 수정
     """
     try:
         result_dict = await svc.update_user(
             user_id=user_id,
             payload={k: v for k, v in payload.dict().items() if v is not None},
+        )
+    except DomainError as exc:
+        raise exc
+
+    return ActionResponse(
+        ok=True,
+        data=ActionData(result=result_dict),
+    )
+
+
+@settings_basic.put(
+    "/users/{user_id}/password",
+    response_model=ActionResponse,
+    summary="[관리자] 사용자 비밀번호 재설정",
+    responses={
+        403: {"description": "FORBIDDEN"},
+        404: {"description": "NOTFOUND"},
+        422: {"description": "VALID"},
+    },
+)
+async def update_user_password(
+    user_id: int,
+    payload: UserPasswordUpdateBody,
+    svc: SettingsBasicService = Depends(get_service),
+):
+    """
+    [관리자] 사용자 비밀번호 재설정
+    - 사용자는 직접 비밀번호 변경 불가
+    - 관리자 PC에서만 재설정
+    """
+    try:
+        result_dict = await svc.update_user_password(
+            user_id=user_id,
+            new_password=payload.new_password,
         )
     except DomainError as exc:
         raise exc
@@ -229,10 +273,10 @@ async def delete_user(
         data=ActionData(result=result_dict),
     )
 
+
 # ─────────────────────────────────────────────────────────
 # B. [내 설정] 페이지 설정 영역 (우측 표)
 # ─────────────────────────────────────────────────────────
-
 @settings_basic.get(
     "/page",
     response_model=ActionResponse,
@@ -244,17 +288,17 @@ async def delete_user(
 async def get_my_page_settings(
     svc: SettingsBasicService = Depends(get_service),
 ):
-    """
-    로그인 사용자의 개인 페이지 설정 조회.
-    - settings_basic_user에서 user_id 기준 조회
-    - 없으면 기본값 반환
-    """
-    try:
-        result_dict = await svc.get_my_page_settings()
-    except DomainError as exc:
-        raise exc
+  """
+  로그인 사용자의 개인 페이지 설정 조회.
+  - settings_basic_user에서 user_id 기준 조회
+  - 없으면 기본값 반환
+  """
+  try:
+      result_dict = await svc.get_my_page_settings()
+  except DomainError as exc:
+      raise exc
 
-    return ActionResponse(ok=True, data=ActionData(result=result_dict))
+  return ActionResponse(ok=True, data=ActionData(result=result_dict))
 
 
 @settings_basic.put(
@@ -279,10 +323,10 @@ async def put_my_page_settings(
 
     return ActionResponse(ok=True, data=ActionData(result=result_dict))
 
+
 # ─────────────────────────────────────────────────────────
 # C. [관리자] 특정 사용자 페이지 설정 영역
 # ─────────────────────────────────────────────────────────
-
 @settings_basic.get(
     "/admin/users/{target_user_id}/page",
     response_model=ActionResponse,
@@ -300,7 +344,9 @@ async def admin_get_user_page_settings(
     관리자: 특정 사용자의 개인 페이지 설정 조회.
     """
     try:
-        result_dict = await svc.admin_get_user_page_settings(target_user_id=target_user_id)
+        result_dict = await svc.admin_get_user_page_settings(
+            target_user_id=target_user_id,
+        )
     except DomainError as exc:
         raise exc
 

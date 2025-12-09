@@ -1,6 +1,6 @@
 // 📄 src/api/hub/apiHub.ts
 // 역할: 백엔드와 통신하는 단일 허브 (모바일 전용 완성본)
-//  - axios 인스턴스 관리
+//  - axios 인스턴스를 관리
 //  - 응답을 ApiResult<T> 형태로 정규화
 //  - 네트워크/인증/도메인 에러를 통합 포맷으로 가공
 //  - handleError 내장 (팝업/알림 통일)
@@ -140,12 +140,18 @@ function forceLogout() {
 
 instance.interceptors.request.use((config) => {
   const token = getAccessToken();
-  if (token) {
-    config.headers = config.headers ?? {};
-    if (!("Authorization" in config.headers)) {
-      (config.headers as any)["Authorization"] = `Bearer ${token}`;
-    }
+
+  // 토큰이 완전히 없으면 바로 로그인 페이지로 이동
+  if (!token) {
+    forceLogout();
+    return config;
   }
+
+  config.headers = config.headers ?? {};
+  if (!("Authorization" in config.headers)) {
+    (config.headers as any)["Authorization"] = `Bearer ${token}`;
+  }
+
   return config;
 });
 
@@ -206,6 +212,21 @@ function makeFrontError(code: FrontErrorCode, detail?: unknown): ApiError {
   };
 }
 
+// 로그인으로 보내되, 토스트는 띄우지 않는 전용 에러
+function makeSilentAuthError(
+  code: FrontErrorCode,
+  detail?: unknown,
+  traceId?: string | null
+): ApiError {
+  return {
+    code: String(code),
+    message: "", // message 비워서 handleError에서 알림이 안 뜨도록
+    detail,
+    traceId: traceId ?? null,
+    raw: detail,
+  };
+}
+
 function isAuthTokenMissingError(body: BackendErrorEnvelope["error"]): boolean {
   const detailText = String(body.detail ?? "");
   const locationText = String(
@@ -245,36 +266,45 @@ function normalizeAxiosError(error: AxiosError): ApiFailure {
   const data = res.data;
   const status = res.status;
 
-  // 401 → 강제 로그아웃
+  // 401 → 강제 로그아웃 + 조용히 처리
   if (status === 401) {
     forceLogout();
     return {
       ok: false,
       data: null,
-      error: makeFrontError("FRONT-AUTH-UNAUTHORIZED-001", data),
+      error: makeSilentAuthError(
+        "FRONT-AUTH-UNAUTHORIZED-001",
+        data,
+        data?.trace_id
+      ),
     };
   }
 
   if (data && typeof data === "object" && data.ok === false && data.error) {
     const backendError = data.error as BackendErrorEnvelope["error"];
+    const backendCode =
+      typeof backendError.code === "string"
+        ? backendError.code.trim().toUpperCase()
+        : "SYSTEM-UNKNOWN-999";
 
+    // 토큰 누락/만료 / AUTH-xxx → 강제 로그아웃 + 조용히 처리
     if (
       isAuthTokenMissingError(backendError) ||
-      (typeof backendError.code === "string" &&
-        backendError.code.startsWith("AUTH-"))
+      backendCode.startsWith("AUTH-")
     ) {
       forceLogout();
       return {
         ok: false,
         data: null,
-        error: makeFrontError(
+        error: makeSilentAuthError(
           "FRONT-AUTH-UNAUTHORIZED-001",
-          backendError.detail ?? backendError
+          backendError.detail ?? backendError,
+          backendError.trace_id ?? data.trace_id
         ),
       };
     }
 
-    const code = backendError.code || "SYSTEM-UNKNOWN-999";
+    const code = (backendError.code as FrontErrorCode) || "SYSTEM-UNKNOWN-999";
 
     return {
       ok: false,
@@ -437,6 +467,14 @@ async function del<TResponse>(
 
 export function handleError(error: ApiError): void {
   try {
+    // 인증 관련 에러(FRONT-AUTH-...)는 이미 로그인으로 보냈으니 조용히 무시
+    if (
+      typeof error.code === "string" &&
+      error.code.startsWith("FRONT-AUTH")
+    ) {
+      return;
+    }
+
     const msg = error.message || "오류가 발생했습니다.";
 
     let detailText = "";

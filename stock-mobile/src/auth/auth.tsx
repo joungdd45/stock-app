@@ -10,9 +10,12 @@
 
 import React, { useState } from "react";
 import { Navigate, useLocation } from "react-router-dom";
-import { loginAdapter, type LoginRequest } from "../api/adapters/login.adapter";
+import {
+  loginAdapter,
+  type LoginRequestDto,
+} from "../api/adapters/login.adapter";
 
-export type LoginPayload = LoginRequest;
+export type LoginPayload = LoginRequestDto;
 
 export const useAuth = () => {
   const [authed, setAuthed] = useState<boolean>(() => {
@@ -35,7 +38,9 @@ export const useAuth = () => {
   };
 
   const logout = () => {
-    loginAdapter.logout();
+    // loginAdapter.logout()  // 없음 → 제거
+    localStorage.removeItem("access_token");
+    localStorage.removeItem("authed");
     setAuthed(false);
   };
 

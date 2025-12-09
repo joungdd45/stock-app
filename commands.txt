@@ -190,3 +190,6 @@ tasklist | findstr uvicorn
 # PID로 강제 종료
 # 예시) taskkill /PID 25456 /F
 taskkill /PID <PID번호> /F
+
+# 서버 접근코드
+ssh ubuntu@223.130.129.231
