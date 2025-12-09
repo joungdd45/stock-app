@@ -46,6 +46,8 @@ export interface SettingsBasicUserCreateDto {
   username: string;
   name: string;
   role: SettingsUserRole;
+  /** 초기 비밀번호 (관리자가 직접 설정) */
+  password?: string;
 }
 
 export type SettingsBasicUserCreateResponse = SettingsBasicUserItem;
@@ -61,6 +63,15 @@ export type SettingsBasicUserUpdateResponse = SettingsBasicUserItem;
 export interface SettingsBasicUserDeleteResponse {
   deleted_id: number;
   deleted_at: string;
+}
+
+export interface SettingsBasicUserPasswordUpdateDto {
+  new_password: string;
+}
+
+export interface SettingsBasicUserPasswordUpdateResponse {
+  id: number;
+  username: string;
 }
 
 export interface SettingsBasicPageConfig {
@@ -120,6 +131,8 @@ const SETTINGS_BASIC_PING_URL = "/api/settings/basic/ping";
 const SETTINGS_BASIC_USERS_URL = "/api/settings/basic/users";
 const SETTINGS_BASIC_USER_DETAIL_URL = (userId: number) =>
   `/api/settings/basic/users/${userId}`;
+const SETTINGS_BASIC_USER_PASSWORD_URL = (userId: number) =>
+  `/api/settings/basic/users/${userId}/password`;
 
 const SETTINGS_BASIC_PAGE_URL = "/api/settings/basic/page";
 
@@ -146,7 +159,7 @@ async function fetchUsers(): Promise<ApiResult<SettingsBasicUsersResponse>> {
   return apiHub.get<SettingsBasicUsersResponse>(SETTINGS_BASIC_USERS_URL);
 }
 
-// 사용자 추가
+// 사용자 추가 (비밀번호 포함)
 async function createUser(
   payload: SettingsBasicUserCreateDto,
 ): Promise<ApiResult<SettingsBasicUserCreateResponse>> {
@@ -156,13 +169,16 @@ async function createUser(
   );
 }
 
-// 사용자 수정
+// 사용자 수정 (비밀번호 제외)
 async function updateUser(
   userId: number,
   payload: SettingsBasicUserUpdateDto,
 ): Promise<ApiResult<SettingsBasicUserUpdateResponse>> {
   const url = SETTINGS_BASIC_USER_DETAIL_URL(userId);
-  return apiHub.put<SettingsBasicUserUpdateResponse, SettingsBasicUserUpdateDto>(url, payload);
+  return apiHub.put<SettingsBasicUserUpdateResponse, SettingsBasicUserUpdateDto>(
+    url,
+    payload,
+  );
 }
 
 // 사용자 삭제(논리삭제)
@@ -171,6 +187,18 @@ async function deleteUser(
 ): Promise<ApiResult<SettingsBasicUserDeleteResponse>> {
   const url = SETTINGS_BASIC_USER_DETAIL_URL(userId);
   return apiHub.delete<SettingsBasicUserDeleteResponse>(url);
+}
+
+// 사용자 비밀번호 재설정
+async function updateUserPassword(
+  userId: number,
+  payload: SettingsBasicUserPasswordUpdateDto,
+): Promise<ApiResult<SettingsBasicUserPasswordUpdateResponse>> {
+  const url = SETTINGS_BASIC_USER_PASSWORD_URL(userId);
+  return apiHub.put<
+    SettingsBasicUserPasswordUpdateResponse,
+    SettingsBasicUserPasswordUpdateDto
+  >(url, payload);
 }
 
 /* ───────────────────────────────────────────────
@@ -247,6 +275,7 @@ export const settingsAdapter = {
   createUser,
   updateUser,
   deleteUser,
+  updateUserPassword,
 
   getMyPageConfig,
   updateMyPageConfig,

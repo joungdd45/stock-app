@@ -199,6 +199,21 @@ function makeFrontError(code: string, detail?: unknown): ApiError {
   };
 }
 
+// 로그인으로 보내고, 토스트는 띄우지 않는 전용 에러
+function makeSilentAuthError(
+  code: string,
+  detail?: unknown,
+  traceId?: string | null
+): ApiError {
+  return {
+    code: String(code),
+    message: "", // 메시지를 비워서 handleError에서 토스트가 안 뜨도록
+    detail,
+    traceId: traceId ?? null,
+    raw: detail,
+  };
+}
+
 function isAuthTokenMissingError(body: BackendErrorEnvelope["error"]): boolean {
   const detailText = String(body.detail ?? "");
   const locationText = String(
@@ -239,14 +254,13 @@ function normalizeAxiosError(error: AxiosError): ApiFailure {
   const data = res.data;
   const status = res.status;
 
-  // 401 같은 명확한 인증 실패는 바로 로그아웃 처리
+  // 401 같은 명확한 인증 실패는 바로 로그아웃 + 토스트 없이 처리
   if (status === 401) {
     forceLogout();
-    // AUTH-DENY-001: "로그인이 필요합니다. 다시 로그인해 주세요."
     return {
       ok: false,
       data: null,
-      error: makeFrontError("AUTH-DENY-001", data),
+      error: makeSilentAuthError("AUTH-DENY-001", data, data?.trace_id),
     };
   }
 
@@ -257,28 +271,30 @@ function normalizeAxiosError(error: AxiosError): ApiFailure {
         ? backendError.code.trim().toUpperCase()
         : "SYSTEM-UNKNOWN-999";
 
-    // 백엔드 에러 내용이 "인증 토큰" 누락 관련일 때: 강제 로그아웃 + AUTH-DENY-001
+    // 백엔드 에러 내용이 "인증 토큰" 누락 관련일 때: 강제 로그아웃 + 조용히 처리
     if (isAuthTokenMissingError(backendError)) {
       forceLogout();
       return {
         ok: false,
         data: null,
-        error: makeFrontError(
+        error: makeSilentAuthError(
           "AUTH-DENY-001",
-          backendError.detail ?? backendError
+          backendError.detail ?? backendError,
+          backendError.trace_id ?? data.trace_id
         ),
       };
     }
 
-    // 기타 AUTH-xxx 도메인 에러: 강제 로그아웃 + 코드 그대로 매핑
+    // 기타 AUTH-xxx 도메인 에러도 강제 로그아웃 + 조용히 처리
     if (backendCode.startsWith("AUTH-")) {
       forceLogout();
       return {
         ok: false,
         data: null,
-        error: makeFrontError(
+        error: makeSilentAuthError(
           backendCode,
-          backendError.detail ?? backendError
+          backendError.detail ?? backendError,
+          backendError.trace_id ?? data.trace_id
         ),
       };
     }

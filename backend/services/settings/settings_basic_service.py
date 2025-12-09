@@ -1,13 +1,14 @@
 # 📄 backend/services/settings/settings_basic_service.py
 # 페이지: 설정 > 기본설정(BasicPage.tsx)
 # 역할: 비즈니스 로직 전담 (조회, 검증, 상태변경, 트랜잭션, 도메인 예외)
-# 단계: v2.1 (사용자설정 + 페이지설정 전체 구현, 모델 동적 로딩)
+# 단계: v2.2 (사용자설정 + 페이지설정 + 비밀번호 생성/수정, 모델 동적 로딩)
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 
+import bcrypt
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -15,7 +16,7 @@ from backend.system.error_codes import DomainError
 import backend.models as models_module
 
 PAGE_ID = "settings.basic"
-PAGE_VERSION = "v2.1"
+PAGE_VERSION = "v2.2"
 
 DEFAULT_PAGE_SIZE = 20
 DEFAULT_THEME = "라이트"
@@ -70,6 +71,33 @@ def _get_session_adapter(session: Any) -> Session:
         detail="settings.basic: 지원하지 않는 DB 세션 타입입니다.",
         ctx={"page_id": PAGE_ID, "session_type": str(type(session))},
     )
+
+
+def _hash_password(raw_password: str) -> str:
+    """
+    비밀번호 해시 유틸.
+    - bcrypt 사용
+    - 로그인 서비스에서 사용하는 검증 로직과 동일한 알고리즘을 가정
+    """
+    password = (raw_password or "").strip()
+    if not password:
+        raise DomainError(
+            "SETTINGS-VALID-013",
+            detail="비밀번호는 필수입니다.",
+            ctx={},
+        )
+
+    if len(password) < 4:
+        # 정책은 필요에 따라 조정 가능 (너무 짧은 비밀번호 방지)
+        raise DomainError(
+            "SETTINGS-VALID-014",
+            detail="비밀번호는 4자 이상이어야 합니다.",
+            ctx={"length": len(password)},
+        )
+
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode("utf-8"), salt)
+    return hashed.decode("utf-8")
 
 
 # ─────────────────────────────────────────────
@@ -208,6 +236,7 @@ class SettingsBasicService:
         [관리자] 사용자 추가
         - username 중복 체크
         - role 유효성 검증
+        - 비밀번호 해시 저장
         """
         self._require_login()
         self._require_admin()
@@ -215,6 +244,7 @@ class SettingsBasicService:
         username = str(payload.get("username") or "").strip()
         name = str(payload.get("name") or "").strip()
         role_raw = str(payload.get("role") or "").strip()
+        raw_password = str(payload.get("password") or "")
 
         if not username:
             raise DomainError(
@@ -242,12 +272,15 @@ class SettingsBasicService:
                 ctx={"username": username},
             )
 
+        # 비밀번호 해시
+        password_hash = _hash_password(raw_password)
+
         now = datetime.utcnow()
         actor = str(self._current_user_id)
 
         user = self.Users(
             username=username,
-            password_hash="!",  # 임시값, 실제 로그인 불가
+            password_hash=password_hash,
             name=name or None,
             role=norm_role,
             is_active=True,
@@ -280,6 +313,7 @@ class SettingsBasicService:
         """
         [관리자] 사용자 정보 수정
         - name, role, is_active 수정
+        - 비밀번호는 update_user_password에서만 변경
         """
         self._require_login()
         self._require_admin()
@@ -322,6 +356,46 @@ class SettingsBasicService:
             "is_active": getattr(user, "is_active", True),
             "last_login_at": getattr(user, "last_login_at", None),
             "login_count": getattr(user, "login_count", 0),
+        }
+
+    async def update_user_password(
+        self,
+        *,
+        user_id: int,
+        new_password: str,
+    ) -> Dict[str, Any]:
+        """
+        [관리자] 사용자 비밀번호 재설정
+        - 사용자는 직접 비밀번호 변경 불가
+        - 관리자만 재설정 가능
+        """
+        self._require_login()
+        self._require_admin()
+
+        user: Optional[Any] = self.session.get(self.Users, user_id)
+        if not user or getattr(user, "deleted_at", None) is not None:
+            raise DomainError(
+                "SETTINGS-NOTFOUND-005",
+                detail="비밀번호를 변경할 사용자를 찾을 수 없습니다.",
+                ctx={"user_id": user_id},
+            )
+
+        # 비밀번호 해시 후 교체
+        password_hash = _hash_password(new_password)
+        if hasattr(user, "password_hash"):
+            user.password_hash = password_hash
+
+        if hasattr(user, "updated_by"):
+            user.updated_by = str(self._current_user_id)
+        if hasattr(user, "updated_at"):
+            user.updated_at = datetime.utcnow()
+
+        self.session.commit()
+        self.session.refresh(user)
+
+        return {
+            "id": user.id,
+            "username": user.username,
         }
 
     async def delete_user(self, *, user_id: int) -> Dict[str, Any]:
@@ -397,8 +471,12 @@ class SettingsBasicService:
                 user_id=self._current_user_id,
                 page_size=page_size,
                 theme=theme,
-                updated_by=actor if hasattr(self.SettingsBasicUser, "updated_by") else None,
-                updated_at=now if hasattr(self.SettingsBasicUser, "updated_at") else None,
+                updated_by=actor
+                if hasattr(self.SettingsBasicUser, "updated_by")
+                else None,
+                updated_at=now
+                if hasattr(self.SettingsBasicUser, "updated_at")
+                else None,
             )
             self.session.add(row)
 
@@ -409,7 +487,9 @@ class SettingsBasicService:
             "theme": theme,
         }
 
-    async def admin_get_user_page_settings(self, *, target_user_id: int) -> Dict[str, Any]:
+    async def admin_get_user_page_settings(
+        self, *, target_user_id: int
+    ) -> Dict[str, Any]:
         self._require_login()
         self._require_admin()
 
@@ -485,8 +565,12 @@ class SettingsBasicService:
                 user_id=target_user_id,
                 page_size=page_size,
                 theme=theme,
-                updated_by=actor if hasattr(self.SettingsBasicUser, "updated_by") else None,
-                updated_at=now if hasattr(self.SettingsBasicUser, "updated_at") else None,
+                updated_by=actor
+                if hasattr(self.SettingsBasicUser, "updated_by")
+                else None,
+                updated_at=now
+                if hasattr(self.SettingsBasicUser, "updated_at")
+                else None,
             )
             self.session.add(row)
 
