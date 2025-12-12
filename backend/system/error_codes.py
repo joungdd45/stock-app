@@ -55,44 +55,45 @@ REGISTRY: Dict[str, ErrorSpec] = {
     "SYSTEM-DB-901":      ErrorSpec(500, "데이터 처리 중 오류가 발생했습니다", "관리자에게 문의하세요"),
 
     # AUTH
-    "AUTH-DENY-001": ErrorSpec(401, "인증이 필요합니다", "다시 로그인하세요"),
-    "AUTH-DENY-002": ErrorSpec(401, "인증 토큰이 유효하지 않습니다", "다시 로그인하세요"),
-    "AUTH-DENY-003": ErrorSpec(403, "권한이 없습니다", "권한이 있는 계정으로 시도하세요"),
+    "AUTH-DENY-001": ErrorSpec(401, "인증이 필요합니다", "다시 로그인하세요."),
+    "AUTH-DENY-002": ErrorSpec(401, "아이디 또는 비밀번호를 확인해 주세요.", "아이디와 비밀번호를 다시 입력해 주세요."),
+    "AUTH-DENY-003": ErrorSpec(403, "권한이 없습니다", "권한이 있는 계정으로 시도하세요."),
 
     # INBOUND
-    "INBOUND-VALID-001":     ErrorSpec(422, "요청 값이 유효하지 않습니다", "입력값을 확인하세요"),
-    "INBOUND-NOTFOUND-101":  ErrorSpec(404, "대상을 찾을 수 없습니다", "식별자를 확인하세요"),
-    "INBOUND-CONFLICT-201":  ErrorSpec(409, "현재 상태에서 처리할 수 없습니다", "상태를 확인하세요"),
-    "INBOUND-STATE-451":     ErrorSpec(409, "현재 상태에서는 허용되지 않습니다", "상태를 확인하세요"),
-    "INBOUND-DISABLED-401":  ErrorSpec(501, "기능이 비활성화되어 있습니다", "관리자에게 기능 활성화를 요청하세요"),
+    "INBOUND-VALID-001":     ErrorSpec(422, "요청 값이 유효하지 않습니다", "입력값을 확인하세요."),
+    "INBOUND-NOTFOUND-101":  ErrorSpec(404, "대상을 찾을 수 없습니다", "식별자를 확인하세요."),
+    "INBOUND-CONFLICT-201":  ErrorSpec(409, "현재 상태에서 처리할 수 없습니다", "상태를 확인하세요."),
+    "INBOUND-STATE-451":     ErrorSpec(409, "현재 상태에서는 허용되지 않습니다", "상태를 확인하세요."),
+    "INBOUND-DISABLED-401":  ErrorSpec(501, "기능이 비활성화되어 있습니다", "관리자에게 기능 활성화를 요청하세요."),
 
     # OUTBOUND
-    "OUTBOUND-VALID-001":     ErrorSpec(422, "요청 값이 유효하지 않습니다", "입력값을 확인하세요"),
-    "OUTBOUND-NOTFOUND-101":  ErrorSpec(404, "대상을 찾을 수 없습니다", "식별자를 확인하세요"),
-    "OUTBOUND-CONFLICT-201":  ErrorSpec(409, "현재 상태에서 처리할 수 없습니다", "상태를 확인하세요"),
-    "OUTBOUND-STATE-451":     ErrorSpec(409, "현재 상태에서는 허용되지 않습니다", "상태를 확인하세요"),
-    "OUTBOUND-DISABLED-401":  ErrorSpec(501, "기능이 비활성화되어 있습니다", "관리자에게 기능 활성화를 요청하세요"),
+    "OUTBOUND-VALID-001":     ErrorSpec(422, "요청 값이 유효하지 않습니다", "입력값을 확인하세요."),
+    "OUTBOUND-NOTFOUND-101":  ErrorSpec(404, "대상을 찾을 수 없습니다", "식별자를 확인하세요."),
+    "OUTBOUND-CONFLICT-201":  ErrorSpec(409, "현재 상태에서 처리할 수 없습니다", "상태를 확인하세요."),
+    "OUTBOUND-STATE-451":     ErrorSpec(409, "현재 상태에서는 허용되지 않습니다", "상태를 확인하세요."),
+    "OUTBOUND-DISABLED-401":  ErrorSpec(501, "기능이 비활성화되어 있습니다", "관리자에게 기능 활성화를 요청하세요."),
 
     # PRODUCT
-    "PRODUCT-VALID-001":     ErrorSpec(422, "요청 값이 유효하지 않습니다", "입력값을 확인하세요"),
-    "PRODUCT-NOTFOUND-101":  ErrorSpec(404, "대상을 찾을 수 없습니다", "식별자를 확인하세요"),
-    "PRODUCT-CONFLICT-201":  ErrorSpec(409, "현재 상태에서 처리할 수 없습니다", "상태를 확인하세요"),
+    "PRODUCT-VALID-001":     ErrorSpec(422, "요청 값이 유효하지 않습니다", "입력값을 확인하세요."),
+    "PRODUCT-NOTFOUND-101":  ErrorSpec(404, "대상을 찾을 수 없습니다", "식별자를 확인하세요."),
+    "PRODUCT-CONFLICT-201":  ErrorSpec(409, "현재 상태에서 처리할 수 없습니다", "상태를 확인하세요."),
 
     # STOCK
-    "STOCK-VALID-001":     ErrorSpec(422, "요청 값이 유효하지 않습니다", "입력값을 확인하세요"),
-    "STOCK-NOTFOUND-101":  ErrorSpec(404, "대상을 찾을 수 없습니다", "식별자를 확인하세요"),
-    "STOCK-CONFLICT-201":  ErrorSpec(409, "현재 상태에서 처리할 수 없습니다", "상태를 확인하세요"),
-    "STOCK-STATE-451":     ErrorSpec(409, "현재 상태에서는 허용되지 않습니다", "상태를 확인하세요"),
+    "STOCK-VALID-001":     ErrorSpec(422, "요청 값이 유효하지 않습니다", "입력값을 확인하세요."),
+    "STOCK-NOTFOUND-101":  ErrorSpec(404, "대상을 찾을 수 없습니다", "식별자를 확인하세요."),
+    "STOCK-CONFLICT-201":  ErrorSpec(409, "현재 상태에서 처리할 수 없습니다", "상태를 확인하세요."),
+    "STOCK-STATE-451":     ErrorSpec(409, "현재 상태에서는 허용되지 않습니다", "상태를 확인하세요."),
 
     # REPORTS
-    "REPORTS-VALID-001":    ErrorSpec(422, "요청 값이 유효하지 않습니다", "입력값을 확인하세요"),
-    "REPORTS-NOTFOUND-101": ErrorSpec(404, "대상을 찾을 수 없습니다", "조건을 확인하세요"),
-    "REPORTS-UNKNOWN-999":  ErrorSpec(500, "처리 중 오류가 발생했습니다", "잠시 후 다시 시도하세요"),
+    "REPORTS-VALID-001":    ErrorSpec(422, "요청 값이 유효하지 않습니다", "입력값을 확인하세요."),
+    "REPORTS-NOTFOUND-101": ErrorSpec(404, "대상을 찾을 수 없습니다", "조건을 확인하세요."),
+    "REPORTS-UNKNOWN-999":  ErrorSpec(500, "처리 중 오류가 발생했습니다", "잠시 후 다시 시도하세요."),
 }
 
 # ─────────────────────────────────────────────────────────
 # 유틸
 # ─────────────────────────────────────────────────────────
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 

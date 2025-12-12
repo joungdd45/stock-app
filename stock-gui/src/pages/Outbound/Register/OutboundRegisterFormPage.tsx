@@ -1,6 +1,7 @@
 /* src/pages/outbound/Register/RegisterFormPage.tsx
    ✅ 출고등록 > 등록 탭 (테이블 입력 + 붙여넣기 + 검증 + API 저장)
    - 붙여넣기 파서: 컨테이너 포커스 후 Ctrl+V
+   - ✅ 구조화(엑셀/CSV) 붙여넣기만 preventDefault로 기본동작(자동 행 증가/셀 주입) 차단
    - 체크박스 선택삭제
    - 검증 후 outboundAdapter.registerForm 호출
    - SKU 입력 시 inboundAdapter.lookupProductBySku로 상품명 자동 조회
@@ -59,6 +60,7 @@ const makeEmptyRow = (): RowItem => ({
   quantity: "",
   totalPrice: "",
 });
+
 const isEmptyRow = (r: RowItem) =>
   !r.country &&
   !r.orderNo &&
@@ -171,8 +173,19 @@ export default function RegisterFormPage() {
     }
   };
 
+  // ✅ 입고등록과 동일: 구조화(엑셀/CSV)만 기본 붙여넣기 차단
   const handlePaste = async (e: React.ClipboardEvent) => {
-    const text = e.clipboardData.getData("text/plain") ?? "";
+    const raw = e.clipboardData.getData("text/plain") ?? "";
+
+    // 🔹 탭/콤마/줄바꿈이 없으면: 단일 값 붙여넣기 → 기본 동작 유지(파서 미실행)
+    if (!raw.includes("\t") && !raw.includes(",") && !raw.includes("\n")) {
+      return;
+    }
+
+    // 🔹 구조화 데이터면 기본 붙여넣기 막고(자동 행 증가/셀 주입 방지) 파서만 실행
+    e.preventDefault();
+
+    const text = raw;
     const lines = text
       .split(/\r?\n/)
       .map((l) => l.trim())
@@ -224,8 +237,7 @@ export default function RegisterFormPage() {
     );
 
     setRows((prev) => {
-      const prevAllEmpty =
-        prev.length > 0 && prev.every((r) => isEmptyRow(r));
+      const prevAllEmpty = prev.length > 0 && prev.every((r) => isEmptyRow(r));
       return prevAllEmpty ? withNames : [...prev, ...withNames];
     });
     setChecked(new Set());
@@ -354,9 +366,7 @@ export default function RegisterFormPage() {
                 <th className="px-2 py-2 w-[40px] text-center">
                   <input
                     type="checkbox"
-                    checked={
-                      rows.length > 0 && checked.size === rows.length
-                    }
+                    checked={rows.length > 0 && checked.size === rows.length}
                     onChange={(e) => {
                       if (e.target.checked)
                         setChecked(new Set(rows.map((r) => r.id)));
@@ -456,7 +466,7 @@ export default function RegisterFormPage() {
                         onChange={(e) =>
                           onCellChange(r.id, "name", e.target.value)
                         }
-                        className="w-full border rounded-lg px-2 py-1 text-sm"
+                        className="w-full border rounded-lg px-2 py--1 text-sm"
                         disabled={isSubmitting}
                       />
                     </td>

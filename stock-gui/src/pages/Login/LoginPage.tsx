@@ -24,7 +24,7 @@ export default function LoginPage() {
     useState<"idle" | "ok" | "error">("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // 페이지 진입 시 서버 핑
+  // 페이지 진입 시 서버 핑 (상태 표출 전용: 토스트 띄우지 않음)
   useEffect(() => {
     const doPing = async () => {
       const res = await loginAdapter.ping();
@@ -32,11 +32,11 @@ export default function LoginPage() {
         setPingStatus("ok");
       } else {
         setPingStatus("error");
-        if (res.error) {
-          handleError(res.error);
-        }
+        // ✅ ping은 화면 상단 상태표시로만 처리한다.
+        // (토스트는 로그인 액션 실패에서만 띄운다)
       }
     };
+
     doPing();
   }, []);
 
@@ -57,9 +57,7 @@ export default function LoginPage() {
         if (res.error) {
           handleError(res.error);
         } else {
-          setErrorMessage(
-            "로그인에 실패했습니다. 잠시 후 다시 시도해 주세요.",
-          );
+          setErrorMessage("로그인에 실패했습니다. 잠시 후 다시 시도해 주세요.");
         }
         return;
       }
@@ -69,12 +67,8 @@ export default function LoginPage() {
       const refreshToken = result.refresh_token;
       const user = result.user;
 
-      if (accessToken) {
-        localStorage.setItem("accessToken", accessToken);
-      }
-      if (refreshToken) {
-        localStorage.setItem("refreshToken", refreshToken);
-      }
+      if (accessToken) localStorage.setItem("accessToken", accessToken);
+      if (refreshToken) localStorage.setItem("refreshToken", refreshToken);
 
       if (user) {
         const userSnapshot = {
@@ -116,9 +110,7 @@ export default function LoginPage() {
               <span>재고</span>
               <span>이찌</span>
             </div>
-            <div className="mt-1 text-xs text-slate-500">
-              경영관리시스템
-            </div>
+            <div className="mt-1 text-xs text-slate-500">경영관리시스템</div>
           </div>
 
           {/* 서버 상태 */}
@@ -140,9 +132,7 @@ export default function LoginPage() {
           <form onSubmit={handleSubmit} className="space-y-4">
             {/* 아이디 */}
             <label className="block text-sm">
-              <span className="mb-0.5 inline-block text-slate-600">
-                ID
-              </span>
+              <span className="mb-0.5 inline-block text-slate-600">ID</span>
               <input
                 type="text"
                 value={id}
@@ -210,7 +200,8 @@ export default function LoginPage() {
 
           {/* 하단 안내 */}
           <p className="mt-6 text-center text-[12px] text-slate-800">
-            보안을 위해 공용 PC에서는 사용 후 <br />반드시 로그아웃하세요.
+            보안을 위해 공용 PC에서는 사용 후 <br />
+            반드시 로그아웃하세요.
           </p>
         </div>
       </div>

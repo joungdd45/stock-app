@@ -1,9 +1,9 @@
 // 📄 src/api/hub/apiHub.ts
-// 역할: 백엔드와 통신하는 단일 허브 (모바일 전용 완성본)
-//  - axios 인스턴스를 관리
+// 역할: 백엔드와 통신하는 단일 허브 (모바일 전용)
+//  - axios 인스턴스 관리
 //  - 응답을 ApiResult<T> 형태로 정규화
-//  - 네트워크/인증/도메인 에러를 통합 포맷으로 가공
-//  - handleError 내장 (팝업/알림 통일)
+//  - 백엔드 ok:false(HTTP 200 포함)도 실패로 처리
+//  - handleError: front_error_codes 기반 메시지 + App 주입 토스트로 출력
 
 import axios, {
   type AxiosError,
@@ -12,16 +12,11 @@ import axios, {
   type AxiosResponse,
 } from "axios";
 
-import {
-  getFrontErrorMessage,
-  type FrontErrorCode,
-} from "./front_error_codes";
+import { getFrontErrorMessage, type FrontErrorCode } from "./front_error_codes";
 
-//
 // ─────────────────────────────────────────────
-// ApiResult 타입 정의
+// ApiResult 타입
 // ─────────────────────────────────────────────
-//
 
 export type ApiError = {
   code: string;
@@ -43,47 +38,27 @@ export type ApiFailure = {
   ok: false;
   data: null;
   error: ApiError;
+  traceId?: string | null;
 };
 
 export type ApiResult<T> = ApiSuccess<T> | ApiFailure;
 
-type BackendSuccessEnvelope<T = unknown> = {
-  ok: true;
-  trace_id?: string | null;
-  page?: string;
-  version?: string;
-  stage?: string;
-  data?: {
-    result?: T;
-  };
-};
+// ─────────────────────────────────────────────
+// ✅ App에서 주입하는 전역 토스트 함수
+// ─────────────────────────────────────────────
 
-type BackendErrorEnvelope = {
-  ok: false;
-  trace_id?: string | null;
-  error: {
-    code: string;
-    message: string;
-    hint?: string;
-    detail?: unknown;
-    ctx?: unknown;
-    stage?: string;
-    domain?: string | null;
-    trace_id?: string;
-    timestamp?: string;
-    [key: string]: unknown;
-  };
-  meta?: unknown;
-};
+type GlobalToastFn = (message: string) => void;
+let globalToastFn: GlobalToastFn | null = null;
 
-//
+export function setGlobalToast(fn: GlobalToastFn | null) {
+  globalToastFn = fn;
+}
+
 // ─────────────────────────────────────────────
 // axios 인스턴스
 // ─────────────────────────────────────────────
-//
 
-const API_BASE_URL =
-  (import.meta as any).env?.VITE_API_BASE_URL ?? "";
+const API_BASE_URL = (import.meta as any).env?.VITE_API_BASE_URL ?? "";
 
 const instance: AxiosInstance = axios.create({
   baseURL: API_BASE_URL,
@@ -91,21 +66,34 @@ const instance: AxiosInstance = axios.create({
   withCredentials: true,
 });
 
+// ─────────────────────────────────────────────
+// 토큰/무토큰 허용 URL
+// ─────────────────────────────────────────────
+
 const ACCESS_TOKEN_STORAGE_KEY = "stockapp.access_token";
 const ACCESS_TOKEN_LEGACY_KEY = "accessToken";
+const ACCESS_TOKEN_MOBILE_JWT_KEY = "stock.jwt";
 
-//
-// ─────────────────────────────────────────────
-// 토큰 관리
-// ─────────────────────────────────────────────
-//
+/**
+ * ✅ 무토큰 허용 URL
+ * - 로그인/핑은 무토큰 요청
+ * - 실제 프로젝트에서 login 경로가 2종 이상이라 넓혀둠
+ */
+const OPEN_URLS = [
+  "/api/login/ping",
+  "/api/login/action",
+  "/api/auth/login",
+  "/api/system/health",
+];
 
 function getAccessToken(): string | null {
   try {
-    const v1 = window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY);
-    if (v1) return v1;
-    const v2 = window.localStorage.getItem(ACCESS_TOKEN_LEGACY_KEY);
-    return v2;
+    return (
+      window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) ||
+      window.localStorage.getItem(ACCESS_TOKEN_LEGACY_KEY) ||
+      window.localStorage.getItem(ACCESS_TOKEN_MOBILE_JWT_KEY) ||
+      null
+    );
   } catch {
     return null;
   }
@@ -115,397 +103,339 @@ function clearAccessToken() {
   try {
     window.localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
     window.localStorage.removeItem(ACCESS_TOKEN_LEGACY_KEY);
+    window.localStorage.removeItem(ACCESS_TOKEN_MOBILE_JWT_KEY);
+
     window.sessionStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
     window.sessionStorage.removeItem(ACCESS_TOKEN_LEGACY_KEY);
+    window.sessionStorage.removeItem(ACCESS_TOKEN_MOBILE_JWT_KEY);
   } catch {
-    // 무시
+    // ignore
   }
 }
 
 function forceLogout() {
   clearAccessToken();
-
   try {
     if (window.location.pathname !== "/login") {
       window.location.href = "/login";
     }
   } catch {
-    // 무시
+    // ignore
   }
 }
 
-//
+// ─────────────────────────────────────────────
 // 요청 인터셉터
-//
+//  - OPEN_URLS는 무토큰 통과
+//  - 그 외 토큰 없으면 forceLogout (단, 요청을 막진 않음)
+// ─────────────────────────────────────────────
 
 instance.interceptors.request.use((config) => {
-  const token = getAccessToken();
+  const url = String(config.url ?? "");
 
-  // 토큰이 완전히 없으면 바로 로그인 페이지로 이동
+  // ✅ 무토큰 허용
+  if (OPEN_URLS.some((p) => url.startsWith(p))) {
+    return config;
+  }
+
+  const token = getAccessToken();
   if (!token) {
+    // 여기서 강제 이동은 하되, 요청 자체를 throw 하진 않는다.
     forceLogout();
     return config;
   }
 
   config.headers = config.headers ?? {};
-  if (!("Authorization" in config.headers)) {
-    (config.headers as any)["Authorization"] = `Bearer ${token}`;
+  if (!(config.headers as any).Authorization) {
+    (config.headers as any).Authorization = `Bearer ${token}`;
   }
 
   return config;
 });
 
-//
 // ─────────────────────────────────────────────
-// 성공 응답 벗기기
+// 백엔드 응답 엔벨로프 인식
+//  - HTTP 200이어도 ok:false면 실패 처리
 // ─────────────────────────────────────────────
-//
 
-function unwrapBackendSuccess<T>(
-  data: any
-): { payload: T; traceId?: string | null } {
-  if (data && typeof data === "object") {
-    const traceId =
-      data.trace_id ?? data.data?.trace_id ?? null;
+type BackendFailureEnvelope = {
+  ok: false;
+  error: any;
+  trace_id?: string | null;
+  meta?: any;
+};
 
-    if (data.data && "result" in data.data) {
-      return {
-        payload: data.data.result as T,
-        traceId,
-      };
-    }
+function isBackendFailureEnvelope(x: any): x is BackendFailureEnvelope {
+  return !!x && typeof x === "object" && x.ok === false && !!x.error && typeof x.error === "object";
+}
 
-    if ("result" in data) {
-      return {
-        payload: data.result as T,
-        traceId,
-      };
-    }
+function unwrapBackendSuccess<T>(x: any): { payload: T; traceId: string | null } {
+  const traceId = (x?.trace_id ?? x?.data?.trace_id ?? null) as string | null;
 
-    if ("ok" in data && !("data" in data)) {
-      return {
-        payload: data as T,
-        traceId,
-      };
-    }
+  // { ok:true, data:{ result } }
+  if (x && typeof x === "object" && x.data && typeof x.data === "object" && "result" in x.data) {
+    return { payload: x.data.result as T, traceId };
   }
 
-  return {
-    payload: data as T,
-    traceId: (data && data.trace_id) || null,
-  };
+  // { result: ... }
+  if (x && typeof x === "object" && "result" in x) {
+    return { payload: x.result as T, traceId };
+  }
+
+  // raw 자체가 payload
+  return { payload: x as T, traceId };
 }
 
-//
 // ─────────────────────────────────────────────
-// 프론트 에러코드 생성
+// FrontError 생성(FrontErrorCode 정합 유지)
 // ─────────────────────────────────────────────
-//
 
-function makeFrontError(code: FrontErrorCode, detail?: unknown): ApiError {
-  const msg = getFrontErrorMessage(code as string);
+function makeFrontError(code: FrontErrorCode, rawMessage?: string): ApiError {
+  const message = getFrontErrorMessage(code) || rawMessage || "오류가 발생했습니다.";
+  return { code, message, detail: rawMessage ?? null, traceId: null, raw: null };
+}
+
+function normalizeBackendFailureEnvelope(dataAny: any): ApiFailure {
+  const be = dataAny?.error ?? {};
+  const traceId = (be.trace_id ?? dataAny?.trace_id ?? null) as string | null;
+
   return {
-    code: String(code),
-    message: msg,
-    detail,
-    raw: detail,
+    ok: false,
+    data: null,
+    error: {
+      code: String(be.code ?? "FRONT-UNEXPECTED-001"),
+      message: String(be.message ?? "처리 중 오류가 발생했습니다."),
+      detail: be.detail ?? null,
+      hint: be.hint ?? undefined,
+      traceId,
+      raw: dataAny,
+    },
+    traceId,
   };
 }
 
-// 로그인으로 보내되, 토스트는 띄우지 않는 전용 에러
-function makeSilentAuthError(
-  code: FrontErrorCode,
-  detail?: unknown,
-  traceId?: string | null
-): ApiError {
-  return {
-    code: String(code),
-    message: "", // message 비워서 handleError에서 알림이 안 뜨도록
-    detail,
-    traceId: traceId ?? null,
-    raw: detail,
-  };
-}
-
-function isAuthTokenMissingError(body: BackendErrorEnvelope["error"]): boolean {
-  const detailText = String(body.detail ?? "");
-  const locationText = String(
-    (body.ctx as any)?.location ?? (body.ctx as any)?.field ?? ""
-  );
-
-  if (detailText.includes("인증 토큰")) return true;
-  if (locationText === "header.Authorization") return true;
-
-  return false;
-}
-
-//
 // ─────────────────────────────────────────────
 // AxiosError → ApiFailure
 // ─────────────────────────────────────────────
-//
 
 function normalizeAxiosError(error: AxiosError): ApiFailure {
+  // 응답이 없는 경우: 네트워크/타임아웃 등
   if (!error.response) {
     if (error.code === "ECONNABORTED") {
-      return {
-        ok: false,
-        data: null,
-        error: makeFrontError("FRONT-TIMEOUT-001", error.message),
-      };
+      return { ok: false, data: null, error: makeFrontError("FRONT-TIMEOUT-001", error.message) };
     }
-
-    return {
-      ok: false,
-      data: null,
-      error: makeFrontError("FRONT-NET-001", error.message),
-    };
+    return { ok: false, data: null, error: makeFrontError("FRONT-NET-001", error.message) };
   }
 
   const res = error.response as AxiosResponse<any>;
   const data = res.data;
   const status = res.status;
 
-  // 401 → 강제 로그아웃 + 조용히 처리
+  // 401: 강제 로그아웃 + FRONT-AUTH-UNAUTHORIZED-001 (front_error_codes에 존재)
   if (status === 401) {
     forceLogout();
     return {
       ok: false,
       data: null,
-      error: makeSilentAuthError(
+      error: makeFrontError(
         "FRONT-AUTH-UNAUTHORIZED-001",
-        data,
-        data?.trace_id
+        "로그인이 필요합니다. 다시 로그인해 주세요.",
       ),
+      traceId: data?.trace_id ?? data?.traceId ?? null,
     };
   }
 
-  if (data && typeof data === "object" && data.ok === false && data.error) {
-    const backendError = data.error as BackendErrorEnvelope["error"];
-    const backendCode =
-      typeof backendError.code === "string"
-        ? backendError.code.trim().toUpperCase()
-        : "SYSTEM-UNKNOWN-999";
+  // 백엔드가 에러를 표준 형태로 내려주는 경우 우선 사용
+  const code = data?.error?.code ?? data?.code ?? "FRONT-UNEXPECTED-001";
+  const message =
+    data?.error?.message ??
+    data?.message ??
+    `요청 처리 중 오류가 발생했습니다. (HTTP ${status})`;
 
-    // 토큰 누락/만료 / AUTH-xxx → 강제 로그아웃 + 조용히 처리
-    if (
-      isAuthTokenMissingError(backendError) ||
-      backendCode.startsWith("AUTH-")
-    ) {
-      forceLogout();
-      return {
-        ok: false,
-        data: null,
-        error: makeSilentAuthError(
-          "FRONT-AUTH-UNAUTHORIZED-001",
-          backendError.detail ?? backendError,
-          backendError.trace_id ?? data.trace_id
-        ),
-      };
-    }
-
-    const code = (backendError.code as FrontErrorCode) || "SYSTEM-UNKNOWN-999";
-
-    return {
-      ok: false,
-      data: null,
-      error: {
-        code,
-        message:
-          (backendError.message as string | undefined) ||
-          (backendError.detail as string | undefined) ||
-          getFrontErrorMessage("FRONT-UNEXPECTED-001"),
-        detail: backendError.detail,
-        hint: backendError.hint,
-        traceId: backendError.trace_id ?? data.trace_id ?? null,
-        raw: data,
-      },
-    };
-  }
+  const detail = data?.error?.detail ?? data?.detail ?? null;
+  const hint = data?.error?.hint ?? data?.hint ?? undefined;
+  const traceId = data?.trace_id ?? data?.traceId ?? null;
 
   return {
     ok: false,
     data: null,
-    error: makeFrontError("FRONT-PARSE-001", data),
+    error: {
+      code: String(code),
+      message: String(message),
+      detail,
+      hint,
+      traceId,
+      raw: data,
+    },
+    traceId,
   };
 }
 
 function normalizeUnknownError(error: unknown): ApiFailure {
-  if (axios.isAxiosError(error)) {
-    return normalizeAxiosError(error);
+  const ax = error as AxiosError;
+  if (ax && (ax as any).isAxiosError) {
+    return normalizeAxiosError(ax);
   }
 
   return {
     ok: false,
     data: null,
-    error: makeFrontError("FRONT-UNEXPECTED-001", error),
+    error: {
+      code: "FRONT-UNEXPECTED-001",
+      message: getFrontErrorMessage("FRONT-UNEXPECTED-001"),
+      detail: null,
+      traceId: null,
+      raw: error,
+    },
   };
 }
 
-//
 // ─────────────────────────────────────────────
-// public 메서드
+// 요청 메서드들 (HTTP 200 + ok:false도 실패 처리)
 // ─────────────────────────────────────────────
-//
 
-async function get<T>(
+async function get<T>(url: string, config?: AxiosRequestConfig): Promise<ApiResult<T>> {
+  try {
+    const res = await instance.get<any>(url, config);
+    const dataAny: any = res.data;
+
+    if (isBackendFailureEnvelope(dataAny)) {
+      return normalizeBackendFailureEnvelope(dataAny);
+    }
+
+    const { payload, traceId } = unwrapBackendSuccess<T>(dataAny);
+    return { ok: true, data: payload, error: null, traceId };
+  } catch (error) {
+    return normalizeUnknownError(error);
+  }
+}
+
+async function post<T, B = unknown>(
   url: string,
-  config?: AxiosRequestConfig
+  body?: B,
+  config?: AxiosRequestConfig,
 ): Promise<ApiResult<T>> {
   try {
-    const res = await instance.get<
-      BackendSuccessEnvelope<T> | T
-    >(url, config);
+    const res = await instance.post<any>(url, body, config);
+    const dataAny: any = res.data;
 
-    const { payload, traceId } = unwrapBackendSuccess<T>(res.data);
+    if (isBackendFailureEnvelope(dataAny)) {
+      return normalizeBackendFailureEnvelope(dataAny);
+    }
 
-    return {
-      ok: true,
-      data: payload,
-      error: null,
-      traceId,
-    };
+    const { payload, traceId } = unwrapBackendSuccess<T>(dataAny);
+    return { ok: true, data: payload, error: null, traceId };
   } catch (error) {
     return normalizeUnknownError(error);
   }
 }
 
-async function post<TResponse, TBody = unknown>(
+async function patch<T, B = unknown>(
   url: string,
-  body?: TBody,
-  config?: AxiosRequestConfig
-): Promise<ApiResult<TResponse>> {
+  body?: B,
+  config?: AxiosRequestConfig,
+): Promise<ApiResult<T>> {
   try {
-    const res = await instance.post<
-      BackendSuccessEnvelope<TResponse> | TResponse
-    >(url, body, config);
+    const res = await instance.patch<any>(url, body, config);
+    const dataAny: any = res.data;
 
-    const { payload, traceId } = unwrapBackendSuccess<TResponse>(res.data);
+    if (isBackendFailureEnvelope(dataAny)) {
+      return normalizeBackendFailureEnvelope(dataAny);
+    }
 
-    return {
-      ok: true,
-      data: payload,
-      error: null,
-      traceId,
-    };
+    const { payload, traceId } = unwrapBackendSuccess<T>(dataAny);
+    return { ok: true, data: payload, error: null, traceId };
   } catch (error) {
     return normalizeUnknownError(error);
   }
 }
 
-async function patch<TResponse, TBody = unknown>(
+async function put<T, B = unknown>(
   url: string,
-  body?: TBody,
-  config?: AxiosRequestConfig
-): Promise<ApiResult<TResponse>> {
+  body?: B,
+  config?: AxiosRequestConfig,
+): Promise<ApiResult<T>> {
   try {
-    const res = await instance.patch<
-      BackendSuccessEnvelope<TResponse> | TResponse
-    >(url, body, config);
-    const { payload, traceId } = unwrapBackendSuccess<TResponse>(res.data);
+    const res = await instance.put<any>(url, body, config);
+    const dataAny: any = res.data;
 
-    return {
-      ok: true,
-      data: payload,
-      error: null,
-      traceId,
-    };
+    if (isBackendFailureEnvelope(dataAny)) {
+      return normalizeBackendFailureEnvelope(dataAny);
+    }
+
+    const { payload, traceId } = unwrapBackendSuccess<T>(dataAny);
+    return { ok: true, data: payload, error: null, traceId };
   } catch (error) {
     return normalizeUnknownError(error);
   }
 }
 
-async function put<TResponse, TBody = unknown>(
-  url: string,
-  body?: TBody,
-  config?: AxiosRequestConfig
-): Promise<ApiResult<TResponse>> {
+async function del<T>(url: string, config?: AxiosRequestConfig): Promise<ApiResult<T>> {
   try {
-    const res = await instance.put<
-      BackendSuccessEnvelope<TResponse> | TResponse
-    >(url, body, config);
-    const { payload, traceId } = unwrapBackendSuccess<TResponse>(res.data);
+    const res = await instance.delete<any>(url, config);
+    const dataAny: any = res.data;
 
-    return {
-      ok: true,
-      data: payload,
-      error: null,
-      traceId,
-    };
+    if (isBackendFailureEnvelope(dataAny)) {
+      return normalizeBackendFailureEnvelope(dataAny);
+    }
+
+    const { payload, traceId } = unwrapBackendSuccess<T>(dataAny);
+    return { ok: true, data: payload, error: null, traceId };
   } catch (error) {
     return normalizeUnknownError(error);
   }
 }
 
-async function del<TResponse>(
-  url: string,
-  config?: AxiosRequestConfig
-): Promise<ApiResult<TResponse>> {
-  try {
-    const res = await instance.delete<
-      BackendSuccessEnvelope<TResponse> | TResponse
-    >(url, config);
-
-    const { payload, traceId } = unwrapBackendSuccess<TResponse>(res.data);
-
-    return {
-      ok: true,
-      data: payload,
-      error: null,
-      traceId,
-    };
-  } catch (error) {
-    return normalizeUnknownError(error);
-  }
-}
-
-//
 // ─────────────────────────────────────────────
-// handleError (프론트 공통 팝업)
+// handleError (프론트 공통 토스트)
+//  - FRONT-AUTH-UNAUTHORIZED-001 도 토스트 1번은 보여준다(원인 가시화)
 // ─────────────────────────────────────────────
-//
 
-export function handleError(error: ApiError): void {
+export function handleError(err: ApiError | unknown): void {
   try {
-    // 인증 관련 에러(FRONT-AUTH-...)는 이미 로그인으로 보냈으니 조용히 무시
-    if (
-      typeof error.code === "string" &&
-      error.code.startsWith("FRONT-AUTH")
-    ) {
+    const e = (err ?? {}) as any;
+    const code = String(e.code ?? "FRONT-UNEXPECTED-001");
+    const message = String(e.message ?? getFrontErrorMessage("FRONT-UNEXPECTED-001"));
+
+    // ✅ 인증 만료도 토스트는 1번 띄우고, 이후 로직 종료
+    if (code === "FRONT-AUTH-UNAUTHORIZED-001") {
+      if (globalToastFn) globalToastFn(message);
       return;
     }
 
-    const msg = error.message || "오류가 발생했습니다.";
-
     let detailText = "";
-    if (error.detail) {
-      if (typeof error.detail === "string") {
-        detailText = error.detail;
-      } else {
+    if (e.detail) {
+      if (typeof e.detail === "string") detailText = e.detail;
+      else {
         try {
-          detailText = JSON.stringify(error.detail);
+          detailText = JSON.stringify(e.detail);
         } catch {
-          detailText = String(error.detail);
+          detailText = String(e.detail);
         }
       }
     }
 
-    const finalMsg =
-      detailText && detailText !== msg
-        ? `${msg}\n\n${detailText}`
-        : msg;
+    const finalMsg = detailText ? `${message}\n\n[상세]\n${detailText}` : message;
 
+    if (globalToastFn) {
+      globalToastFn(finalMsg);
+      return;
+    }
+
+    // 개발 중 안전장치(주입 안 된 경우)
     alert(finalMsg);
   } catch {
-    alert("오류가 발생했습니다.");
+    if (globalToastFn) {
+      globalToastFn("처리 중 오류가 발생했습니다.");
+      return;
+    }
+    alert("처리 중 오류가 발생했습니다.");
   }
 }
 
-//
 // ─────────────────────────────────────────────
 // export
 // ─────────────────────────────────────────────
-//
 
 export const apiHub = {
   get,

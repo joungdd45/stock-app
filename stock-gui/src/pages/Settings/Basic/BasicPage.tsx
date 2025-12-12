@@ -153,6 +153,7 @@ export default function BasicPage() {
       username: newUser.username.trim(),
       name: newUser.name.trim(),
       role: newUser.role,
+      password: newUser.password, // ← 이 줄 추가
       // 비밀번호 전달은 서비스/라우터/어댑터 정리 후 연동 예정
     });
     setIsSavingUser(false);
@@ -285,11 +286,21 @@ export default function BasicPage() {
 
     setIsSavingPassword(true);
     try {
-      // TODO: 서비스/라우터/어댑터 작업 후 실제 API 연동 예정
-      // 예: await settingsAdapter.updateUserPassword(passwordTargetUser.id, { new_password: pwd });
-      alert(
-        `사용자 '${passwordTargetUser.username}'의 비밀번호가 수정되었다고 가정합니다. (백엔드 연동 예정)`,
+      const res = await settingsAdapter.updateUserPassword(
+        passwordTargetUser.id,
+        { new_password: pwd },
       );
+
+      if (!res.ok || !res.data) {
+        if (res.error) {
+          handleError(res.error);
+        } else {
+          alert("비밀번호 수정에 실패했습니다.");
+        }
+        return;
+      }
+
+      alert("비밀번호가 변경되었습니다.");
       closePasswordModal();
     } catch (e) {
       console.error(e);
@@ -301,6 +312,7 @@ export default function BasicPage() {
 
   // ───────────────────────────────────────────────────────────
   // 페이지 설정 (백엔드 + 로컬스토리지 참고)
+
   const [pageSettings, setPageSettings] = useState<AppSettings>(() =>
     loadLocalSettingsFallback(),
   );

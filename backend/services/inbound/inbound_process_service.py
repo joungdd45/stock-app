@@ -550,6 +550,7 @@ class InboundProcessService:
         InboundItem = self.models["InboundItem"]
         InventoryLedger = self.models["InventoryLedger"]
         StockCurrent = self.models["StockCurrent"]
+        Product = self.models["Product"]  # ← 추가
 
         norm_header_id = _normalize_header_id(header_id)
         norm_items = _normalize_confirm_items(items)
@@ -661,9 +662,26 @@ class InboundProcessService:
                     },
                 )
 
-        # 4) 요청 기준 sku / qty 검증 및 집계
-        total_qty = 0
-        qty_by_sku: Dict[str, int] = {}
+        # 🔹 상품 정보 미리 로드 (묶음 여부 확인용)
+        sku_set: Set[str] = set()
+        for db_item in db_items:
+            db_sku = getattr(db_item, "sku", None)
+            if db_sku:
+                sku_set.add(str(db_sku))
+
+        product_map: Dict[str, Any] = {}
+        if sku_set:
+            stmt_product = select(Product).where(Product.sku.in_(list(sku_set)))
+            result_product = await self._execute(stmt_product)
+            product_list = result_product.scalars().all()
+            product_map = {
+                str(getattr(p, "sku")): p
+                for p in product_list
+            }
+
+        # 4) 요청 기준 sku / qty 검증 및 집계  ← ★ 여기부터 전체 교체
+        total_qty = 0  # 전표에 표시되는 총합 (사용자 입력 기준)
+        qty_by_sku: Dict[str, int] = {}  # 실제 재고에 반영되는 양(단품 기준)
 
         for row in norm_items:
             item_id = int(row["item_id"])
@@ -688,13 +706,17 @@ class InboundProcessService:
                         },
                     )
 
+            # 입력 수량 정규화
             norm_qty = _normalize_qty(req_qty_raw, allow_zero=False)
 
+            # 전표 화면용 qty는 그대로 입력값 유지
             if hasattr(db_item, "qty"):
                 db_item.qty = norm_qty
 
+            # 화면용 총합
             total_qty += norm_qty
 
+            # SKU 확인
             sku_key = str(db_sku) if db_sku is not None else ""
             if not sku_key:
                 raise DomainError(
@@ -706,9 +728,30 @@ class InboundProcessService:
                         "item_id": item_id,
                     },
                 )
-            qty_by_sku[sku_key] = qty_by_sku.get(sku_key, 0) + norm_qty
 
-        # 5) header / item 상태를 committed 로 변경 (필드 존재 시)
+            # 🔹 묶음 SKU 여부 확인 → 단품 SKU로 환산
+            product = product_map.get(sku_key)
+            target_sku = sku_key
+            factor = 1
+
+            if product is not None:
+                is_bundle = bool(getattr(product, "is_bundle", False))
+                base_sku = getattr(product, "base_sku", None)
+                pack_qty = getattr(product, "pack_qty", 1) or 1
+
+                # 묶음 SKU이면 base_sku × pack_qty 로 변환
+                if is_bundle and base_sku and pack_qty > 1:
+                    target_sku = str(base_sku)
+                    factor = pack_qty
+
+            # 최종 단품 기준 입고량
+            effective_qty = norm_qty * factor
+
+            # 합산
+            qty_by_sku[target_sku] = qty_by_sku.get(target_sku, 0) + effective_qty
+
+        # 5) header / item 상태를 committed 로 변경 (필드 존재 시)  ← ★ 여기까지 전체 교체 완료
+
         if hasattr(header_obj, "status"):
             header_obj.status = "committed"
         if hasattr(header_obj, "updated_by"):

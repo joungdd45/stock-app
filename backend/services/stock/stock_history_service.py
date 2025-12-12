@@ -122,7 +122,10 @@ class StockHistoryService:
         P = self.models["Product"]
         S = self.models["StockCurrent"]
 
-        conditions = []
+        # 🔹 묶음 SKU는 재고이력에서 숨긴다
+        conditions = [
+            or_(P.is_bundle.is_(None), P.is_bundle == False)
+        ]
 
         if date_from:
             conditions.append(L.created_at >= date_from)
@@ -140,6 +143,7 @@ class StockHistoryService:
 
         where_clause = and_(*conditions) if conditions else None
 
+        # 총 개수 조회
         count_stmt = select(func.count()).select_from(L).join(P, L.sku == P.sku)
         if where_clause is not None:
             count_stmt = count_stmt.where(where_clause)
@@ -156,6 +160,7 @@ class StockHistoryService:
 
         offset = (page - 1) * size
 
+        # 목록 조회
         list_stmt = (
             select(
                 L.id.label("ledger_id"),
@@ -233,7 +238,11 @@ class StockHistoryService:
         P = self.models["Product"]
         S = self.models["StockCurrent"]
 
-        conditions = []
+        # 🔹 묶음 SKU(is_bundle=True)는 엑셀에서도 제외
+        conditions = [
+            or_(P.is_bundle.is_(None), P.is_bundle == False)
+        ]
+
         date_from = self._parse_date(from_date, "from_date")
         date_to = self._parse_date(to_date, "to_date")
 

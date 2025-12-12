@@ -384,35 +384,69 @@ class OutboundProcessService:
         kst_now = now + timedelta(hours=9)
         kst_date = kst_now.date()
 
+        # 🔹 상품 정보 미리 로드 (묶음 여부 확인용)
+        Product = self.Product
+        sku_list = list({it.sku for it in items})
+        products = (
+            session.execute(select(Product).where(Product.sku.in_(sku_list)))
+            .scalars()
+            .all()
+        )
+        product_map = {p.sku: p for p in products}
+
         # 재고 차감 및 이력
+        # - 묶음 SKU(is_bundle=True, base_sku/pack_qty 설정)는
+        #   단품 SKU 기준으로 환산해서 차감한다.
         for it in items:
+            product = product_map.get(it.sku)
+
+            # 기본값: 그냥 단품으로 취급
+            target_sku = it.sku
+            factor = 1
+
+            if product is not None:
+                is_bundle = bool(getattr(product, "is_bundle", False))
+                base_sku = getattr(product, "base_sku", None)
+                pack_qty = getattr(product, "pack_qty", 1) or 1
+
+                # 묶음 SKU인 경우: base_sku × pack_qty 로 환산
+                if is_bundle and base_sku and pack_qty > 1:
+                    target_sku = base_sku
+                    factor = pack_qty
+
+            effective_qty = it.qty * factor
+
             stock = (
                 session.execute(
-                    select(StockCurrent).where(StockCurrent.sku == it.sku)
+                    select(StockCurrent).where(StockCurrent.sku == target_sku)
                 )
                 .scalars()
                 .first()
             )
 
-            if not stock or stock.qty_on_hand < it.qty:
+            if not stock or stock.qty_on_hand < effective_qty:
                 raise DomainError(
                     "OUTBOUND-STATE-451",
                     detail="재고가 부족하여 출고할 수 없습니다.",
-                    ctx={"sku": it.sku},
+                    ctx={"sku": target_sku},
                 )
 
-            stock.qty_on_hand -= it.qty
+            stock.qty_on_hand -= effective_qty
             stock.updated_at = now
 
+            memo = "출고 확정"
+            if target_sku != it.sku:
+                memo = f"출고 확정 (묶음:{it.sku} x {it.qty})"
+
             ledger = InventoryLedger(
-                sku=it.sku,
+                sku=target_sku,
                 event_type="OUTBOUND",
                 ref_type="OUTBOUND",
                 ref_id=header.id,
                 qty_in=0,
-                qty_out=it.qty,
+                qty_out=effective_qty,
                 unit_price=stock.last_unit_price,
-                memo="출고 확정",
+                memo=memo,
                 created_at=now,
             )
 

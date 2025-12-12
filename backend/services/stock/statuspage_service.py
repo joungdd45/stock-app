@@ -171,6 +171,7 @@ class StatusPageService:
             WHERE sc.deleted_at IS NULL
               AND p.deleted_at IS NULL
               AND p.is_active = TRUE
+              AND (p.is_bundle IS NULL OR p.is_bundle = FALSE)
         """
 
     # ─────────────────────────────────────────────────────

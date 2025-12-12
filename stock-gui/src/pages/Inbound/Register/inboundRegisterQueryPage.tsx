@@ -596,7 +596,7 @@ export default function RegisterQueryPage() {
 
     if (
       !window.confirm(
-        `선택된 ${targets.length}건을 삭제할까요?\n(실제 삭제 스펙은 백엔드 기준 soft delete)`,
+        `선택된 ${targets.length}건을 삭제할까요?`,
       )
     ) {
       return;
@@ -615,7 +615,7 @@ export default function RegisterQueryPage() {
       }
 
       await fetchList("delete");
-      alert(`삭제가 완료되었습니다. (삭제 건수: ${res.data.deleted_count})`);
+      alert(`삭제가 완료되었습니다.`);
     } catch (err) {
       console.error(err);
       handleError(err as any);

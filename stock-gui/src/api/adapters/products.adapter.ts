@@ -31,7 +31,8 @@ export type ProductListItem = {
   unit_price: number;
   weight_g: number | null;
   barcode: string | null;
-  status: boolean;
+  status?: boolean;      // ← 구버전 호환용
+  is_active?: boolean;   // ← 신규 활성 여부
   bundle_qty: number;
 };
 
@@ -53,6 +54,7 @@ export type ProductUpdatePayload = {
   name?: string;
   barcode?: string;
   weight_g?: number;
+  is_active?: boolean;
 };
 
 type ProductPingResponse = {
@@ -79,14 +81,20 @@ type ProductDeleteResult = {
   deleted?: number;
 };
 
-type ProductBundleUpdatePayload = {
-  ids: string[];
-  bundle_qty: number;
+/* 📌 묶음설정(bundle-mapping) 전용 타입 */
+
+export type BundleMappingItem = {
+  component_sku: string;
+  component_qty: number;
 };
 
-type ProductBundleUpdateResult = {
+export type BundleMappingPayload = {
+  bundle_sku: string;
+  items: BundleMappingItem[];
+};
+
+type BundleMappingResult = {
   ok: boolean;
-  updated?: number;
 };
 
 type ProductBulkUploadPayload = {
@@ -128,21 +136,28 @@ async function deleteItems(
   ids: string[],
 ): Promise<ApiResult<ProductDeleteResult>> {
   const body: ProductDeletePayload = { ids };
-  // ⚠ 여기서 두 번째 인자는 AxiosRequestConfig 타입이기 때문에 data로 감싸서 전달
+  // 두 번째 인자는 AxiosRequestConfig 타입이므로 data로 감싸서 전달
   return apiHub.delete<ProductDeleteResult>(PRODUCTS_DELETE_URL, {
     data: body,
   });
 }
 
-async function updateBundleMany(
-  ids: string[],
-  bundleQty: number,
-): Promise<ApiResult<ProductBundleUpdateResult>> {
-  const body: ProductBundleUpdatePayload = {
-    ids,
-    bundle_qty: bundleQty,
-  };
-  return apiHub.post<ProductBundleUpdateResult>(PRODUCTS_BUNDLE_URL, body);
+/**
+ * 📌 묶음설정 저장
+ * - 항상 전체 replace
+ * - body 예:
+ *   {
+ *     bundle_sku: "BUNDLE-001",
+ *     items: [
+ *       { component_sku: "SKU-001", component_qty: 2 },
+ *       { component_sku: "SKU-002", component_qty: 1 }
+ *     ]
+ *   }
+ */
+async function updateBundleMapping(
+  payload: BundleMappingPayload,
+): Promise<ApiResult<BundleMappingResult>> {
+  return apiHub.post<BundleMappingResult>(PRODUCTS_BUNDLE_URL, payload);
 }
 
 async function bulkUploadFromText(
@@ -161,9 +176,9 @@ export const productsAdapter = {
   fetchList,
   createOne,
   deleteItems,
-  updateBundleMany,
   updateOne,
   bulkUploadFromText,
+  updateBundleMapping,
 } as const;
 
 export type ProductsAdapter = typeof productsAdapter;

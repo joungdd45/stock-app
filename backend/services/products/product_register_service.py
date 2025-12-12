@@ -131,6 +131,7 @@ class ProductRegisterService:
                     "weight": weight,
                     "barcode": r.barcode,
                     "is_bundle_related": True if bundle_exists else False,
+                    "is_active": r.is_active,
                 }
             )
 
@@ -294,7 +295,7 @@ class ProductRegisterService:
         """
         상품 단건 수정
         - sku 고정
-        - name / weight / barcode / last_inbound_price 수정
+        - name / weight / barcode / last_inbound_price / is_active 수정
         - base_sku / pack_qty / is_bundle 는 현재 단계에서
           별도 화면 없이 내부 정책으로만 유지 (여기서 변경하지 않음)
         """
@@ -343,6 +344,10 @@ class ProductRegisterService:
                 )
             product.last_inbound_unit_price = value
 
+        # 사용 여부(is_active) 수정
+        if "is_active" in payload:
+            product.is_active = bool(payload["is_active"])
+
         # base_sku / pack_qty / is_bundle 는 여기서 수정하지 않는다.
         product.updated_by = self.user.get("username")
 
@@ -354,56 +359,28 @@ class ProductRegisterService:
         }
 
     # ======================================================
-    # 4) 선택 삭제 (이력 없으면 물리삭제)
+    # 4) 선택 삭제 (상품 삭제 기능 봉인)
     # ======================================================
+
     def delete(self, *, skus: List[str]) -> Dict[str, Any]:
         """
-        선택 삭제
-        - 재고 이력이 있으면 삭제 불가
-        - 없으면 Product 물리삭제
+        선택 삭제 (비활성)
+        - 정책상 상품 삭제는 지원되지 않습니다.
+        - 잘못 등록된 상품은 이름/메모로 구분해서 사용 중지 처리하세요.
         """
-        if not skus:
-            raise DomainError(
-                "PRODUCT-VALID-004",
-                detail="skus가 비어있습니다.",
-                ctx={"page_id": PAGE_ID},
-            )
-
-        deleted: List[str] = []
-
-        for sku in skus:
-            sku = (sku or "").strip()
-            if not sku:
-                continue
-
-            # 재고 이력 존재 여부 확인
-            used = self.session.execute(
-                select(self.Ledger).where(self.Ledger.sku == sku)
-            ).first()
-
-            if used:
-                raise DomainError(
-                    "PRODUCT-USED-001",
-                    detail="재고 이력이 있는 SKU는 삭제할 수 없습니다.",
-                    ctx={"sku": sku},
-                )
-
-            self.session.execute(
-                delete(self.Product).where(self.Product.sku == sku)
-            )
-
-            deleted.append(sku)
-
-        self.session.commit()
-
-        return {
-            "ok": True,
-            "deleted": deleted,
-        }
+        raise DomainError(
+            "PRODUCT-DELETE-001",
+            detail="상품 삭제는 지원되지 않습니다. 잘못 등록된 상품은 이름/메모로 구분해서 사용 중지해주세요.",
+            ctx={
+                "page_id": PAGE_ID,
+                "skus": skus,
+            },
+        )
 
     # ======================================================
     # 5) 묶음 매핑 단건 업데이트
     #    - bundle_sku 기준 기존 매핑 논리삭제 → 신규 매핑 전체 재삽입
+    #    - Product.base_sku / pack_qty / is_bundle 갱신
     # ======================================================
     def update_bundle_mapping(self, *, payload: Dict[str, Any]) -> Dict[str, Any]:
         bundle_sku = (payload.get("bundle_sku") or "").strip()
@@ -443,8 +420,24 @@ class ProductRegisterService:
                 ctx={"bundle_sku": bundle_sku},
             )
 
-        # qty 검증 및 정제
+        # 🔹 우리 규칙: 단일상품 × N개만 허용
+        #    → component_sku는 1종류만 있어야 함
+        unique_components: Set[str] = set(component_skus)
+        if len(unique_components) != 1:
+            raise DomainError(
+                "PRODUCT-BUNDLE-MULTI",
+                detail="묶음 구성품은 하나의 상품만 사용할 수 있습니다.",
+                ctx={
+                    "bundle_sku": bundle_sku,
+                    "component_skus": sorted(unique_components),
+                },
+            )
+
+        base_sku = list(unique_components)[0]
+
+        # qty 검증 및 정제 + 총 pack_qty 계산
         cleaned_items: List[Dict[str, Any]] = []
+        total_pack_qty = 0
         for raw in items:
             comp_sku = (raw.get("component_sku") or "").strip()
             qty = raw.get("component_qty")
@@ -466,6 +459,7 @@ class ProductRegisterService:
                     "component_qty": qty_val,
                 }
             )
+            total_pack_qty += qty_val
 
         # SKU 존재 여부 체크 (bundle_sku + component_skus)
         all_skus: Set[str] = {bundle_sku, *component_skus}
@@ -488,6 +482,37 @@ class ProductRegisterService:
 
         now = datetime.utcnow()
         username = self.user.get("username")
+
+        # 🔹 Product 정보 업데이트 (묶음 → 단품 환산 기준 세팅)
+        # bundle_sku 상품 / base_sku(단품) 상품 둘 다 로드
+        product_map: Dict[str, Any] = {
+            p.sku: p
+            for p in existing_products
+        }
+
+        bundle_product = product_map.get(bundle_sku)
+        base_product = product_map.get(base_sku)
+
+        if bundle_product is None or base_product is None:
+            raise DomainError(
+                "PRODUCT-NOTFOUND",
+                detail="묶음 또는 기준 상품 정보를 찾을 수 없습니다.",
+                ctx={"bundle_sku": bundle_sku, "base_sku": base_sku},
+            )
+
+        # bundle_sku: 묶음 상품으로 표시
+        bundle_product.base_sku = base_sku
+        bundle_product.pack_qty = total_pack_qty
+        bundle_product.is_bundle = True
+        bundle_product.updated_at = now
+        bundle_product.updated_by = username
+
+        # base_sku: 단품 기준 유지
+        base_product.base_sku = base_sku
+        base_product.pack_qty = 1
+        base_product.is_bundle = False
+        base_product.updated_at = now
+        base_product.updated_by = username
 
         # 기존 매핑 논리삭제
         self.session.execute(
@@ -521,6 +546,8 @@ class ProductRegisterService:
         return {
             "ok": True,
             "bundle_sku": bundle_sku,
+            "base_sku": base_sku,
+            "pack_qty": total_pack_qty,
             "mapping_count": len(cleaned_items),
         }
 

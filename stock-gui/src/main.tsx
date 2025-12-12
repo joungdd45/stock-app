@@ -1,10 +1,8 @@
 // 📄 src/main.tsx
-// 역할: 전역 렌더 단계 에러 바운더리 + 브라우저 라우터 + App 마운트
-// 참고: App.tsx에는 BrowserRouter를 넣지 말고, Routes만 사용
-
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
+import { Toaster } from "react-hot-toast";
 import App from "./App";
 import "./index.css";
 
@@ -25,7 +23,6 @@ class RootErrorBoundary extends React.Component<
   }
 
   componentDidCatch(error: any, info: any) {
-    // 콘솔에도 남겨두기
     console.error("[RootErrorBoundary]", error, info);
   }
 
@@ -36,13 +33,7 @@ class RootErrorBoundary extends React.Component<
       const stack = this.state.error?.stack || "";
 
       return (
-        <div
-          style={{
-            padding: 16,
-            fontFamily: "system-ui, sans-serif",
-            background: "#f9f9f9",
-          }}
-        >
+        <div style={{ padding: 16, fontFamily: "system-ui, sans-serif", background: "#f9f9f9" }}>
           <h1 style={{ color: "#c00", fontSize: 18, marginBottom: 8 }}>
             😵 전역 렌더 오류
           </h1>
@@ -78,6 +69,12 @@ class RootErrorBoundary extends React.Component<
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <RootErrorBoundary>
+      {/* ✅ 전역 토스트는 main에만 1개 */}
+      <Toaster
+        position="top-center"
+        toastOptions={{ duration: 3000 }}
+      />
+
       <BrowserRouter>
         <App />
       </BrowserRouter>

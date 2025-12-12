@@ -47,7 +47,7 @@ export interface SettingsBasicUserCreateDto {
   name: string;
   role: SettingsUserRole;
   /** 초기 비밀번호 (관리자가 직접 설정) */
-  password?: string;
+  password: string;
 }
 
 export type SettingsBasicUserCreateResponse = SettingsBasicUserItem;

@@ -229,6 +229,13 @@ function isAuthTokenMissingError(body: BackendErrorEnvelope["error"]): boolean {
 // ─────────────────────────────────────────────
 // AxiosError → ApiFailure
 // ─────────────────────────────────────────────
+//
+// ✅ 목표
+// 1) 백엔드가 내려준 { ok:false, error:{ code, message, detail, hint... } } 가 있으면 "무조건 우선" 사용
+// 2) status===401 이더라도, 위 봉투(envelope)가 있으면 그 코드를 존중 (AUTH-DENY-002 같은 로그인 실패가 뭉개지지 않게)
+// 3) forceLogout은 "토큰 누락/만료" 같은 경우에만 수행 (로그인 실패까지 강제 로그아웃 금지)
+// 4) AUTH-*라도 전부 silent 처리하지 말고, 최소한 로그인 실패(AUTH-DENY-002)는 사용자 토스트로 보여줄 수 있게 남김
+//
 
 function normalizeAxiosError(error: AxiosError): ApiFailure {
   // 네트워크 레벨에서 응답 자체가 없는 경우
@@ -254,16 +261,8 @@ function normalizeAxiosError(error: AxiosError): ApiFailure {
   const data = res.data;
   const status = res.status;
 
-  // 401 같은 명확한 인증 실패는 바로 로그아웃 + 토스트 없이 처리
-  if (status === 401) {
-    forceLogout();
-    return {
-      ok: false,
-      data: null,
-      error: makeSilentAuthError("AUTH-DENY-001", data, data?.trace_id),
-    };
-  }
-
+  // ✅ 1) 백엔드 에러 봉투(ok:false + error)가 있으면 "무조건 우선" 처리
+  //    (401이든 뭐든, 여기서 code/message를 확정한다)
   if (data && typeof data === "object" && data.ok === false && data.error) {
     const backendError = data.error as BackendErrorEnvelope["error"];
     const backendCode =
@@ -271,7 +270,7 @@ function normalizeAxiosError(error: AxiosError): ApiFailure {
         ? backendError.code.trim().toUpperCase()
         : "SYSTEM-UNKNOWN-999";
 
-    // 백엔드 에러 내용이 "인증 토큰" 누락 관련일 때: 강제 로그아웃 + 조용히 처리
+    // ✅ 토큰 누락/만료 등 "인증 토큰 문제"일 때만 강제 로그아웃 + silent
     if (isAuthTokenMissingError(backendError)) {
       forceLogout();
       return {
@@ -280,13 +279,16 @@ function normalizeAxiosError(error: AxiosError): ApiFailure {
         error: makeSilentAuthError(
           "AUTH-DENY-001",
           backendError.detail ?? backendError,
-          backendError.trace_id ?? data.trace_id
+          backendError.trace_id ?? (data as any).trace_id
         ),
       };
     }
 
-    // 기타 AUTH-xxx 도메인 에러도 강제 로그아웃 + 조용히 처리
-    if (backendCode.startsWith("AUTH-")) {
+    // ✅ AUTH-* 중에서도 "정말 silent + logout"이 필요한 것만 제한적으로 처리
+    //    - AUTH-DENY-001: 로그인 필요/토큰 문제 계열 (백엔드가 이렇게 내려주면 silent로 처리)
+    //    - AUTH-DENY-003: 권한 없음(페이지 가드에서 처리하고 싶으면 silent 가능)
+    //    - AUTH-DENY-002: 로그인 실패(아이디/비번) → 사용자에게 토스트로 보여주는 케이스(로그아웃 금지)
+    if (backendCode === "AUTH-DENY-001") {
       forceLogout();
       return {
         ok: false,
@@ -294,12 +296,26 @@ function normalizeAxiosError(error: AxiosError): ApiFailure {
         error: makeSilentAuthError(
           backendCode,
           backendError.detail ?? backendError,
-          backendError.trace_id ?? data.trace_id
+          backendError.trace_id ?? (data as any).trace_id
         ),
       };
     }
 
-    // 나머지 도메인 에러는 code 기준으로 front_error_codes의 패턴 매핑 사용
+    if (backendCode === "AUTH-DENY-003") {
+      // 권한 없음은 토큰을 날릴 이유는 없으므로 logout은 하지 않음
+      // 필요하면 silent 처리만 유지
+      return {
+        ok: false,
+        data: null,
+        error: makeSilentAuthError(
+          backendCode,
+          backendError.detail ?? backendError,
+          backendError.trace_id ?? (data as any).trace_id
+        ),
+      };
+    }
+
+    // ✅ 나머지(INCLUDING AUTH-DENY-002 포함)는 "code 기준 메시지 매핑"으로 정상 노출
     const code = backendCode || "SYSTEM-UNKNOWN-999";
 
     return {
@@ -315,9 +331,19 @@ function normalizeAxiosError(error: AxiosError): ApiFailure {
           getFrontErrorMessage("FRONT-UNEXPECTED-001"),
         detail: backendError.detail,
         hint: backendError.hint,
-        traceId: backendError.trace_id ?? data.trace_id ?? null,
+        traceId: backendError.trace_id ?? (data as any).trace_id ?? null,
         raw: data,
       },
+    };
+  }
+
+  // ✅ 2) 봉투가 없는 상태에서의 401 처리 (정상적인 백엔드는 보통 봉투를 주지만, 예외 대비)
+  //    여기서는 "무조건 logout" 하지 말고, silent 에러만 만든다.
+  if (status === 401) {
+    return {
+      ok: false,
+      data: null,
+      error: makeSilentAuthError("AUTH-DENY-001", data, (data as any)?.trace_id),
     };
   }
 

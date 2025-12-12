@@ -4,10 +4,11 @@
  * 역할:
  *  - 라우터 구성 전담
  *  - AuthProvider + RequireAuth 연결
- *  - 각 페이지 파일을 라우트에만 매핑
+ *  - ✅ 전역 토스트 무대(항상 렌더)
+ *  - ✅ apiHub(handleError)가 사용할 토스트 함수 주입(setGlobalToast)
  */
 
-import React from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 
 import { AuthProvider } from "./auth/useAuth";
@@ -18,7 +19,7 @@ import MainPage from "./pages/main/MainPage";
 
 import InboundListPage from "./pages/inbound/InboundListPage";
 import InboundBarcodeScanPage from "./pages/inbound/InboundBarcodeScanPage";
-import InboundBarcodeRegisterPage from "./pages/inbound/InboundBarcodeRegisterPage"; // ✅ 바코드 등록 페이지
+import InboundBarcodeRegisterPage from "./pages/inbound/InboundBarcodeRegisterPage";
 
 import OutboundInvoiceScanPage from "./pages/outbound/OutboundInvoiceScanPage";
 import OutboundListPage from "./pages/outbound/OutboundListPage";
@@ -26,6 +27,43 @@ import OutboundScanPage from "./pages/outbound/OutboundScanPage";
 
 import StockStatusPage from "./pages/stock/StockStatusPage";
 import StockBarcodeScanPage from "./pages/stock/StockBarcodeScanPage";
+
+// ✅ apiHub 전역 토스트 주입
+import { setGlobalToast } from "@/api/hub/apiHub";
+
+// ─────────────────────────────────────────────
+// ✅ 전역 토스트 UI (App에 고정 렌더)
+// ─────────────────────────────────────────────
+
+type ToastItem = {
+  id: string;
+  message: string;
+};
+
+function makeId() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function GlobalToastHost({ items }: { items: ToastItem[] }) {
+  return (
+    <div className="fixed left-0 right-0 bottom-4 z-[9999] px-4 flex flex-col gap-2 items-center pointer-events-none">
+      {items.map((t) => (
+        <div
+          key={t.id}
+          className="w-full max-w-sm rounded-xl shadow-md border px-4 py-3 text-sm"
+          style={{
+            backgroundColor: "#111827",
+            color: "#FFFFFF",
+            borderColor: "#334155",
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          {t.message}
+        </div>
+      ))}
+    </div>
+  );
+}
 
 const RouterView: React.FC = () => {
   return (
@@ -131,10 +169,30 @@ const RouterView: React.FC = () => {
 };
 
 export default function App() {
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+
+  const showToast = useCallback((message: string) => {
+    const id = makeId();
+    setToasts((prev) => [...prev, { id, message }]);
+
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 2400);
+  }, []);
+
+  // ✅ 앱 시작 시 1회: apiHub에 전역 토스트 함수 주입
+  useEffect(() => {
+    setGlobalToast(showToast);
+    return () => setGlobalToast(null);
+  }, [showToast]);
+
   return (
     <AuthProvider>
       <BrowserRouter>
         <RouterView />
+
+        {/* ✅ 토스트는 라우트 밖에서 항상 렌더 */}
+        <GlobalToastHost items={toasts} />
       </BrowserRouter>
     </AuthProvider>
   );

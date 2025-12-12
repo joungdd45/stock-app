@@ -16,7 +16,7 @@
      };
 */
 
-import { apiHub, type ApiResult } from "../hub/apiHub";
+import { apiHub, type ApiResult } from "@/api/hub/apiHub";
 
 // ─────────────────────────────────────────────────────────
 // 엔드포인트 상수

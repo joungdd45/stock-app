@@ -112,7 +112,7 @@ class ProductUpdateDTO(BaseModel):
     """
     상품 수정용 DTO
     - sku는 path로 고정
-    - name / last_inbound_price / weight / barcode 는 선택 수정
+    - name / last_inbound_price / weight / barcode / is_active 는 선택 수정
     - base_sku / pack_qty / is_bundle 은 v1-6에서는 별도 화면 없이
       서비스 내부 정책으로만 제어
     """
@@ -120,6 +120,7 @@ class ProductUpdateDTO(BaseModel):
     last_inbound_price: Optional[float] = None
     weight: Optional[float] = None
     barcode: Optional[str] = None
+    is_active: Optional[bool] = None
 
 
 class DeleteRequest(BaseModel):

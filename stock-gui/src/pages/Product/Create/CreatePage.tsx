@@ -30,6 +30,12 @@ type RowItem = {
   bundleQty: number | "";
 };
 
+type BundleRow = {
+  id: string;
+  componentSku: string;
+  componentQty: string;
+};
+
 const uuid = () => Math.random().toString(36).slice(2, 10);
 
 const stripComma = (s: string) => s.replace(/[, ]+/g, "");
@@ -60,6 +66,12 @@ const makeEmptyRow = (): RowItem => ({
   bundleQty: 1,
 });
 
+const makeEmptyBundleRow = (): BundleRow => ({
+  id: uuid(),
+  componentSku: "",
+  componentQty: "1",
+});
+
 // 어댑터 → 화면 Row
 const mapFromAdapter = (p: ProductListItem): RowItem => ({
   id: String(p.id ?? p.sku),
@@ -68,7 +80,7 @@ const mapFromAdapter = (p: ProductListItem): RowItem => ({
   unitPrice: p.unit_price ?? 0,
   weight: p.weight_g ?? 0,
   barcode: p.barcode ?? "",
-  status: p.status,
+  status: p.status ?? p.is_active ?? true,  // ← 핵심
   bundleQty: p.bundle_qty ?? 1,
 });
 
@@ -88,14 +100,17 @@ const makeUpdatePayloadFromEdit = (
   name: string,
   weight: string,
   barcode: string,
+  isActive: boolean,   // ← 여기 추가
 ): ProductUpdatePayload => {
   const weightNorm = weight.trim();
   const parsedWeight =
     weightNorm === "" ? undefined : Math.max(0, toInt(weightNorm));
+
   return {
     name: name.trim(),
     barcode: barcode.trim(),
     weight_g: parsedWeight,
+    is_active: isActive,   // ← 여기에 추가
   };
 };
 
@@ -123,6 +138,14 @@ export default function CreatePage() {
   const [editName, setEditName] = useState("");
   const [editWeight, setEditWeight] = useState("");
   const [editBarcode, setEditBarcode] = useState("");
+  const [editIsActive, setEditIsActive] = useState(true);
+
+  // 묶음설정 모달
+  const [bundleModalOpen, setBundleModalOpen] = useState(false);
+  const [bundleTargetSku, setBundleTargetSku] = useState("");
+  const [bundleRows, setBundleRows] = useState<BundleRow[]>([
+    makeEmptyBundleRow(),
+  ]);  
 
   useEffect(() => {
     pasteTargetRef.current?.focus();
@@ -236,49 +259,105 @@ export default function CreatePage() {
     });
   };
 
-  // 선택 삭제
-  const deleteSelected = async () => {
+  // 묶음설정 모달 열기 (선택된 1건 기준)
+  const onBulkBundle = () => {
     if (!isAdmin) return;
-    if (checked.size === 0) return;
 
-    if (!confirm(`선택된 ${checked.size}건을 삭제할까요?`)) return;
-
-    const ids = Array.from(checked);
-    const res = await productsAdapter.deleteItems(ids);
-    if (!res.ok) {
-      console.error("상품 선택 삭제 실패", res.error);
-      if (res.error) {
-        handleError(res.error);
-      }
+    if (checked.size === 0) {
+      alert("묶음으로 설정할 상품을 한 건 선택해 주세요.");
       return;
     }
 
-    await loadList();
+    if (checked.size > 1) {
+      alert("묶음설정은 한 번에 한 상품만 설정할 수 있어요.");
+      return;
+    }
+
+    const targetId = Array.from(checked)[0];
+    const target = rows.find((r) => r.id === targetId);
+    if (!target) {
+      alert("선택한 상품을 찾을 수 없어요.");
+      return;
+    }
+
+    setBundleTargetSku(target.sku);
+    setBundleRows([makeEmptyBundleRow()]);
+    setBundleModalOpen(true);
   };
 
-  // 묶음 수량 일괄 설정
-  const onBulkBundle = async () => {
-    if (!isAdmin) return;
-    if (checked.size === 0) return;
-
-    const v = window.prompt(
-      "선택한 행의 묶음 수량을 입력하세요(1은 단품):",
-      "2",
+  // 묶음설정 행 편집
+  const onChangeBundleCell = (
+    id: string,
+    field: "componentSku" | "componentQty",
+    value: string,
+  ) => {
+    setBundleRows((prev) =>
+      prev.map((row) =>
+        row.id === id ? { ...row, [field]: value } : row,
+      ),
     );
-    if (v === null) return;
+  };
 
-    const qty = Math.max(1, toInt(v));
-    const ids = Array.from(checked);
+  const onAddBundleRow = () => {
+    setBundleRows((prev) => [...prev, makeEmptyBundleRow()]);
+  };
 
-    const res = await productsAdapter.updateBundleMany(ids, qty);
+  const onRemoveBundleRow = (id: string) => {
+    setBundleRows((prev) => {
+      if (prev.length === 1) {
+        // 마지막 한 줄은 내용만 비우기
+        return [makeEmptyBundleRow()];
+      }
+      return prev.filter((row) => row.id !== id);
+    });
+  };
+
+  const onCloseBundleModal = () => {
+    setBundleModalOpen(false);
+    setBundleTargetSku("");
+    setBundleRows([makeEmptyBundleRow()]);
+  };
+
+  const onSaveBundleModal = async () => {
+    if (!bundleTargetSku) {
+      alert("묶음 SKU가 비어 있어요.");
+      return;
+    }
+
+    const items = bundleRows
+      .map((row) => {
+        const sku = row.componentSku.trim();
+        const qty = toInt(row.componentQty);
+        return {
+          component_sku: sku,
+          component_qty: qty,
+        };
+      })
+      .filter((item) => item.component_sku && item.component_qty > 0);
+
+    if (items.length === 0) {
+      alert("구성품 SKU와 수량을 1개 이상 입력해 주세요.");
+      return;
+    }
+
+    const res = await productsAdapter.updateBundleMapping({
+      bundle_sku: bundleTargetSku,
+      items,
+    });
+
     if (!res.ok) {
-      console.error("묶음 수량 변경 실패", res.error);
+      console.error("묶음설정 저장 실패", res.error);
       if (res.error) {
         handleError(res.error);
       }
       return;
     }
 
+    if (res.data?.ok) {
+      alert("묶음 구성이 저장됐어요.\n(기존 구성은 새 구성으로 교체됩니다.)");
+    }
+
+    onCloseBundleModal();
     await loadList();
   };
 
@@ -305,6 +384,10 @@ export default function CreatePage() {
         : String(target.weight),
     );
     setEditBarcode(target.barcode);
+
+    // ✅ 활성/비활성 상태도 같이 세팅
+    setEditIsActive(target.status); // ProductListItem.status 기준
+
     setEditModalOpen(true);
   };
 
@@ -329,6 +412,7 @@ export default function CreatePage() {
       editName,
       editWeight,
       editBarcode,
+      editIsActive, // ✅ 여기로 전달
     );
 
     const res = await productsAdapter.updateOne(editSku, payload);
@@ -346,6 +430,7 @@ export default function CreatePage() {
   };
 
   // 엑셀 업로드
+
   const onClickBulkUpload = () => {
     if (!isAdmin) return;
     fileInputRef.current?.click();
@@ -547,13 +632,13 @@ export default function CreatePage() {
 
         {/* 버튼 그룹 */}
         <div className="flex flex-wrap items-center justify-end gap-2 px-4 py-3">
-          <button
+        <button
             className={`rounded-xl px-4 py-2 text-sm ${
-              !anyChecked || !isAdmin
+              checked.size !== 1 || !isAdmin
                 ? "bg-gray-200 text-gray-500 cursor-not-allowed"
                 : "bg-gray-900 text-white"
             }`}
-            disabled={!anyChecked || !isAdmin}
+            disabled={checked.size !== 1 || !isAdmin}
             onClick={onBulkBundle}
           >
             묶음설정
@@ -568,17 +653,6 @@ export default function CreatePage() {
             onClick={onOpenEditModal}
           >
             선택 수정
-          </button>
-          <button
-            className={`rounded-xl px-4 py-2 text-sm ${
-              !anyChecked || !isAdmin
-                ? "bg-gray-200 text-gray-500 cursor-not-allowed"
-                : "bg-red-500 text-white"
-            }`}
-            disabled={!anyChecked || !isAdmin}
-            onClick={deleteSelected}
-          >
-            선택 삭제
           </button>
           <button
             className="rounded-xl border px-4 py-2 text-sm hover:bg-gray-50"
@@ -655,8 +729,8 @@ export default function CreatePage() {
                     <span
                       className={
                         r.status
-                          ? "inline-flex rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700"
-                          : "inline-flex rounded-full bg-gray-100 px-2 py-0.5 text-[11px] text-gray-600"
+                          ? "inline-flex rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] text-emerald-700"
+                          : "inline-flex rounded-full bg-red-100 px-2 py-0.5 text-[11px] text-gray-600"
                       }
                     >
                       {r.status ? "사용" : "미사용"}
@@ -695,6 +769,210 @@ export default function CreatePage() {
           </div>
         </div>
       </div>
+      
+      {/* 선택 수정 모달 */}
+      {editModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="w-full max-w-md rounded-2xl bg-white p-4 shadow-lg">
+            <h2 className="mb-3 text-base font-semibold">상품 선택 수정</h2>
+
+            <div className="space-y-3 text-sm">
+              <div>
+                <div className="mb-1 text-gray-600">SKU</div>
+                <div className="rounded-lg border bg-gray-50 px-2 py-1 font-mono">
+                  {editSku}
+                </div>
+              </div>
+
+              <div>
+                <div className="mb-1 text-gray-600">상품명</div>
+                <input
+                  type="text"
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  className="w-full rounded-lg border px-2 py-1 text-sm"
+                />
+              </div>
+
+              <div>
+                <div className="mb-1 text-gray-600">중량(g)</div>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={editWeight}
+                  onChange={(e) => setEditWeight(e.target.value)}
+                  className="w-full rounded-lg border px-2 py-1 text-sm text-right"
+                />
+              </div>
+
+              <div>
+                <div className="mb-1 text-gray-600">바코드</div>
+                <input
+                  type="text"
+                  value={editBarcode}
+                  onChange={(e) => setEditBarcode(e.target.value)}
+                  className="w-full rounded-lg border px-2 py-1 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="inline-flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={editIsActive}
+                    onChange={(e) => setEditIsActive(e.target.checked)}
+                  />
+                  <span>{editIsActive ? "사용" : "미사용"}</span>
+                </label>
+              </div>
+            </div>
+
+            <div className="mt-4 flex justify-end gap-2 text-sm">
+              <button
+                type="button"
+                onClick={onCloseEditModal}
+                className="rounded-lg border px-3 py-1.5"
+                disabled={isSubmitting}
+              >
+                닫기
+              </button>
+              <button
+                type="button"
+                onClick={onSaveEditModal}
+                className="rounded-lg px-3 py-1.5 bg-black text-white"
+                disabled={isSubmitting}
+              >
+                저장
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 묶음설정 모달 */}
+      {bundleModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="w-full max-w-2xl rounded-2xl bg-white p-4 shadow-lg">
+            <h2 className="mb-3 text-base font-semibold">묶음 구성품 설정</h2>
+
+            <div className="mb-3 text-sm">
+              <div className="mb-1 text-gray-600">묶음 SKU</div>
+              <div className="rounded-lg border bg-gray-50 px-2 py-1 font-mono">
+                {bundleTargetSku}
+              </div>
+            </div>
+
+            <div className="mb-2 text-sm text-gray-600">
+              구성품 SKU와 수량을 입력하세요. 저장 시 기존 구성은 모두 교체돼요.
+            </div>
+
+            <div className="max-h-64 overflow-auto rounded-xl border mb-3">
+              <table className="w-full table-fixed text-sm">
+                <colgroup>
+                  <col style={{ width: "55%" }} />
+                  <col style={{ width: "25%" }} />
+                  <col style={{ width: "20%" }} />
+                </colgroup>
+                <thead className="bg-gray-50">
+                  <tr className="border-b border-gray-200 text-center text-[13px] text-gray-700">
+                    <th className="px-2 py-2">구성품 SKU</th>
+                    <th className="px-2 py-2">수량</th>
+                    <th className="px-2 py-2">삭제</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {bundleRows.map((row, idx) => (
+                    <tr
+                      key={row.id}
+                      className={`border-b border-gray-100 ${
+                        idx % 2 === 0 ? "bg-white" : "bg-gray-50"
+                      }`}
+                    >
+                      <td className="px-2 py-1">
+                        <input
+                          type="text"
+                          value={row.componentSku}
+                          onChange={(e) =>
+                            onChangeBundleCell(
+                              row.id,
+                              "componentSku",
+                              e.target.value,
+                            )
+                          }
+                          className="w-full rounded-lg border px-2 py-1 text-sm font-mono"
+                          placeholder="구성품 SKU"
+                        />
+                      </td>
+                      <td className="px-2 py-1">
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          value={row.componentQty}
+                          onChange={(e) =>
+                            onChangeBundleCell(
+                              row.id,
+                              "componentQty",
+                              e.target.value.replace(/[^\d]/g, ""),
+                            )
+                          }
+                          className="w-full rounded-lg border px-2 py-1 text-sm text-right"
+                          placeholder="1"
+                        />
+                      </td>
+                      <td className="px-2 py-1 text-center">
+                        <button
+                          type="button"
+                          onClick={() => onRemoveBundleRow(row.id)}
+                          className="rounded-lg border px-2 py-1 text-xs text-gray-700 hover:bg-gray-100"
+                        >
+                          삭제
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+
+                  {bundleRows.length === 0 && (
+                    <tr>
+                      <td
+                        colSpan={3}
+                        className="px-4 py-6 text-center text-sm text-gray-500"
+                      >
+                        구성품 행이 없습니다. 아래 버튼으로 행을 추가해 주세요.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="mt-3 flex items-center justify-between text-sm">
+              <button
+                type="button"
+                onClick={onAddBundleRow}
+                className="rounded-lg border px-3 py-1.5 hover:bg-gray-50"
+              >
+                행 추가
+              </button>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={onCloseBundleModal}
+                  className="rounded-lg border px-3 py-1.5"
+                >
+                  닫기
+                </button>
+                <button
+                  type="button"
+                  onClick={onSaveBundleModal}
+                  className="rounded-lg bg-black px-3 py-1.5 text-white"
+                >
+                  저장
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 숨김 포커스 영역 */}
       <div ref={pasteTargetRef} className="sr-only" tabIndex={-1} />
