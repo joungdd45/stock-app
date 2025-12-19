@@ -28,7 +28,6 @@ export function useHeader() {
 function findLabelsByPath(pathname: string): { parent?: string; current?: string } {
   function dfs(items: typeof NAV_ITEMS, parentLabel?: string): { parent?: string; current?: string } | null {
     for (const it of items) {
-      // 정확히 일치하거나, 하위 경로가 포함되는 경우도 허용
       if (it.path && (pathname === it.path || pathname.startsWith(it.path + "/"))) {
         return parentLabel ? { parent: parentLabel, current: it.label } : { current: it.label };
       }
@@ -57,27 +56,24 @@ export default function InventoryShell() {
 
   return (
     <HeaderAddonContext.Provider value={ctxValue}>
-      {/* [NOAH PATCH] 레이아웃 안정화: 사이드바 고정폭, 본문 가로 넘침 차단, 내부 스크롤 고정 */}
-      <div className="min-h-screen w-full flex bg-slate-50 overflow-hidden">
-        {/* 좌측 사이드바: 고정폭 + shrink-0로 폭 유지 */}
-        <aside className="w-[248px] shrink-0">
+      {/* ✅ 화면(Viewport)에 고정: 바깥(body/html)은 스크롤 없음. 모든 렌더링은 이 안에서만 */}
+      <div className="fixed inset-0 flex bg-slate-50 overflow-hidden">
+        {/* ✅ 사이드바를 항상 “위 레이어”로: 우측 내용이 라인 위로 침범 못함 */}
+        <aside className="relative z-20 w-[248px] shrink-0 overflow-hidden bg-slate-900">
           <Sidebar />
         </aside>
 
-        {/* 우측 영역: 가로 넘침 차단을 위해 min-w-0 + overflow-x-hidden */}
-        <div className="flex-1 flex flex-col min-w-0 overflow-x-hidden">
-          {/* 헤더: 타이틀 (고정 영역) */}
-          <header className="border-b border-gray-200 bg-white px-4 py-6">
+        {/* ✅ 우측 영역은 경계선 + 클리핑: 내용은 이 박스 안에서만 렌더링 */}
+        <div className="relative z-10 flex-1 min-w-0 flex flex-col overflow-hidden border-l border-gray-200 bg-slate-50">
+          {/* 헤더: 우측 영역 안에서만 존재 */}
+          <header className="shrink-0 border-b border-gray-200 bg-white px-4 py-6">
             {title && <h1 className="text-lg font-semibold leading-7">{title}</h1>}
           </header>
 
-          {/* 메인: 내부 스크롤 컨테이너에서만 세로 스크롤 → 사이드바 흔들림 방지 */}
-          <main
-            className="flex-1 overflow-y-scroll"
-            style={{ scrollbarGutter: "stable both-edges" }}
-          >
-            <div className="p-4">
-              {/* 서브탭/추가영역을 좌측 상단에 고정 표시 */}
+          {/* ✅ 스크롤은 여기서만, 가로는 완전 차단 */}
+          <main className="flex-1 min-w-0 overflow-y-auto overflow-x-hidden">
+            {/* ✅ Outlet도 우측 박스 안에만: 혹시 모를 overflow 방지 */}
+            <div className="p-4 min-w-0 max-w-full overflow-hidden">
               {headerAddon && (
                 <div
                   className="

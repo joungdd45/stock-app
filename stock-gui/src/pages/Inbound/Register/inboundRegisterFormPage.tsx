@@ -1,12 +1,21 @@
 /* src/pages/inbound/register/inboundRegisterFormPage.tsx
    ✅ 입고등록 > 등록 탭 (API 저장 연동판 - 어댑터 사용)
-   - 붙여넣기 파서: 컨테이너 포커스 후 Ctrl+V
-   - 체크박스 선택삭제
-   - 검증 후 inboundAdapter.registerFormCreate 호출
-   - SKU 입력 시 상품관리 lookup-by-sku 엔드포인트로 상품명 자동 조회
-   - 저장중 버튼 비활성화, 성공 시 초기화
+   v2.3 (금액 표시/계산 정리: 총 단가 콤마 표시 + 개당 단가 원화 반올림)
+   - 템플릿 헤더(확정):
+     번호 | 주문일자 | SKU | 입고 | 총 단가 | 입고처
+   - 엑셀에는 개당단가 없음 → (입고 수량, 총 단가)로 페이지에서 자동 계산 + readonly 표시
+   - ✅ 개당 단가: 원화 기준, Math.round로 반올림(소수점 제거)
+   - ✅ 총 단가: 입력은 숫자만, 표시값은 천단위 콤마
+   - 상품명은 엑셀에 없어도 됨 → SKU로 상품명 자동조회하여 name 채움
+   - 엑셀 상단 타이틀/장식행이 있을 수 있으니 "헤더 행 자동 탐색" 적용
+   - 대량등록: label(for=file) 방식으로 파일 선택창 100% 보장
+   - 템플릿 다운로드: fetch → a.download + 파일명 자동 증가 (YYYYMMDD_1,2.)
+   - ✅ 버튼 정렬/순서: [다운로드] → [엑셀 업로드(대량등록)] → [행 추가] → [선택 삭제] → [초기화] → [입고 등록]
 */
-import React, { useEffect, useMemo, useRef, useState } from "react";
+
+import React, { useMemo, useState } from "react";
+import * as XLSX from "xlsx";
+
 import { inboundAdapter } from "@/api/adapters/inbound.adapter";
 import { handleError } from "@/utils/handleError";
 
@@ -33,16 +42,6 @@ const toNumber = (v: number | string | ""): number => {
 const fmt = (n: number | "") =>
   n === "" ? "" : new Intl.NumberFormat().format(n as number);
 
-const isHeaderLine = (cells: string[]) => {
-  if (cells.length === 0) return false;
-  const first = cells[0]?.trim();
-  return first === "주문일자" || first?.toLowerCase().includes("order");
-};
-const splitLine = (line: string): string[] => {
-  if (line.includes("\t")) return line.split("\t");
-  if (line.includes(",")) return line.split(",");
-  return line.trim().split(/\s+/);
-};
 const makeEmptyRow = (): RowItem => ({
   id: uuid(),
   orderDate: "",
@@ -53,6 +52,7 @@ const makeEmptyRow = (): RowItem => ({
   unitPrice: "",
   supplier: "",
 });
+
 const isEmptyRow = (r: RowItem) =>
   !r.orderDate &&
   !r.sku &&
@@ -62,11 +62,48 @@ const isEmptyRow = (r: RowItem) =>
   !r.unitPrice &&
   !r.supplier;
 
-/* ─────────────────────────────────────────
- * SKU → 상품명 자동조회 훅
- * - 상품관리 lookup-by-sku 엔드포인트 사용
+/* ─────────────────────────────────────────────
+ * 템플릿 다운로드 (파일명 자동 증가)
+ * ───────────────────────────────────────────── */
+
+const BULK_TEMPLATE_URL = "/templates/입고대량등록_양식.xlsx";
+const BULK_TEMPLATE_BASENAME = "입고대량등록_양식";
+
+const pad2 = (n: number) => String(n).padStart(2, "0");
+const ymd = () => {
+  const d = new Date();
+  return `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}`;
+};
+const nextSeqForToday = (baseKey: string) => {
+  const key = `${baseKey}_${ymd()}`;
+  const prev = Number(localStorage.getItem(key) || "0");
+  const next = prev + 1;
+  localStorage.setItem(key, String(next));
+  return String(next);
+};
+
+async function downloadXlsxWithAutoSeq(url: string, baseName: string) {
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error("양식 파일을 불러오지 못했어요.");
+
+  const blob = await res.blob();
+  const seq = nextSeqForToday("inbound_bulk_template_seq");
+  const filename = `${baseName}_${ymd()}_${seq}.xlsx`;
+
+  const a = document.createElement("a");
+  const objUrl = URL.createObjectURL(blob);
+  a.href = objUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objUrl);
+}
+
+/* ─────────────────────────────────────────────
+ * SKU → 상품명 자동조회
  * - 간단 캐시 + 중복 요청 방지
- * ───────────────────────────────────────── */
+ * ───────────────────────────────────────────── */
 
 const PRODUCT_NAME_CACHE: Record<string, string> = {};
 
@@ -74,38 +111,143 @@ function useProductName() {
   const inFlight = React.useRef<Record<string, Promise<string | null>>>({});
 
   const getName = async (sku: string): Promise<string | null> => {
-    const trimmed = sku.trim();
-    if (!trimmed) return null;
+    const key = sku.trim();
+    if (!key) return null;
 
-    // 캐시 우선
-    if (PRODUCT_NAME_CACHE[trimmed]) {
-      return PRODUCT_NAME_CACHE[trimmed];
-    }
+    if (PRODUCT_NAME_CACHE[key]) return PRODUCT_NAME_CACHE[key];
 
-    // 이미 진행중이면 그 프라미스 재사용
-    if (!inFlight.current[trimmed]) {
-      inFlight.current[trimmed] = (async () => {
+    if (!inFlight.current[key]) {
+      inFlight.current[key] = (async () => {
         try {
-          const res = await inboundAdapter.lookupProductBySku(trimmed);
+          const res = await inboundAdapter.lookupProductBySku(key);
           if (!res.ok || !res.data?.item) return null;
-          const name = res.data.item.name;
-          if (name) {
-            PRODUCT_NAME_CACHE[trimmed] = name;
-          }
-          return name ?? null;
+          const name = res.data.item.name ?? null;
+          if (name) PRODUCT_NAME_CACHE[key] = name;
+          return name;
         } catch (err) {
-          console.error("SKU 조회 실패", trimmed, err);
+          console.error("SKU 조회 실패", key, err);
           return null;
         } finally {
-          delete inFlight.current[trimmed];
+          delete inFlight.current[key];
         }
       })();
     }
 
-    return inFlight.current[trimmed];
+    return inFlight.current[key];
   };
 
   return { getName };
+}
+
+/* ─────────────────────────────────────────────
+ * 엑셀 파싱
+ * - 헤더 행 자동 탐색(상단 타이틀/장식행 무시)
+ * - 확정 헤더(한글):
+ *   번호 | 주문일자 | SKU | 입고 | 총 단가 | 입고처
+ * ───────────────────────────────────────────── */
+
+const norm = (v: any) =>
+  String(v ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/_/g, "");
+
+const headerKey = (h: string) => {
+  const x = norm(h);
+
+  // 한글 (확정)
+  if (x === "주문일자") return "order_date";
+  if (x === "sku") return "sku";
+  if (x === "입고") return "qty";
+  if (x === "총단가") return "total_price";
+  if (x === "입고처") return "supplier";
+
+  // 최소 보강(변형 대비)
+  if (x.includes("주문") && x.includes("일자")) return "order_date";
+  if (x.includes("sku")) return "sku";
+  if (x.includes("입고") && !x.includes("처")) return "qty";
+  if (x.includes("총") && x.includes("단가")) return "total_price";
+  if (x.includes("입고") && x.includes("처")) return "supplier";
+
+  return "";
+};
+
+type BulkItem = {
+  order_date: string;
+  sku: string;
+  qty: number;
+  total_price: number;
+  supplier: string;
+};
+
+async function parseXlsxFileToBulkItems(file: File): Promise<BulkItem[]> {
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type: "array" });
+  const wsName = wb.SheetNames[0];
+  if (!wsName) return [];
+
+  const ws = wb.Sheets[wsName];
+  const table: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true });
+  if (!table || table.length < 2) return [];
+
+  const requiredKeys = ["order_date", "sku", "qty", "total_price", "supplier"];
+
+  let headerRowIndex = -1;
+  let idx: Record<string, number> = {};
+
+  // 상단 30줄 안에서 헤더를 찾는다
+  for (let r = 0; r < Math.min(table.length, 30); r++) {
+    const row = table[r] || [];
+    const tempIdx: Record<string, number> = {};
+
+    row.forEach((cell, i) => {
+      const k = headerKey(String(cell ?? ""));
+      if (k) tempIdx[k] = i;
+    });
+
+    const missing = requiredKeys.filter((k) => tempIdx[k] === undefined);
+    if (missing.length === 0) {
+      headerRowIndex = r;
+      idx = tempIdx;
+      break;
+    }
+  }
+
+  if (headerRowIndex === -1) {
+    throw new Error(
+      "엑셀 헤더를 인식하지 못했어요. (번호/주문일자/SKU/입고/총 단가/입고처인지 확인해줘)",
+    );
+  }
+
+  const out: BulkItem[] = [];
+
+  for (let r = headerRowIndex + 1; r < table.length; r++) {
+    const row = table[r] || [];
+    const hasAny = row.some((v) => String(v ?? "").trim() !== "");
+    if (!hasAny) continue;
+
+    const get = (k: string) => row[idx[k]];
+
+    const order_date = String(get("order_date") ?? "").trim();
+    const sku = String(get("sku") ?? "").trim();
+    const supplier = String(get("supplier") ?? "").trim();
+
+    const qty = toNumber(String(get("qty") ?? ""));
+    const total_price = toNumber(String(get("total_price") ?? ""));
+
+    if (!order_date && !sku && !supplier && qty === 0 && total_price === 0) continue;
+
+    out.push({
+      order_date,
+      sku,
+      qty,
+      total_price,
+      supplier,
+    });
+  }
+
+  return out;
 }
 
 export default function RegisterFormPage() {
@@ -114,11 +256,6 @@ export default function RegisterFormPage() {
   const [rows, setRows] = useState<RowItem[]>([makeEmptyRow()]);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [isSubmitting, setIsSubmitting] = useState(false);
-
-  const pasteTargetRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    pasteTargetRef.current?.focus();
-  }, []);
 
   const addRow = () => setRows((prev) => [...prev, makeEmptyRow()]);
 
@@ -132,113 +269,74 @@ export default function RegisterFormPage() {
     setChecked(new Set());
   };
 
+  // ✅ 개당 단가: 원화 기준, 끝자리 반올림(소수점 제거)
+  const recalcUnit = (next: RowItem) => {
+    const q = toNumber(next.qty);
+    const t = toNumber(next.totalPrice);
+
+    if (q > 0 && t >= 0) {
+      const u = Math.round(t / q);
+      next.unitPrice = Number.isFinite(u) ? u : "";
+    } else {
+      next.unitPrice = "";
+    }
+    return next;
+  };
+
   const onCellChange = async (
     id: string,
-    field: keyof Pick<
-      RowItem,
-      "orderDate" | "sku" | "name" | "qty" | "totalPrice" | "supplier"
-    >,
+    field: keyof Pick<RowItem, "orderDate" | "sku" | "name" | "qty" | "totalPrice" | "supplier">,
     value: string,
   ) => {
-    // 기본 값 반영 + 단가 계산
     setRows((prev) =>
       prev.map((r) => {
         if (r.id !== id) return r;
-        const next: RowItem = { ...r, [field]: value };
-        const q = toNumber(next.qty);
-        const t = toNumber(next.totalPrice);
-        if (q > 0 && t >= 0) {
-          const u = Math.floor((t / q) * 100) / 100;
-          next.unitPrice = Number.isFinite(u) ? u : "";
-        } else {
-          next.unitPrice = "";
-        }
-        return next;
+        // 숫자 칸(qty/totalPrice)은 string으로 들어오니 캐스팅 허용
+        const next: RowItem = { ...r, [field]: value as any };
+        return recalcUnit(next);
       }),
     );
 
-    // SKU 입력 시 상품관리에서 상품명 자동 조회
     if (field === "sku" && value) {
       const name = await getName(value);
       if (name) {
         setRows((prev) =>
           prev.map((r) =>
-            r.id === id && (!r.name || r.name.trim() === "")
-              ? { ...r, name }
-              : r,
+            r.id === id && (!r.name || r.name.trim() === "") ? { ...r, name } : r,
           ),
         );
       }
     }
   };
 
-  // 붙여넣기: 완전 빈 상태면 대체, 아니면 이어붙이기
-  const handlePaste = async (e: React.ClipboardEvent) => {
-    const raw = e.clipboardData.getData("text/plain") ?? "";
+  const applyBulkItemsToRows = async (items: BulkItem[]) => {
+    if (!items || items.length === 0) return;
 
-    // 🔹 탭/콤마/줄바꿈이 없으면: 단일 값 붙여넣기 → 기본 동작만 수행, 파서 미실행
-    if (!raw.includes("\t") && !raw.includes(",") && !raw.includes("\n")) {
-      return;
-    }
+    const mapped: RowItem[] = items.map((it) => {
+      const qty = typeof it.qty === "number" ? it.qty : toNumber(String(it.qty));
+      const total =
+        typeof it.total_price === "number"
+          ? it.total_price
+          : toNumber(String(it.total_price));
 
-    // 🔹 엑셀/CSV처럼 구조화된 데이터면 기본 붙여넣기 막고 파서만 실행
-    e.preventDefault();
-
-    const text = raw;
-    const lines = text
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0);
-    if (lines.length === 0) return;
-
-    const firstCells = splitLine(lines[0]).map((c) => c.trim());
-    const startIdx = isHeaderLine(firstCells) ? 1 : 0;
-
-    const parsed: RowItem[] = [];
-    for (let i = startIdx; i < lines.length; i++) {
-      const cells = splitLine(lines[i]).map((c) => c.trim());
-      const [
-        orderDate = "",
-        sku = "",
-        name = "",
-        qtyStr = "",
-        totalPriceStr = "",
-        unitPriceStr = "",
-        supplier = "",
-      ] = cells;
-
-      if (
-        [orderDate, sku, name, qtyStr, totalPriceStr, unitPriceStr, supplier].every(
-          (v) => v === "",
-        )
-      )
-        continue;
-
-      const qtyNum = toNumber(qtyStr);
-      const totalNum = toNumber(totalPriceStr);
-      let unitNum = toNumber(unitPriceStr);
-      if (!unitNum && qtyNum > 0) {
-        unitNum = Math.floor((totalNum / qtyNum) * 100) / 100;
-      }
-
-      parsed.push({
+      const next: RowItem = {
         id: uuid(),
-        orderDate,
-        sku,
-        name,
-        qty: qtyNum || "",
-        totalPrice: totalNum || "",
-        unitPrice: unitNum || "",
-        supplier,
-      });
-    }
-    if (parsed.length === 0) return;
+        orderDate: it.order_date ?? "",
+        sku: it.sku ?? "",
+        name: "",
+        qty,
+        totalPrice: total,
+        unitPrice: "",
+        supplier: it.supplier ?? "",
+      };
 
-    // 붙여넣기한 SKU들에 대해서도 상품명 자동 조회 시도
+      return recalcUnit(next);
+    });
+
     const withNames = await Promise.all(
-      parsed.map(async (r) => {
-        if (!r.sku || (r.name && r.name.trim())) return r;
-        const name = await getName(r.sku);
+      mapped.map(async (r) => {
+        if (!r.sku) return r;
+        const name = await getName(r.sku.trim());
         return name ? { ...r, name } : r;
       }),
     );
@@ -250,22 +348,45 @@ export default function RegisterFormPage() {
     setChecked(new Set());
   };
 
-  // 합계
+  const onChangeBulkFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    try {
+      const file = e.target.files?.[0];
+      e.target.value = "";
+      if (!file) return;
+
+      const ext = (file.name.split(".").pop() || "").toLowerCase();
+      if (ext !== "xlsx") {
+        alert("xlsx 파일만 지원해요. (양식 파일로 저장한 xlsx를 선택해줘)");
+        return;
+      }
+
+      const items = await parseXlsxFileToBulkItems(file);
+      await applyBulkItemsToRows(items);
+    } catch (err) {
+      console.error(err);
+      handleError(err as any);
+    }
+  };
+
+  const onDownloadTemplate = async () => {
+    try {
+      await downloadXlsxWithAutoSeq(BULK_TEMPLATE_URL, BULK_TEMPLATE_BASENAME);
+    } catch (err) {
+      handleError(err as any);
+    }
+  };
+
   const summary = useMemo(() => {
     const totalQty = rows.reduce((acc, r) => acc + toNumber(r.qty), 0);
-    const totalPrice = rows.reduce(
-      (acc, r) => acc + toNumber(r.totalPrice),
-      0,
-    );
+    const totalPrice = rows.reduce((acc, r) => acc + toNumber(r.totalPrice), 0);
     return { totalQty, totalPrice };
   }, [rows]);
 
-  // 간단 검증
   const validate = (items: RowItem[]) => {
     const invalid = items.filter((r) => {
       const qty = toNumber(r.qty);
       const total = toNumber(r.totalPrice);
-      return !r.orderDate || !r.sku?.trim() || qty <= 0 || total < 0;
+      return !r.orderDate || !r.sku?.trim() || !r.supplier?.trim() || qty <= 0 || total < 0;
     });
     return { ok: invalid.length === 0, invalid };
   };
@@ -281,7 +402,7 @@ export default function RegisterFormPage() {
       const first = invalid[0];
       alert(
         `필수값이 비어있거나 잘못된 행이 있습니다.
-주문일자, SKU, 입고 수량, 총 단가를 확인해주세요.
+주문일자, SKU, 입고 수량, 총 단가, 입고처를 확인해주세요.
 문제 행 SKU: ${first.sku || "(빈 값)"}`,
       );
       return;
@@ -291,12 +412,11 @@ export default function RegisterFormPage() {
       items: rows.map((r) => {
         const qty = toNumber(r.qty);
         const total = toNumber(r.totalPrice);
-        const unit =
-          toNumber(r.unitPrice) ||
-          (qty ? Math.floor((total / qty) * 100) / 100 : 0);
+        // ✅ 저장도 동일 규칙: 원화 반올림(정수)
+        const unit = qty ? Math.round(total / qty) : 0;
 
         return {
-          order_date: r.orderDate, // "YYYYMMDD"
+          order_date: r.orderDate,
           sku: r.sku.trim(),
           name: r.name.trim(),
           qty,
@@ -311,17 +431,12 @@ export default function RegisterFormPage() {
     try {
       setIsSubmitting(true);
       const res = await inboundAdapter.registerFormCreate(payload);
-
-      // ✅ 전역 에러 처리: 코드/메시지 직접 보지 않고 handleError 한 줄로 처리
-      if (!res.ok) {
-        return handleError(res.error);
-      }
+      if (!res.ok) return handleError(res.error);
 
       alert("입고 등록이 완료됐어요.");
       clearAll();
     } catch (err) {
       console.error(err);
-      // ✅ 예외도 전역 에러 처리로 위임
       handleError(err as any);
     } finally {
       setIsSubmitting(false);
@@ -330,11 +445,38 @@ export default function RegisterFormPage() {
 
   return (
     <div className="w-full h-full flex flex-col gap-4">
-      {/* 액션바 */}
+      {/* 액션바 (한 덩어리 + 지정 순서) */}
       <div className="flex items-center justify-end gap-2">
+        <button
+          onClick={onDownloadTemplate}
+          disabled={isSubmitting}
+          className="px-3 py-2 rounded-lg border text-sm"
+        >
+          대량등록 템플릿
+        </button>
+
+        <input
+          id="inbound-bulk-file"
+          type="file"
+          accept=".xlsx"
+          className="hidden"
+          onChange={onChangeBulkFile}
+          disabled={isSubmitting}
+        />
+        <label
+          htmlFor="inbound-bulk-file"
+          className={`px-3 py-2 rounded-lg border text-sm cursor-pointer ${
+            isSubmitting ? "opacity-50 cursor-not-allowed" : ""
+          }`}
+          title="xlsx 양식 파일을 선택해 업로드하면 행이 자동으로 채워집니다."
+        >
+          엑셀 대량등록
+        </label>
+
         <button onClick={addRow} className="px-3 py-2 rounded-lg border text-sm">
           행 추가
         </button>
+
         <button
           onClick={deleteSelected}
           disabled={checked.size === 0 || isSubmitting}
@@ -346,6 +488,7 @@ export default function RegisterFormPage() {
         >
           선택 삭제
         </button>
+
         <button
           onClick={clearAll}
           disabled={isSubmitting}
@@ -353,27 +496,20 @@ export default function RegisterFormPage() {
         >
           초기화
         </button>
+
         <button
           onClick={onSubmitRegister}
           disabled={isSubmitting}
           className={`px-3 py-2 rounded-lg border text-sm font-semibold ${
-            isSubmitting
-              ? "bg-gray-300 text-gray-600 cursor-wait"
-              : "bg-black text-white"
+            isSubmitting ? "bg-gray-300 text-gray-600 cursor-wait" : "bg-black text-white"
           }`}
         >
           {isSubmitting ? "저장 중..." : "입고 등록"}
         </button>
       </div>
 
-      {/* 테이블 + 붙여넣기 컨테이너 */}
-      <div
-        ref={pasteTargetRef}
-        tabIndex={0}
-        onPaste={handlePaste}
-        className="rounded-xl border bg-white shadow-sm outline-none"
-        title="여기를 클릭해 포커스 후 Ctrl+V로 붙여넣으세요."
-      >
+      {/* 테이블 */}
+      <div className="rounded-xl border bg-white shadow-sm outline-none">
         <div className="overflow-auto">
           <table className="min-w-full table-auto">
             <thead>
@@ -383,8 +519,7 @@ export default function RegisterFormPage() {
                     type="checkbox"
                     checked={rows.length > 0 && checked.size === rows.length}
                     onChange={(e) => {
-                      if (e.target.checked)
-                        setChecked(new Set(rows.map((r) => r.id)));
+                      if (e.target.checked) setChecked(new Set(rows.map((r) => r.id)));
                       else setChecked(new Set());
                     }}
                     disabled={isSubmitting}
@@ -402,10 +537,7 @@ export default function RegisterFormPage() {
             <tbody>
               {rows.length === 0 ? (
                 <tr>
-                  <td
-                    colSpan={8}
-                    className="text-center text-sm text-gray-500 py-8"
-                  >
+                  <td colSpan={8} className="text-center text-sm text-gray-500 py-8">
                     입력할 행이 없습니다.
                   </td>
                 </tr>
@@ -427,48 +559,59 @@ export default function RegisterFormPage() {
                         disabled={isSubmitting}
                       />
                     </td>
+
                     <td className="px-3 py-2">
                       <input
                         type="text"
                         placeholder="예: 20251025"
                         value={r.orderDate}
-                        onChange={(e) =>
-                          onCellChange(r.id, "orderDate", e.target.value)
-                        }
+                        onChange={(e) => onCellChange(r.id, "orderDate", e.target.value)}
                         className="w-full border rounded-lg px-2 py-1 text-sm"
                         disabled={isSubmitting}
                       />
                     </td>
+
                     <td className="px-3 py-2">
                       <input
                         type="text"
                         value={r.sku}
-                        onChange={(e) =>
-                          onCellChange(r.id, "sku", e.target.value)
-                        }
+                        onChange={(e) => onCellChange(r.id, "sku", e.target.value)}
                         className="w-full border rounded-lg px-2 py-1 text-sm"
                         disabled={isSubmitting}
                       />
                     </td>
+
                     <td className="px-3 py-2">
                       <input
                         type="text"
                         value={r.name}
-                        onChange={(e) =>
-                          onCellChange(r.id, "name", e.target.value)
-                        }
+                        onChange={(e) => onCellChange(r.id, "name", e.target.value)}
                         className="w-full border rounded-lg px-2 py-1 text-sm"
                         disabled={isSubmitting}
                       />
                     </td>
+
                     <td className="px-3 py-2">
                       <input
                         inputMode="numeric"
                         value={r.qty}
                         onChange={(e) =>
+                          onCellChange(r.id, "qty", e.target.value.replace(/[^\d]/g, ""))
+                        }
+                        className="w-full border rounded-lg px-2 py-1 text-sm text-right"
+                        disabled={isSubmitting}
+                      />
+                    </td>
+
+                    {/* ✅ 총 단가: 표시값은 천단위 콤마 / 입력은 숫자만 */}
+                    <td className="px-3 py-2">
+                      <input
+                        inputMode="numeric"
+                        value={r.totalPrice === "" ? "" : fmt(toNumber(r.totalPrice))}
+                        onChange={(e) =>
                           onCellChange(
                             r.id,
-                            "qty",
+                            "totalPrice",
                             e.target.value.replace(/[^\d]/g, ""),
                           )
                         }
@@ -476,21 +619,8 @@ export default function RegisterFormPage() {
                         disabled={isSubmitting}
                       />
                     </td>
-                    <td className="px-3 py-2">
-                      <input
-                        inputMode="decimal"
-                        value={r.totalPrice}
-                        onChange={(e) =>
-                          onCellChange(
-                            r.id,
-                            "totalPrice",
-                            e.target.value.replace(/[^\d.]/g, ""),
-                          )
-                        }
-                        className="w-full border rounded-lg px-2 py-1 text-sm text-right"
-                        disabled={isSubmitting}
-                      />
-                    </td>
+
+                    {/* ✅ 개당 단가: 원화 반올림 정수 + 천단위 콤마 */}
                     <td className="px-3 py-2">
                       <input
                         readOnly
@@ -499,13 +629,12 @@ export default function RegisterFormPage() {
                         disabled
                       />
                     </td>
+
                     <td className="px-3 py-2">
                       <input
                         type="text"
                         value={r.supplier}
-                        onChange={(e) =>
-                          onCellChange(r.id, "supplier", e.target.value)
-                        }
+                        onChange={(e) => onCellChange(r.id, "supplier", e.target.value)}
                         className="w-full border rounded-lg px-2 py-1 text-sm"
                         disabled={isSubmitting}
                       />
@@ -517,7 +646,6 @@ export default function RegisterFormPage() {
           </table>
         </div>
 
-        {/* 합계 */}
         <div className="px-4 py-3 border-t text-sm flex justify-end gap-8">
           <div>
             총 수량: <b>{fmt(summary.totalQty)}</b>

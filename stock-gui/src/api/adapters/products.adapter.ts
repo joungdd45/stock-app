@@ -31,8 +31,8 @@ export type ProductListItem = {
   unit_price: number;
   weight_g: number | null;
   barcode: string | null;
-  status?: boolean;      // ← 구버전 호환용
-  is_active?: boolean;   // ← 신규 활성 여부
+  status?: boolean; // ← 구버전 호환용
+  is_active?: boolean; // ← 신규 활성 여부
   bundle_qty: number;
 };
 
@@ -97,14 +97,122 @@ type BundleMappingResult = {
   ok: boolean;
 };
 
+/**
+ * ✅ bulk rows (백엔드 DTO에 맞춤)
+ * backend BulkRowDTO:
+ *  - sku (필수)
+ *  - name (필수)
+ *  - barcode (옵션)
+ *  - weight (옵션)  <-- 템플릿의 weight_g를 여기로 매핑
+ *  - last_inbound_price (옵션) <-- 템플릿의 unit_price를 여기로 매핑
+ */
+export type ProductBulkRow = {
+  sku: string;
+  name: string;
+  barcode?: string | null;
+  weight?: number | null;
+  last_inbound_price?: number | null;
+};
+
 type ProductBulkUploadPayload = {
-  text: string;
+  rows: ProductBulkRow[];
 };
 
 type ProductBulkUploadResult = {
   ok: boolean;
   count: number;
 };
+
+/* ─────────────────────────────────────────────
+   내부 유틸: CSV 파싱(간단/안전)
+─────────────────────────────────────────────*/
+
+function toNum(v: string): number {
+  const cleaned = String(v ?? "").trim().replace(/[^\d.]/g, "");
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function splitCsvLine(line: string): string[] {
+  // 따옴표 포함 CSV 최소 지원
+  const out: string[] = [];
+  let cur = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+
+    if (ch === '"') {
+      const next = line[i + 1];
+      if (inQuotes && next === '"') {
+        cur += '"';
+        i++;
+        continue;
+      }
+      inQuotes = !inQuotes;
+      continue;
+    }
+
+    if (ch === "," && !inQuotes) {
+      out.push(cur);
+      cur = "";
+      continue;
+    }
+
+    cur += ch;
+  }
+
+  out.push(cur);
+  return out.map((s) => s.trim());
+}
+
+function csvTextToBulkRows(text: string): ProductBulkRow[] {
+  const raw = String(text ?? "").trim();
+  if (!raw) return [];
+
+  const lines = raw.split(/\r?\n/).filter((l) => l.trim() !== "");
+  if (lines.length < 2) return [];
+
+  const header = splitCsvLine(lines[0]).map((h) => h.trim());
+  const idx = (key: string) => header.indexOf(key);
+
+  const iSku = idx("sku");
+  const iName = idx("name");
+  const iBarcode = idx("barcode");
+
+  // CreatePage에서 만든 헤더 기준
+  const iWeightG = idx("weight_g");
+  const iUnitPrice = idx("unit_price");
+
+  if (iSku === -1 || iName === -1) return [];
+
+  const rows: ProductBulkRow[] = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = splitCsvLine(lines[i]);
+
+    const sku = String(cols[iSku] ?? "").trim();
+    const name = String(cols[iName] ?? "").trim();
+    if (!sku || !name) continue;
+
+    const barcode = iBarcode >= 0 ? String(cols[iBarcode] ?? "").trim() : "";
+    const weight = iWeightG >= 0 ? toNum(String(cols[iWeightG] ?? "")) : 0;
+    const last_inbound_price =
+      iUnitPrice >= 0 ? toNum(String(cols[iUnitPrice] ?? "")) : 0;
+
+    rows.push({
+      sku,
+      name,
+      barcode: barcode ? barcode : null,
+      weight: Number.isFinite(weight) ? weight : 0,
+      last_inbound_price: Number.isFinite(last_inbound_price)
+        ? last_inbound_price
+        : 0,
+    });
+  }
+
+  return rows;
+}
 
 /* ─────────────────────────────────────────────
    어댑터 함수 구현
@@ -132,9 +240,7 @@ async function updateOne(
   return apiHub.patch<ProductUpdateResult>(url, payload);
 }
 
-async function deleteItems(
-  ids: string[],
-): Promise<ApiResult<ProductDeleteResult>> {
+async function deleteItems(ids: string[]): Promise<ApiResult<ProductDeleteResult>> {
   const body: ProductDeletePayload = { ids };
   // 두 번째 인자는 AxiosRequestConfig 타입이므로 data로 감싸서 전달
   return apiHub.delete<ProductDeleteResult>(PRODUCTS_DELETE_URL, {
@@ -145,14 +251,6 @@ async function deleteItems(
 /**
  * 📌 묶음설정 저장
  * - 항상 전체 replace
- * - body 예:
- *   {
- *     bundle_sku: "BUNDLE-001",
- *     items: [
- *       { component_sku: "SKU-001", component_qty: 2 },
- *       { component_sku: "SKU-002", component_qty: 1 }
- *     ]
- *   }
  */
 async function updateBundleMapping(
   payload: BundleMappingPayload,
@@ -160,11 +258,59 @@ async function updateBundleMapping(
   return apiHub.post<BundleMappingResult>(PRODUCTS_BUNDLE_URL, payload);
 }
 
+/**
+ * ✅ 대량등록
+ * - 기존: { text } 전송 → 백엔드에서 rows missing 에러
+ * - 변경: CSV(text) → rows[]로 변환해서 { rows } 전송
+ */
 async function bulkUploadFromText(
   text: string,
 ): Promise<ApiResult<ProductBulkUploadResult>> {
-  const body: ProductBulkUploadPayload = { text };
-  return apiHub.post<ProductBulkUploadResult>(PRODUCTS_BULK_URL, body);
+  const rows = csvTextToBulkRows(text);
+
+  const body: ProductBulkUploadPayload = { rows };
+
+  // rows가 비었으면 프론트에서 바로 막아도 되지만, 여기서도 안전하게 처리
+  if (!rows.length) {
+    return {
+      ok: false,
+      error: {
+        code: "FRONT-PRODUCT-BULK-INVALID-001",
+        message: "대량등록 데이터가 비어있어요. (sku/name 확인)",
+        detail: "대량등록 데이터가 비어있어요. (sku/name 확인)",
+        traceId: null,
+      } as any,
+      data: null as any,
+    } as any;
+  }
+
+  // 백엔드 응답은 ActionResponse 형태일 수 있으니,
+  // apiHub가 이미 result를 풀어주지 않는 경우를 대비해 후처리까지 겸함
+  const res = await apiHub.post<any>(PRODUCTS_BULK_URL, body);
+  if (!res.ok) return res as any;
+
+  const payload = res.data as any;
+
+  // 케이스1) apiHub가 이미 result를 언랩해줌: { ok, count }
+  if (payload?.count !== undefined) {
+    return res as ApiResult<ProductBulkUploadResult>;
+  }
+
+  // 케이스2) ActionResponse: { data: { result: {...} } }
+  const r = payload?.data?.result ?? payload?.result ?? payload;
+  const count =
+    r?.count ??
+    r?.created ??
+    (Array.isArray(r?.items) ? r.items.length : rows.length) ??
+    rows.length;
+
+  return {
+    ...res,
+    data: {
+      ok: r?.ok ?? true,
+      count: Number(count) || 0,
+    },
+  } as ApiResult<ProductBulkUploadResult>;
 }
 
 /* ─────────────────────────────────────────────

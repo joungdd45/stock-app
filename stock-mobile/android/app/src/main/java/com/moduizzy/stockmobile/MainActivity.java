@@ -6,6 +6,8 @@ import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 
+import androidx.appcompat.app.AlertDialog;
+
 import com.getcapacitor.BridgeActivity;
 
 public class MainActivity extends BridgeActivity {
@@ -24,13 +26,27 @@ public class MainActivity extends BridgeActivity {
         }
     }
 
+    @Override
+    public void onBackPressed() {
+        showExitDialog();
+    }
+
+    private void showExitDialog() {
+        runOnUiThread(() -> new AlertDialog.Builder(this)
+                .setTitle("앱 종료")
+                .setMessage("종료할꺼임?")
+                .setPositiveButton("확인", (dialog, which) -> finishAndRemoveTask())
+                .setNegativeButton("취소", (dialog, which) -> dialog.dismiss())
+                .setCancelable(true)
+                .show());
+    }
+
     private void applyImmersiveMode() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             // Android 11+ (API 30+)
             WindowInsetsController controller = getWindow().getInsetsController();
             if (controller != null) {
                 controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
-                // 스와이프 시 잠깐 나타났다 다시 숨김 (게임 방식)
                 controller.setSystemBarsBehavior(
                         WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                 );

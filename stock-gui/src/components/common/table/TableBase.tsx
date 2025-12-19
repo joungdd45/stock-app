@@ -7,6 +7,7 @@
 // - [NOAH PATCH] 액션 버튼을 Carbon Table 바깥 상단으로 이동
 // - [NOAH PATCH] 체크박스 보조텍스트("Select row" 등) 완전 숨김(구/신 prefix 동시 대응)
 // - [NOAH PATCH] onSelectionChange 지원 (선택된 row.id 목록을 상위로 전달)
+// - [NOAH PATCH 2025-12-18] ✅ 가로 오버플로우(페이지 밖으로 밀림) 방지: 스크롤은 테이블 컨테이너 내부에서만
 
 import React, { useMemo, useRef } from "react";
 import {
@@ -31,7 +32,7 @@ type SortState = { key?: string; dir?: SortDir };
 export type TableHeaderDef = {
   key: string;
   header: string;
-  width?: string;
+  width?: string; // 예: "10rem", "120px"
   sortable?: boolean; // 기본 true 취급
 };
 
@@ -52,13 +53,11 @@ type Props = {
   filter: FilterValue;
   onFilterChange: (v: FilterValue) => void;
 
-  actions?: React.ReactNode; // [NOAH PATCH] 외부 상단 액션 영역으로 렌더
+  actions?: React.ReactNode;
 
-  // 선택된 row.id 목록 전달용 (선택 없으면 [])
   onSelectionChange?: (ids: string[]) => void;
 };
 
-// [NOAH PATCH] 보조텍스트/선택라벨 숨김 + 정렬아이콘 숨김(구/신 prefix 동시대응)
 // 스코프 한정: .noah-tablebase 하위에만 적용
 const AssistiveTextFix = () => (
   <style>{`
@@ -82,7 +81,6 @@ const AssistiveTextFix = () => (
     .noah-tablebase .bx--table-sort__icon--unsorted {
       display: none !important;
     }
-    /* 체크박스 라벨 안의 텍스트 제거(구/신 prefix 동시대응) */
     .noah-tablebase .cds--table-column-checkbox label,
     .noah-tablebase .bx--table-column-checkbox label {
       font-size: 0 !important;
@@ -117,27 +115,25 @@ export default function TableBase({
     [safeHeaders]
   );
 
-  // ✅ 헤더 라벨 (undefined 완전 방어)
   const renderHeaderLabel = (headerKey?: string, label?: string) => {
     if (!headerKey || !label) return null;
     const isActive = sort.key === headerKey;
     const isDesc = isActive && sort.dir === "DESC";
     const icon = isActive ? (isDesc ? "▼" : "▲") : "▲";
     const colorCls = isActive ? (isDesc ? "text-blue-600" : "text-gray-500") : "text-gray-400";
+
     return (
-      <span className="inline-flex items-center gap-1 select-none">
-        <span>{label}</span>
-        <span className={`text-[11px] leading-none ${colorCls}`} aria-hidden="true">
+      <span className="inline-flex min-w-0 items-center gap-1 select-none">
+        <span className="min-w-0 truncate">{label}</span>
+        <span className={`shrink-0 text-[11px] leading-none ${colorCls}`} aria-hidden="true">
           {icon}
         </span>
       </span>
     );
   };
 
-  const colWidths = useMemo(
-    () => safeHeaders.map((h) => h.width ?? "auto"),
-    [safeHeaders]
-  );
+  // ✅ width 지정된 컬럼만 col에 width를 박고, 나머지는 아예 style을 안 넣는다(= 고정폭 합계 폭주 방지)
+  const colWidths = useMemo(() => safeHeaders.map((h) => h.width), [safeHeaders]);
 
   const carbonRows = useMemo(
     () =>
@@ -148,14 +144,11 @@ export default function TableBase({
     [rows]
   );
 
-  // React key 경고 방지: getHeaderProps가 반환하는 key는 제거하고 직접 key를 넣는다.
   const wrapHeaderProps = (orig: any, header: { key: string }) => {
     const { key: _ignoredKey, onClick: origOnClick, ...rest } = orig ?? {};
 
     const onClick = (e: any) => {
-      if (typeof origOnClick === "function") {
-        origOnClick(e);
-      }
+      if (typeof origOnClick === "function") origOnClick(e);
       const colKey = header.key;
       if (!sortableMap[colKey]) return;
       const nextDir: SortDir =
@@ -167,16 +160,12 @@ export default function TableBase({
     return { ...rest, onClick };
   };
 
-  // 선택 상태 변경 감지용
   const selectionKeyRef = useRef<string>("");
 
   const reportSelectionIfChanged = (cRows: any[]) => {
     if (!onSelectionChange) return;
 
-    const ids = cRows
-      .filter((r) => r.isSelected)
-      .map((r) => String(r.id));
-
+    const ids = cRows.filter((r) => r.isSelected).map((r) => String(r.id));
     const key = ids.join("|");
     if (key !== selectionKeyRef.current) {
       selectionKeyRef.current = key;
@@ -185,10 +174,9 @@ export default function TableBase({
   };
 
   return (
-    <div className="noah-tablebase p-3">
+    <div className="noah-tablebase p-3 min-w-0">
       <AssistiveTextFix />
 
-      {/* 필터 박스 (테이블 바깥) */}
       <FilterBox
         value={filter}
         onChange={(v) => onFilterChange(v)}
@@ -204,7 +192,6 @@ export default function TableBase({
         }}
       />
 
-      {/* [NOAH PATCH] 액션 버튼을 테이블 '바깥' 상단 우측으로 이동 */}
       {actions && (
         <div className="mb-2 flex items-center justify-end gap-2">
           {actions}
@@ -212,23 +199,17 @@ export default function TableBase({
       )}
 
       <DataTable rows={carbonRows} headers={safeHeaders as any} useZebraStyles size="lg">
-        {({
-          rows: cRows = [],
-          headers: cHeaders = [],
-          getHeaderProps,
-          getRowProps,
-          getSelectionProps,
-        }) => {
-          // 선택 상태 상위 보고
+        {({ rows: cRows = [], headers: cHeaders = [], getHeaderProps, getRowProps, getSelectionProps }) => {
           reportSelectionIfChanged(cRows);
 
           return (
-            <TableContainer className="w-full overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-sm">
-              <div className="max-h-[560px] overflow-auto">
+            <TableContainer className="w-full max-w-full min-w-0 rounded-2xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+              {/* ✅ 가로 스크롤은 여기서만 발생하게 고정 (페이지 전체 밀림 방지) */}
+              <div className="max-h-[560px] w-full max-w-full min-w-0 overflow-x-auto overflow-y-auto">
                 <Table
                   aria-label="공통 테이블"
                   className={[
-                    "min-w-full w-full table-fixed border-collapse",
+                    "w-full table-fixed border-collapse", // ✅ min-w-full 제거
                     "[&>thead>tr>th]:sticky [&>thead>tr>th]:top-0 [&>thead>tr>th]:z-10",
                     "[&>thead>tr]:bg-gray-50 [&>thead>tr>th]:bg-gray-50 [&>thead>tr>th]:text-gray-800",
                     "[&>thead>tr>th]:border-b border-gray-200",
@@ -240,7 +221,7 @@ export default function TableBase({
                   <colgroup>
                     <col style={{ width: "44px" }} />
                     {colWidths.map((w, i) => (
-                      <col key={`col-${i}`} style={{ width: w }} />
+                      <col key={`col-${i}`} style={w ? { width: w } : undefined} />
                     ))}
                   </colgroup>
 
@@ -264,7 +245,9 @@ export default function TableBase({
                                 clickable ? "cursor-pointer select-none" : "opacity-60"
                               }`}
                             >
-                              {renderHeaderLabel(header.key, header.header)}
+                              <div className="min-w-0 truncate">
+                                {renderHeaderLabel(header.key, header.header)}
+                              </div>
                             </TableHeader>
                           );
                         })}
@@ -296,7 +279,8 @@ export default function TableBase({
                           <TableSelectRow {...getSelectionProps({ row })} />
                           {row.cells.map((cell: any) => (
                             <TableCell key={cell.id} className="text-center text-sm">
-                              {cell.value}
+                              {/* ✅ 셀 내부에서만 말줄임/오버플로우 처리 */}
+                              <div className="min-w-0 truncate">{cell.value}</div>
                             </TableCell>
                           ))}
                         </TableRow>
@@ -342,9 +326,7 @@ export default function TableBase({
                     </span>
                     <button
                       className="rounded-md border px-2 py-1 disabled:opacity-40"
-                      disabled={
-                        page >= Math.max(1, Math.ceil(total / pageSize)) || loading
-                      }
+                      disabled={page >= Math.max(1, Math.ceil(total / pageSize)) || loading}
                       onClick={() => onPageChange(page + 1)}
                     >
                       다음
@@ -359,4 +341,3 @@ export default function TableBase({
     </div>
   );
 }
- 

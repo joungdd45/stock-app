@@ -1,6 +1,9 @@
 /* C:\dev\stock-mobile\src\pages\stock\StockBarcodeScanPage.tsx */
 /**
  * 재고 바코드 스캔 페이지 (zxing + 피드백 + 1회 스캔 멈춤)
+ * 변경:
+ *  - 더미 StockRow 저장 제거
+ *  - barcode만 sessionStorage에 저장 (조회페이지에서 API 조회용)
  */
 
 import React, { useEffect, useRef, useState } from "react";
@@ -9,13 +12,12 @@ import { Camera } from "lucide-react";
 import { AppShell, Card, COLORS } from "../../components/layout/AppShell";
 import { BrowserMultiFormatReader } from "@zxing/browser";
 
-interface StockRow {
-  name: string;
-  stock: number;
-  free: number;
-}
+const STORAGE_KEY = "stock.scan.barcode";
 
-const STORAGE_KEY = "stock.scan.result";
+type StoredBarcodePayload = {
+  barcode: string;
+  scannedAt: string; // 디버깅/추적용
+};
 
 const StockBarcodeScanPage: React.FC = () => {
   const nav = useNavigate();
@@ -80,6 +82,7 @@ const StockBarcodeScanPage: React.FC = () => {
 
             const rawText = result.getText();
             const scannedText = String(rawText ?? "").trim();
+            if (!scannedText) return;
 
             if (lastBarcode === scannedText) return;
 
@@ -135,13 +138,12 @@ const StockBarcodeScanPage: React.FC = () => {
 
     setSubmitting(true);
 
-    const dummy: StockRow = {
-      name: `스캔: ${scannedBarcode}`,
-      stock: 10,
-      free: 8,
+    const payload: StoredBarcodePayload = {
+      barcode: scannedBarcode,
+      scannedAt: new Date().toISOString(),
     };
 
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(dummy));
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     nav("/stock/status");
   };
 

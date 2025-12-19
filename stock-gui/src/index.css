@@ -2,6 +2,16 @@
 @tailwind components;
 @tailwind utilities;
 
-/* 선택: 보기 좋은 기본값 */
-html, body, #root { height: 100%; }
-body { background: #f8fafc; }
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+/* ✅ “페이지(브라우저)” 자체는 절대 스크롤/가로 확장 금지 */
+html, body {
+  overflow: hidden;
+}
+
+body {
+  background: #f8fafc;
+}

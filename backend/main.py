@@ -148,3 +148,7 @@ app.include_router(settings_basic)
 from backend.routers.settings.settings_advanced import settings_advanced
 app.include_router(settings_advanced)
 
+from backend.routers.app.app_version import app_version
+app.include_router(app_version)
+
+
