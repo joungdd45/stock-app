@@ -1,15 +1,17 @@
 /* C:\dev\stock-mobile\src\pages\stock\StockStatusPage.tsx */
 /**
- * 재고관리 > 재고현황
- *  - 바코드 스캔 버튼으로 이동
- *  - 바코드 스캔 결과(sessionStorage)로 단건 조회 (현재: barcode만 읽어 표시)
- *  - 다음 단계: stockAdapter.status(barcode) 연동해서 name/stock/free 표시
+ * 재고관리 > 재고현황 (디버그 포함)
+ * - 스캔 페이지에서 저장한 barcode로 단건 조회
+ * - apiHub 언랩 결과(res.data)를 그대로 사용
+ * - 📌 요청 barcode / 응답 내용을 화면에 그대로 표시 (디버깅용)
  */
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ScanLine } from "lucide-react";
 import { AppShell, Card, COLORS } from "../../components/layout/AppShell";
+import { stockAdapter } from "../../api/adapters/stock.adapter";
+import { handleError } from "../../utils/handleError";
 
 interface StockRow {
   name: string;
@@ -24,77 +26,129 @@ type StoredBarcodePayload = {
   scannedAt?: string;
 };
 
+type ScanResultShape = {
+  sku: string;
+  name: string;
+  current_qty: number;
+  available_qty: number;
+  last_price: number | null;
+};
+
 const StockStatusPage: React.FC = () => {
   const nav = useNavigate();
+
   const [items, setItems] = useState<StockRow[]>([]);
   const [lastBarcode, setLastBarcode] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
 
-  useEffect(() => {
+  // 🔎 디버그 표시용
+  const [debugText, setDebugText] = useState<string>("");
+
+  const scannedBarcode = useMemo(() => {
     const stored = sessionStorage.getItem(STORAGE_KEY);
-    if (!stored) {
-      setItems([]);
-      setLastBarcode(null);
-      return;
-    }
+    if (!stored) return null;
 
     try {
       const parsed: StoredBarcodePayload = JSON.parse(stored);
-      const barcode = String(parsed?.barcode ?? "").trim();
-
-      if (!barcode) {
-        setItems([]);
-        setLastBarcode(null);
-        return;
-      }
-
-      setLastBarcode(barcode);
-
-      // ✅ 현재 단계: API 연동 전이므로, 스캔값이 제대로 넘어왔는지 확인용 임시 표시
-      // 다음 단계에서 stockAdapter.status(barcode)로 name/stock/free를 받아와서 setItems로 교체한다.
-      setItems([
-        {
-          name: `스캔 바코드: ${barcode}`,
-          stock: 0,
-          free: 0,
-        },
-      ]);
+      return String(parsed.barcode ?? "").trim() || null;
     } catch {
-      setItems([]);
-      setLastBarcode(null);
+      return null;
     }
   }, []);
+
+  useEffect(() => {
+    if (!scannedBarcode) {
+      setItems([]);
+      setLastBarcode(null);
+      setDebugText("");
+      return;
+    }
+
+    setLastBarcode(scannedBarcode);
+
+    const run = async () => {
+      if (loading) return;
+      setLoading(true);
+
+      try {
+        const res = await stockAdapter.scanStatusByBarcode({
+          barcode: scannedBarcode,
+        });
+
+        // 🔎 요청/응답을 그대로 화면에 표시
+        setDebugText(
+          `요청 barcode: ${scannedBarcode}\n` +
+            (res.ok
+              ? `응답 OK\nsku=${(res.data as any)?.sku ?? "-"}\nname=${(res.data as any)?.name ?? "-"}\ncurrent_qty=${(res.data as any)?.current_qty ?? "-"}\navailable_qty=${(res.data as any)?.available_qty ?? "-"}`
+              : `응답 FAIL\ncode=${(res.error as any)?.code ?? "-"}\nmessage=${(res.error as any)?.message ?? "-"}`)
+        );
+
+        if (!res.ok) {
+          handleError(res.error);
+          setItems([]);
+          return;
+        }
+
+        const found = res.data as ScanResultShape | null;
+
+        if (!found || !String(found.name ?? "").trim()) {
+          setItems([]);
+          return;
+        }
+
+        setItems([
+          {
+            name: String(found.name),
+            stock: Number(found.current_qty ?? 0),
+            free: Number(found.available_qty ?? 0),
+          },
+        ]);
+      } catch (e) {
+        handleError(e);
+        setItems([]);
+        setDebugText(`예외 발생: ${String(e)}`);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    run();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scannedBarcode]);
 
   return (
     <AppShell title="재고현황">
       <div className="space-y-3">
-        {/* 상단: 바코드 스캔 버튼 + 설명 */}
         <Card className="p-3">
           <div className="flex flex-col gap-2">
             <button
-              className="w-full flex items-center justify-center gap-2 px-3 py-3 rounded-2xl text-sm font-medium"
-              style={{
-                backgroundColor: COLORS.main,
-                color: "#FFFFFF",
-              }}
+              className="w-full flex items-center justify-center gap-2 px-3 py-3 rounded-2xl text-sm font-medium disabled:opacity-60"
+              style={{ backgroundColor: COLORS.main, color: "#FFFFFF" }}
               onClick={() => nav("/stock/scan-barcode")}
+              disabled={loading}
             >
               <ScanLine size={18} color="#FFFFFF" />
               <span>바코드 스캔</span>
             </button>
-
-            <p className="text-xs text-center" style={{ color: COLORS.textGray }}>
-              바코드를 스캔하면 해당 상품의 재고현황이 아래에 표시됩니다.
-            </p>
 
             {lastBarcode && (
               <p className="text-[10px] text-center" style={{ color: COLORS.textGray }}>
                 마지막 스캔값: {lastBarcode}
               </p>
             )}
+
+            {/* 🔎 디버그 표시 */}
+            {debugText && (
+              <pre
+                className="text-[10px] whitespace-pre-wrap rounded-md p-2"
+                style={{ color: COLORS.textGray, background: "#f8fafc" }}
+              >
+                {debugText}
+              </pre>
+            )}
           </div>
         </Card>
 
-        {/* 하단: 재고 리스트 */}
         <Card className="overflow-hidden">
           <table className="w-full text-sm">
             <thead className="bg-slate-50" style={{ color: COLORS.textGray }}>
@@ -106,25 +160,19 @@ const StockStatusPage: React.FC = () => {
             </thead>
             <tbody>
               {items.map((r, idx) => (
-                <tr
-                  key={idx}
-                  className="border-t"
-                  style={{ borderColor: COLORS.line }}
-                >
+                <tr key={idx} className="border-t" style={{ borderColor: COLORS.line }}>
                   <td className="py-2 px-3">{r.name}</td>
                   <td className="py-2 px-3 text-center">{r.stock}</td>
                   <td className="py-2 px-3 text-center">{r.free}</td>
                 </tr>
               ))}
 
-              {items.length === 0 && (
+              {items.length === 0 && !loading && (
                 <tr>
-                  <td
-                    colSpan={3}
-                    className="py-6 text-center text-xs"
-                    style={{ color: "#94A3B8" }}
-                  >
-                    바코드를 스캔해서 재고를 조회해 주세요
+                  <td colSpan={3} className="py-6 text-center text-xs" style={{ color: "#94A3B8" }}>
+                    {lastBarcode
+                      ? "해당 바코드로 상품을 찾지 못했어요"
+                      : "바코드를 스캔해서 재고를 조회해 주세요"}
                   </td>
                 </tr>
               )}
