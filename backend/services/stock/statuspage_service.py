@@ -215,6 +215,7 @@ class StatusPageService:
         sort_info = self._resolve_sorting(sort_by, order)
         offset = (page - 1) * size_resolved
 
+        # ✅ 검색 대상에 barcode 추가
         base_sql = (
             self._base_sql()
             + """
@@ -222,6 +223,7 @@ class StatusPageService:
                     :q IS NULL
                  OR p.sku ILIKE '%' || :q || '%'
                  OR p.name ILIKE '%' || :q || '%'
+                 OR p.barcode ILIKE '%' || :q || '%'
               )
             """
         )
@@ -372,12 +374,10 @@ class StatusPageService:
                 ctx={"page_id": PAGE_ID, "skus": selected_skus},
             )
 
-        # 엑셀 생성
         wb = Workbook()
         ws = wb.active
         ws.title = "재고현황"
 
-        # 헤더: SKU / 상품명 / 현 재고 / 가용재고
         ws.append(["SKU", "상품명", "현 재고", "가용재고"])
 
         for r in rows:
