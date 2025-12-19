@@ -1,7 +1,7 @@
 # 📄 backend/services/stock/statuspage_service.py
 # 페이지: 재고 현황(StatusPage)
-# 역할: 재고 목록 조회, 다건검색, 엑셀 생성, 재고 절대값 조정
-# 단계: v1.5 (list + multi + adjust + export 엑셀 실제 생성) / 구조 통일 작업지침 v2 적용
+# 역할: 재고 목록 조회, 다건검색, 엑셀 생성, 재고 절대값 조정 (+ 바코드 스캔 단건조회)
+# 단계: v1.6 (scan_by_barcode 추가) / 구조 통일 작업지침 v2 적용
 #
 # ✅ 서비스 원칙
 # - 판단/조회/계산/검증/상태변경/트랜잭션/도메인 예외만 담당
@@ -25,7 +25,7 @@ from openpyxl import Workbook
 from backend.system.error_codes import DomainError
 
 PAGE_ID = "stock.status"
-PAGE_VERSION = "v1.5"
+PAGE_VERSION = "v1.6"
 
 
 # ─────────────────────────────────────────────────────────
@@ -192,6 +192,65 @@ class StatusPageService:
         return items
 
     # ─────────────────────────────────────────────────────
+    # ✅ NEW) 바코드 스캔 단건 조회 (정확 매칭)
+    # ─────────────────────────────────────────────────────
+    async def scan_by_barcode(self, *, barcode: str) -> Dict[str, Any]:
+        """
+        바코드 스캔 전용 단건 조회.
+        - barcode를 product.barcode에 '정확히(=)' 매칭
+        - 해당 상품의 sku로 stock_current를 조회하여 1건 반환
+        """
+        b = str(barcode or "").strip()
+        if not b:
+            raise DomainError(
+                "STOCK-VALID-001",
+                detail="barcode는 필수입니다.",
+                ctx={"page_id": PAGE_ID},
+            )
+
+        # product.barcode = :barcode (정확매칭)
+        # - 활성/미삭제/비묶음 조건 유지
+        # - 재고는 stock_current에서 조인
+        stmt = text(
+            f"""
+            SELECT
+                p.sku AS sku,
+                p.name AS name,
+                sc.qty_on_hand AS current_qty,
+                sc.qty_on_hand - sc.qty_pending_out AS available_qty,
+                sc.last_unit_price AS last_price
+            {self._base_sql()}
+              AND p.barcode = :barcode
+            LIMIT 1
+            """
+        )
+
+        try:
+            result = await _execute(self.session, stmt, {"barcode": b})
+            row = result.mappings().first()
+        except Exception as exc:
+            raise DomainError(
+                "SYSTEM-DB-901",
+                detail=str(exc),
+                ctx={"page_id": PAGE_ID, "barcode": b},
+            )
+
+        if not row:
+            raise DomainError(
+                "STOCK-NOTFOUND-101",
+                detail="해당 바코드로 상품을 찾지 못했어요.",
+                ctx={"page_id": PAGE_ID, "barcode": b},
+            )
+
+        return {
+            "sku": row["sku"],
+            "name": row["name"],
+            "current_qty": int(row["current_qty"] or 0),
+            "available_qty": int(row["available_qty"] or 0),
+            "last_price": float(row["last_price"]) if row["last_price"] is not None else None,
+        }
+
+    # ─────────────────────────────────────────────────────
     # 1) 재고현황 목록 조회 (단일검색)
     # ─────────────────────────────────────────────────────
     async def list_items(
@@ -215,7 +274,7 @@ class StatusPageService:
         sort_info = self._resolve_sorting(sort_by, order)
         offset = (page - 1) * size_resolved
 
-        # ✅ 검색 대상에 barcode 추가
+        # ✅ 검색 대상에 barcode 포함(리스트 검색용)
         base_sql = (
             self._base_sql()
             + """

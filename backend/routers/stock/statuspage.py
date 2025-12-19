@@ -1,7 +1,7 @@
 # 📄 backend/routers/stock/statuspage.py
 # 페이지: 재고 현황(StatusPage)
 # 역할: 프론트 요청 수신 → 가드/의존성 → 서비스 호출 → 응답 포맷 래핑
-# 단계: v1.5 (get_sync_session + 공용 guard 연동 + multi 지원) / 구조 통일 작업지침 v2 적용
+# 단계: v1.6 (scan 엔드포인트 추가) / 구조 통일 작업지침 v2 적용
 #
 # ✅ 라우터 원칙
 # - 요청 받기, 인증/가드, 입력 파싱, 서비스 호출, 응답 반환, 문서화만 담당
@@ -20,14 +20,14 @@ from sqlalchemy.orm import Session
 
 from backend.system.error_codes import DomainError
 from backend.services.stock.statuspage_service import StatusPageService
-from backend.db.session import get_sync_session  # ✅ 실제 DB 세션
-from backend.security.guard import guard  # ✅ 공용 인증/권한 가드
+from backend.db.session import get_sync_session
+from backend.security.guard import guard
 
 # ─────────────────────────────────────────────────────────
 # 페이지 메타
 # ─────────────────────────────────────────────────────────
 PAGE_ID = "stock.status"
-PAGE_VERSION = "v1.5"
+PAGE_VERSION = "v1.6"
 
 ROUTE_PREFIX = "/api/stock/status"
 ROUTE_TAGS = ["statuspage"]
@@ -40,13 +40,8 @@ __all__ = ["statuspage"]
 # ─────────────────────────────────────────────────────────
 def get_service(
     user: Dict[str, Any] = Depends(guard),
-    session: Session = Depends(get_sync_session),  # ✅ 여기서 실제 세션 주입
+    session: Session = Depends(get_sync_session),
 ) -> StatusPageService:
-    """
-    서비스 DI.
-    - 공용 guard로부터 인증된 사용자 정보(user)를 받고,
-    - get_sync_session으로 DB 세션을 주입한다.
-    """
     return StatusPageService(session=session, user=user)
 
 # ─────────────────────────────────────────────────────────
@@ -89,14 +84,14 @@ class ActionType(str, Enum):
 
 class ActionRequest(BaseModel):
     action: ActionType
-
-    # adjust용
     sku: Optional[str] = None
     final_qty: Optional[int] = None
     memo: Optional[str] = None
-
-    # export용
     selected_skus: Optional[List[str]] = None
+
+
+class ScanRequest(BaseModel):
+    barcode: str = Field(..., description="스캔된 바코드 값")
 
 
 # ─────────────────────────────────────────────────────────
@@ -112,7 +107,7 @@ def ping():
     )
 
 # ─────────────────────────────────────────────────────────
-# 1️⃣ 재고현황 목록
+# 1️⃣ 재고현황 목록 (검색/리스트용)
 # ─────────────────────────────────────────────────────────
 @statuspage.get("/list", response_model=ActionResponse)
 async def list_items(
@@ -136,9 +131,23 @@ async def list_items(
 
     return ActionResponse(ok=True, data=ActionData(result=result))
 
+# ─────────────────────────────────────────────────────────
+# 2️⃣ 바코드 스캔 단건 조회 (핵심)
+# ─────────────────────────────────────────────────────────
+@statuspage.post("/scan", response_model=ActionResponse)
+async def scan_by_barcode(
+    payload: ScanRequest,
+    svc: StatusPageService = Depends(get_service),
+):
+    try:
+        result = await svc.scan_by_barcode(barcode=payload.barcode)
+    except DomainError as exc:
+        raise exc
+
+    return ActionResponse(ok=True, data=ActionData(result=result))
 
 # ─────────────────────────────────────────────────────────
-# 2️⃣ 다건 검색
+# 3️⃣ 다건 검색
 # ─────────────────────────────────────────────────────────
 @statuspage.post("/multi", response_model=ActionResponse)
 async def multi_items(
@@ -158,9 +167,8 @@ async def multi_items(
 
     return ActionResponse(ok=True, data=ActionData(result=result))
 
-
 # ─────────────────────────────────────────────────────────
-# 3️⃣ 재고 조정 / 엑셀
+# 4️⃣ 재고 조정 / 엑셀
 # ─────────────────────────────────────────────────────────
 @statuspage.post("/action", response_model=ActionResponse)
 async def do_action(
@@ -170,18 +178,15 @@ async def do_action(
     try:
         if payload.action == ActionType.ADJUST:
             result = await svc.adjust(payload=payload.dict())
-
         elif payload.action == ActionType.EXPORT:
             skus = payload.selected_skus or []
             result = await svc.export_items(selected_skus=skus)
-
         else:
             raise DomainError(
                 "STOCK-VALID-001",
                 detail="지원하지 않는 액션입니다.",
                 ctx={"page_id": PAGE_ID, "action": payload.action},
             )
-
     except DomainError as exc:
         raise exc
 
