@@ -1,14 +1,10 @@
-// C:\dev\stock-app\stock-gui\src\pages\product\Create\CreatePage.tsx
-// 상품관리 > 상품 등록 페이지
-// - 상단: 단일 등록 폼
-// - 하단: 조회 전용 테이블(재고현황 스타일)
-// - 선택 수정: 모달
-// 변경(2025-12-15):
-// - 중량(g) 컬럼/입력/수정 기능 제거 (UI 단순화)
-// - 신규 등록 payload는 weight_g=0 고정(백엔드/타입 호환 목적)
-// 변경(2025-12-18):
-// - ✅ 대량등록 양식(xlsx) 다운로드 버튼 추가 (파일명 자동: ..._YYYYMMDD_01.xlsx)
-// - ✅ 템플릿 xlsx 업로드 파싱 지원(제목/병합셀 무시, 헤더+번호 기준 데이터 추출)
+// C:\dev\stock-app\stock-gui\src\pages\Product\Create\CreatePage.tsx
+// 상품관리 > 상품 등록/조회 페이지
+// ✅ 변경(2025-12-26):
+// - 상단 단일 등록 폼/등록 버튼/등록 로직 제거
+// - 상단을 검색폼으로 변경
+// - ✅ 대량등록(템플릿 다운로드/엑셀 업로드) 버튼은 유지
+// - 하단: 조회 전용 테이블 + 묶음설정/선택수정
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
@@ -16,7 +12,6 @@ import * as XLSX from "xlsx";
 import {
   productsAdapter,
   type ProductListItem,
-  type ProductCreatePayload,
   type ProductUpdatePayload,
 } from "@/api/adapters/products.adapter";
 import { handleError } from "@/utils/handleError";
@@ -45,7 +40,7 @@ type BulkRow = {
   sku: string;
   name: string;
   barcode?: string;
-  weight_g?: number; // 템플릿에는 있으나, 현재 단일등록은 weight_g=0 고정
+  weight_g?: number;
   unit_price?: number;
   status?: boolean;
 };
@@ -69,16 +64,6 @@ const toFloat = (v: number | string | "") => {
 const fmtInt = (n: number) =>
   new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 0 }).format(n);
 
-const makeEmptyRow = (): RowItem => ({
-  id: uuid(),
-  sku: "",
-  name: "",
-  unitPrice: "",
-  barcode: "",
-  status: true,
-  bundleQty: 1,
-});
-
 const makeEmptyBundleRow = (): BundleRow => ({
   id: uuid(),
   componentSku: "",
@@ -86,7 +71,7 @@ const makeEmptyBundleRow = (): BundleRow => ({
 });
 
 // ───────────────────────────────────────────────
-// ✅ 대량등록 양식(xlsx) 다운로드 (public 정적파일)
+// ✅ 대량등록 양식(xlsx) 다운로드
 // ───────────────────────────────────────────────
 
 const BULK_TEMPLATE_URL = "/templates/상품대량등록_양식.xlsx";
@@ -120,9 +105,6 @@ async function downloadXlsxWithName(url: string, baseName: string, seq: string) 
 
 // ───────────────────────────────────────────────
 // ✅ 템플릿 xlsx 파서
-// - 제목/병합셀/설명줄 무시
-// - 헤더: 번호, SKU, 상품명, 바코드, 중량, 입고단가 줄 탐색
-// - 데이터: "번호"가 숫자인 행만 추출
 // ───────────────────────────────────────────────
 
 function cellStr(v: any) {
@@ -175,14 +157,14 @@ async function parseProductTemplateXlsx(file: File): Promise<BulkRow[]> {
     const r = rows[i] ?? [];
 
     const no = cellStr(r[cNo]);
-    if (!/^\d+$/.test(no)) continue; // 번호가 숫자인 행만
+    if (!/^\d+$/.test(no)) continue;
 
     const sku = cellStr(r[cSku]);
     const name = cellStr(r[cName]);
-    if (!sku || !name) continue; // 필수
+    if (!sku || !name) continue;
 
     const barcode = cellStr(r[cBarcode]) || undefined;
-    const weight_g = cellNum(r[cWeight]); // 템플릿 값 그대로 읽되, 서버가 무시해도 OK
+    const weight_g = cellNum(r[cWeight]);
     const unit_price = cellNum(r[cPrice]);
 
     out.push({
@@ -204,8 +186,6 @@ function csvEscape(v: any) {
   return s;
 }
 
-// 기존 bulkUploadFromText를 살리기 위한 CSV 텍스트 생성
-// (백엔드가 기대하는 포맷이 따로면, 여기 헤더/컬럼만 맞추면 됨)
 function buildBulkCsvText(items: BulkRow[]) {
   const header = ["sku", "name", "barcode", "weight_g", "unit_price", "status"].join(
     ",",
@@ -230,25 +210,11 @@ const mapFromAdapter = (p: ProductListItem): RowItem => ({
   name: p.name,
   unitPrice: p.unit_price ?? 0,
   barcode: p.barcode ?? "",
-  status: p.status ?? p.is_active ?? true, // ← 핵심
+  status: p.status ?? p.is_active ?? true,
   bundleQty: p.bundle_qty ?? 1,
 });
 
-// 생성 payload
-const makeCreatePayloadFromForm = (r: RowItem): ProductCreatePayload => ({
-  sku: r.sku.trim(),
-  name: r.name.trim(),
-  barcode: r.barcode.trim(),
-  status: !!r.status,
-  unit_price: toFloat(r.unitPrice),
-
-  // ✅ 중량 입력 제거: 백엔드/타입 호환을 위해 0 고정
-  weight_g: 0,
-
-  bundle_qty: 1,
-});
-
-// 수정 payload (중량 제거)
+// 수정 payload
 const makeUpdatePayloadFromEdit = (
   name: string,
   barcode: string,
@@ -261,20 +227,25 @@ const makeUpdatePayloadFromEdit = (
   };
 };
 
-// ───────────────────────────────────────────────
-// 컴포넌트
-// ───────────────────────────────────────────────
-
 export default function CreatePage() {
   const isAdmin = true;
 
-  // 상단 단일 등록
-  const [formRow, setFormRow] = useState<RowItem>(makeEmptyRow());
+  // ✅ 상단 검색 폼
+  const [search, setSearch] = useState({
+    sku: "",
+    name: "",
+    barcode: "",
+    status: "all" as "all" | "active" | "inactive",
+  });
+
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // 하단 조회용 표
-  const [rows, setRows] = useState<RowItem[]>([]);
+  // ✅ 서버에서 받은 전체 목록
+  const [allRows, setAllRows] = useState<RowItem[]>([]);
+
+  // ✅ 현재 화면 rows 기준 체크
   const [checked, setChecked] = useState<Set<string>>(new Set());
+
   const pasteTargetRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -298,92 +269,39 @@ export default function CreatePage() {
     loadList();
   }, []);
 
-  // ───────────────────────────────────────────────
-  // 목록 조회
-  // ───────────────────────────────────────────────
-
   async function loadList() {
     const res = await productsAdapter.fetchList();
     if (!res.ok || !res.data) {
       console.error("상품 목록 조회 실패", res.error);
-      if (!res.ok && res.error) {
-        handleError(res.error);
-      }
-      setRows([]);
+      if (!res.ok && res.error) handleError(res.error);
+      setAllRows([]);
       setChecked(new Set());
       return;
     }
     const items = res.data.items.map(mapFromAdapter);
-    setRows(items);
+    setAllRows(items);
     setChecked(new Set());
   }
 
-  // 상단 등록 셀 변경
-  const onFormCellChange = (
-    field: keyof Omit<RowItem, "id">,
-    value: string | boolean,
-  ) => {
-    setFormRow((prev) => {
-      if (field === "unitPrice") {
-        const raw = (value as string).replace(/[^\d.]/g, "");
-        return { ...prev, unitPrice: raw === "" ? "" : Number(raw) };
-      }
-      if (field === "status") {
-        return { ...prev, status: Boolean(value) };
-      }
-      if (field === "bundleQty") {
-        const raw = (value as string).replace(/[^\d]/g, "");
-        return {
-          ...prev,
-          bundleQty: raw === "" ? "" : Math.max(1, Number(raw)),
-        };
-      }
-      return { ...prev, [field]: value as string };
+  // ✅ 검색 필터(클라이언트)
+  const rows = useMemo(() => {
+    const skuQ = search.sku.trim().toLowerCase();
+    const nameQ = search.name.trim().toLowerCase();
+    const bcQ = search.barcode.trim().toLowerCase();
+    const statusQ = search.status;
+
+    return allRows.filter((r) => {
+      if (skuQ && !r.sku.toLowerCase().includes(skuQ)) return false;
+      if (nameQ && !r.name.toLowerCase().includes(nameQ)) return false;
+      if (bcQ && !(r.barcode ?? "").toLowerCase().includes(bcQ)) return false;
+
+      if (statusQ === "active" && !r.status) return false;
+      if (statusQ === "inactive" && r.status) return false;
+
+      return true;
     });
-  };
+  }, [allRows, search]);
 
-  // 상단 등록 검증
-  const validateOne = (r: RowItem) => {
-    if (!r.sku.trim()) return "SKU는 필수예요.";
-    if (!r.name.trim()) return "상품명은 필수예요.";
-    if (toFloat(r.unitPrice) < 0) return "최근입고단가는 0 이상이어야 해요.";
-    return "";
-  };
-
-  // 상단 등록 실행
-  const onSubmitSingle = async () => {
-    if (!isAdmin) return;
-
-    const msg = validateOne(formRow);
-    if (msg) {
-      alert(msg);
-      return;
-    }
-
-    const payload = makeCreatePayloadFromForm(formRow);
-
-    try {
-      setIsSubmitting(true);
-      const res = await productsAdapter.createOne(payload);
-      if (!res.ok) {
-        console.error("상품 단일 등록 실패", res.error);
-        if (res.error) {
-          handleError(res.error);
-        }
-        return;
-      }
-      alert("상품 한 건이 등록됐어요.");
-      setFormRow(makeEmptyRow());
-      await loadList();
-    } catch (e: any) {
-      console.error(e);
-      alert(`등록 중 오류가 발생했어요.\n사유: ${String(e?.message || e)}`);
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  // 체크박스
   const toggleOne = (id: string) => {
     setChecked((prev) => {
       const next = new Set(prev);
@@ -395,12 +313,12 @@ export default function CreatePage() {
 
   const toggleAll = () => {
     setChecked((prev) => {
-      if (prev.size === rows.length) return new Set();
+      if (rows.length > 0 && prev.size === rows.length) return new Set();
       return new Set(rows.map((r) => r.id));
     });
   };
 
-  // 묶음설정 모달 열기 (선택된 1건 기준)
+  // 묶음설정 모달 열기
   const onBulkBundle = () => {
     if (!isAdmin) return;
 
@@ -426,7 +344,6 @@ export default function CreatePage() {
     setBundleModalOpen(true);
   };
 
-  // 묶음설정 행 편집
   const onChangeBundleCell = (
     id: string,
     field: "componentSku" | "componentQty",
@@ -443,9 +360,7 @@ export default function CreatePage() {
 
   const onRemoveBundleRow = (id: string) => {
     setBundleRows((prev) => {
-      if (prev.length === 1) {
-        return [makeEmptyBundleRow()];
-      }
+      if (prev.length === 1) return [makeEmptyBundleRow()];
       return prev.filter((row) => row.id !== id);
     });
   };
@@ -466,10 +381,7 @@ export default function CreatePage() {
       .map((row) => {
         const sku = row.componentSku.trim();
         const qty = toInt(row.componentQty);
-        return {
-          component_sku: sku,
-          component_qty: qty,
-        };
+        return { component_sku: sku, component_qty: qty };
       })
       .filter((item) => item.component_sku && item.component_qty > 0);
 
@@ -485,9 +397,7 @@ export default function CreatePage() {
 
     if (!res.ok) {
       console.error("묶음설정 저장 실패", res.error);
-      if (res.error) {
-        handleError(res.error);
-      }
+      if (res.error) handleError(res.error);
       return;
     }
 
@@ -499,7 +409,7 @@ export default function CreatePage() {
     await loadList();
   };
 
-  // 선택 수정 모달 오픈
+  // 선택 수정 모달
   const onOpenEditModal = () => {
     if (!isAdmin) return;
     if (checked.size === 0) return;
@@ -517,8 +427,6 @@ export default function CreatePage() {
     setEditSku(target.sku);
     setEditName(target.name);
     setEditBarcode(target.barcode);
-
-    // ✅ 활성/비활성 상태도 같이 세팅
     setEditIsActive(target.status);
 
     setEditModalOpen(true);
@@ -546,9 +454,7 @@ export default function CreatePage() {
     const res = await productsAdapter.updateOne(editSku, payload);
     if (!res.ok) {
       console.error("상품 수정 실패", res.error);
-      if (res.error) {
-        handleError(res.error);
-      }
+      if (res.error) handleError(res.error);
       return;
     }
 
@@ -557,7 +463,7 @@ export default function CreatePage() {
     await loadList();
   };
 
-  // ✅ 양식 다운로드
+  // ✅ 템플릿 다운로드
   const onDownloadBulkTemplate = async () => {
     try {
       await downloadXlsxWithName(
@@ -571,7 +477,7 @@ export default function CreatePage() {
     }
   };
 
-  // ✅ 업로드
+  // ✅ 엑셀 업로드
   const onClickBulkUpload = () => {
     if (!isAdmin) return;
     fileInputRef.current?.click();
@@ -587,7 +493,6 @@ export default function CreatePage() {
     try {
       let text = "";
 
-      // (1) 템플릿 xlsx/xls → 파싱 → CSV 생성
       if (name.endsWith(".xlsx") || name.endsWith(".xls")) {
         const items = await parseProductTemplateXlsx(file);
         if (items.length === 0) {
@@ -596,10 +501,10 @@ export default function CreatePage() {
         }
         text = buildBulkCsvText(items);
       } else {
-        // (2) 기존 방식: csv/tsv/txt 그대로 전송
         text = await file.text();
       }
 
+      setIsSubmitting(true);
       const res = await productsAdapter.bulkUploadFromText(text);
       if (!res.ok) {
         console.error("대량등록 실패", res.error);
@@ -613,26 +518,25 @@ export default function CreatePage() {
     } catch (err: any) {
       console.error(err);
       alert(`대량등록 중 오류가 발생했어요.\n사유: ${String(err?.message || err)}`);
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
-  // 하단 합계
-  const summary = useMemo(() => {
-    const count = rows.length;
-    return { count };
-  }, [rows]);
+  const summary = useMemo(() => ({ count: rows.length }), [rows]);
 
   const displayUnitPrice = (v: RowItem["unitPrice"]) =>
     v === "" ? "" : fmtInt(Number(v));
   const displayBundle = (v: RowItem["bundleQty"]) => (v === "" ? "" : String(v));
 
-  // ───────────────────────────────────────────────
-  // 렌더
-  // ───────────────────────────────────────────────
+  const onResetSearch = () => {
+    setSearch({ sku: "", name: "", barcode: "", status: "all" });
+    setChecked(new Set());
+  };
 
   return (
     <div className="w-full h-full flex flex-col gap-4 p-3">
-      {/* 상단 우측 액션바 */}
+      {/* 상단 우측 액션바 (대량등록 유지) */}
       <div className="flex items-center justify-end gap-2">
         <input
           ref={fileInputRef}
@@ -665,30 +569,25 @@ export default function CreatePage() {
         </button>
 
         <button
-          onClick={onSubmitSingle}
-          disabled={!isAdmin || isSubmitting}
-          className={`px-3 py-2 rounded-lg border text-sm font-semibold ${
-            isSubmitting
-              ? "bg-gray-300 text-gray-600 cursor-wait"
-              : "bg-black text-white"
-          }`}
-          title="상단 등록표의 1건을 등록"
+          onClick={onResetSearch}
+          disabled={isSubmitting}
+          className="px-3 py-2 rounded-lg border text-sm"
+          title="검색 조건 초기화"
         >
-          {isSubmitting ? "등록 중..." : "등록"}
+          검색 초기화
         </button>
       </div>
 
-      {/* 상단: 단일 등록용 표 */}
+      {/* 상단: 검색 폼 */}
       <div className="rounded-2xl border bg-white shadow-sm">
         <div className="overflow-auto">
           <table className="min-w-full table-fixed text-sm">
             <thead>
               <tr className="text-left text-sm text-gray-600 border-b bg-gray-50">
-                <th className="px-4 py-3 w-[220px] text-center">SKU</th>
-                <th className="px-4 py-3 text-center">상품명</th>
-                <th className="px-4 py-3 w-[140px] text-right">최근입고단가</th>
-                <th className="px-4 py-3 w-[180px]">바코드</th>
-                <th className="px-4 py-3 w-[110px] text-center">상태</th>
+                <th className="px-4 py-3 w-[220px] text-center">SKU 검색</th>
+                <th className="px-4 py-3 text-center">상품명 검색</th>
+                <th className="px-4 py-3 w-[180px]">바코드 검색</th>
+                <th className="px-4 py-3 w-[170px] text-center">상태</th>
               </tr>
             </thead>
             <tbody>
@@ -696,65 +595,67 @@ export default function CreatePage() {
                 <td className="px-4 py-2 text-center">
                   <input
                     type="text"
-                    value={formRow.sku}
-                    onChange={(e) => onFormCellChange("sku", e.target.value)}
+                    value={search.sku}
+                    onChange={(e) => setSearch((p) => ({ ...p, sku: e.target.value }))}
                     className="w-full border rounded-lg px-2 py-1 text-sm font-mono text-center"
-                    disabled={isSubmitting || !isAdmin}
+                    disabled={isSubmitting}
+                    placeholder="예: SKU-001"
                   />
                 </td>
                 <td className="px-4 py-2 text-center">
                   <input
                     type="text"
-                    value={formRow.name}
-                    onChange={(e) => onFormCellChange("name", e.target.value)}
+                    value={search.name}
+                    onChange={(e) => setSearch((p) => ({ ...p, name: e.target.value }))}
                     className="w-full border rounded-lg px-2 py-1 text-sm text-center"
-                    disabled={isSubmitting || !isAdmin}
-                  />
-                </td>
-                <td className="px-4 py-2">
-                  <input
-                    inputMode="decimal"
-                    value={formRow.unitPrice}
-                    onChange={(e) => onFormCellChange("unitPrice", e.target.value)}
-                    className="w-full border rounded-lg px-2 py-1 text-sm text-right"
-                    placeholder="0"
-                    disabled={isSubmitting || !isAdmin}
+                    disabled={isSubmitting}
+                    placeholder="예: 닭가슴살"
                   />
                 </td>
                 <td className="px-4 py-2">
                   <input
                     type="text"
-                    value={formRow.barcode}
-                    onChange={(e) => onFormCellChange("barcode", e.target.value)}
+                    value={search.barcode}
+                    onChange={(e) =>
+                      setSearch((p) => ({ ...p, barcode: e.target.value }))
+                    }
                     className="w-full border rounded-lg px-2 py-1 text-sm"
-                    disabled={isSubmitting || !isAdmin}
+                    disabled={isSubmitting}
+                    placeholder="예: 880..."
                   />
                 </td>
                 <td className="px-4 py-2 text-center">
-                  <label className="inline-flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={formRow.status}
-                      onChange={(e) => onFormCellChange("status", e.target.checked)}
-                      disabled={isSubmitting || !isAdmin}
-                    />
-                    <span>{formRow.status ? "사용" : "미사용"}</span>
-                  </label>
+                  <select
+                    value={search.status}
+                    onChange={(e) =>
+                      setSearch((p) => ({
+                        ...p,
+                        status: e.target.value as "all" | "active" | "inactive",
+                      }))
+                    }
+                    className="w-full border rounded-lg px-2 py-1 text-sm text-center"
+                    disabled={isSubmitting}
+                  >
+                    <option value="all">전체</option>
+                    <option value="active">사용</option>
+                    <option value="inactive">미사용</option>
+                  </select>
                 </td>
               </tr>
             </tbody>
           </table>
         </div>
-        <div className="px-4 py-3 border-t text-sm flex justify-between">
+
+        <div className="px-4 py-3 border-t text-sm flex justify-between items-center">
           <div className="text-gray-500">
-            상단 표에 1건 입력 후 우측 상단의 <strong>등록</strong> 버튼을 눌러 저장하세요.
+            검색어를 입력하면 하단 목록이 즉시 필터링됩니다. (등록은 엑셀 대량등록만 사용)
           </div>
           <button
-            onClick={() => setFormRow(makeEmptyRow())}
-            disabled={isSubmitting || !isAdmin}
+            onClick={loadList}
+            disabled={isSubmitting}
             className="px-3 py-2 rounded-lg border text-sm"
           >
-            초기화
+            목록 새로고침
           </button>
         </div>
       </div>
@@ -762,7 +663,7 @@ export default function CreatePage() {
       {/* 하단: 조회 전용 테이블 */}
       <div className="rounded-2xl border border-gray-200 bg-white shadow-sm overflow-hidden flex flex-col max-h-[520px]">
         <div className="border-b border-gray-100 px-4 py-3 text-sm text-gray-600">
-          하단 표는 조회·조정용입니다. 셀은 수정 불가이며, 선택 후 상단 버튼으로 묶음설정·선택수정·선택삭제를 할 수 있어요.
+          하단 표는 조회·조정용입니다. 셀은 수정 불가이며, 선택 후 상단 버튼으로 묶음설정·선택수정을 할 수 있어요.
         </div>
 
         {/* 버튼 그룹 */}
@@ -874,7 +775,7 @@ export default function CreatePage() {
                     colSpan={7}
                     className="px-4 py-10 text-center text-sm text-gray-500"
                   >
-                    등록된 상품이 없습니다.
+                    조건에 맞는 상품이 없습니다.
                   </td>
                 </tr>
               )}
@@ -1040,17 +941,6 @@ export default function CreatePage() {
                       </td>
                     </tr>
                   ))}
-
-                  {bundleRows.length === 0 && (
-                    <tr>
-                      <td
-                        colSpan={3}
-                        className="px-4 py-6 text-center text-sm text-gray-500"
-                      >
-                        구성품 행이 없습니다. 아래 버튼으로 행을 추가해 주세요.
-                      </td>
-                    </tr>
-                  )}
                 </tbody>
               </table>
             </div>

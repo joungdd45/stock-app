@@ -1,225 +1,459 @@
 # 📄 backend/services/stock/statuspage_service.py
 # 페이지: 재고 현황(StatusPage)
-# 역할: 재고 목록 조회, 다건검색, 엑셀 생성, 재고 절대값 조정 (+ 바코드 스캔 단건조회)
-# 단계: v1.6 (scan_by_barcode 추가) / 구조 통일 작업지침 v2 적용
+# 역할: 재고현황 조회/스캔/엑셀(xlsx)/재고조정(실사)
+# 단계: v1.8 (xlsx 다운로드 전용 export 추가)
 #
-# ✅ 서비스 원칙
-# - 판단/조회/계산/검증/상태변경/트랜잭션/도메인 예외만 담당
-# - HTTP 상태, JSON 응답 포맷, Swagger 문서화는 담당하지 않음
-# - 문제 발생 시 DomainError(code, detail, ctx, ...)만 던진다.
+# ✅ 변경 요약(v1.8)
+# - 운영용 xlsx 다운로드: export_operational_xlsx_bytes(sku, selected_skus)
+# - 기존 action(export)은 유지(호환) / 프론트는 export-xlsx 사용 권장
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, List
 from dataclasses import dataclass
-from datetime import datetime
-from io import BytesIO
-import base64
+from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy.orm import Session
-from sqlalchemy.ext.asyncio import AsyncSession
+import anyio
 from sqlalchemy import text
-
-from openpyxl import Workbook
+from sqlalchemy.orm import Session
 
 from backend.system.error_codes import DomainError
 
 PAGE_ID = "stock.status"
-PAGE_VERSION = "v1.6"
+PAGE_VERSION = "v1.8"
 
 
-# ─────────────────────────────────────────────────────────
-# 내부 유틸 — 세션 어댑터 / 공통 execute
-# ─────────────────────────────────────────────────────────
-def _get_session_adapter(session: Any) -> Any:
-    if isinstance(session, (Session, AsyncSession)):
-        return session
-
-    raise DomainError(
-        "SYSTEM-DB-901",
-        detail="지원하지 않는 DB 세션 타입입니다.",
-        ctx={"page_id": PAGE_ID, "session_type": str(type(session))},
-    )
+async def _run_sync(fn):
+    return await anyio.to_thread.run_sync(fn)
 
 
-async def _execute(session: Any, stmt, params: Optional[Dict[str, Any]] = None):
+async def _execute(session: Session, stmt, params: Optional[Dict[str, Any]] = None):
     params = params or {}
-    if isinstance(session, AsyncSession):
-        return await session.execute(stmt, params)
-    return session.execute(stmt, params)
+    return await _run_sync(lambda: session.execute(stmt, params))
 
 
-async def _commit(session: Any) -> None:
-    if isinstance(session, AsyncSession):
-        await session.commit()
-    else:
-        session.commit()
+async def _commit(session: Session):
+    return await _run_sync(session.commit)
 
 
-async def _rollback(session: Any) -> None:
-    if isinstance(session, AsyncSession):
-        await session.rollback()
-    else:
-        session.rollback()
+async def _rollback(session: Session):
+    return await _run_sync(session.rollback)
 
 
-def _get_user_id(user: Dict[str, Any]) -> str:
-    val = user.get("user_id")
-    if val is None:
-        return ""
-    return str(val)
+def _safe_user_id(user: Dict[str, Any]) -> str:
+    return str(user.get("id") or user.get("user_id") or user.get("username") or "system")
 
 
-# ─────────────────────────────────────────────────────────
-# 서비스 결과 모델
-# ─────────────────────────────────────────────────────────
 @dataclass
-class AdjustResult:
-    sku: str
-    before_qty: int
-    after_qty: int
-    current_qty: int
-    available_qty: int
-    last_price: Optional[float]
-
-
-# ─────────────────────────────────────────────────────────
-# 서비스 클래스
-# ─────────────────────────────────────────────────────────
 class StatusPageService:
-    page_id: str = PAGE_ID
-    page_version: str = PAGE_VERSION
+    session: Session
+    user: Dict[str, Any]
 
-    def __init__(self, *, session: Any, user: Dict[str, Any]):
-        self.session = _get_session_adapter(session)
-        self.user = user
-
-    # ─────────────────────────────────────────────────────
-    # 내부 헬퍼: 페이지 크기 결정
-    # ─────────────────────────────────────────────────────
-    async def _resolve_page_size(self, size: int) -> int:
-        if size and size > 0:
-            return size
-
-        user_id = _get_user_id(self.user)
-        page_key = PAGE_ID
-
-        stmt = text(
-            """
-            SELECT page_size
-            FROM user_page_settings
-            WHERE user_id = :user_id
-              AND page_key = :page_key
-              AND deleted_at IS NULL
-            """
-        )
-        result = await _execute(
-            self.session,
-            stmt,
-            {"user_id": user_id, "page_key": page_key},
-        )
-        row = result.first()
-        if row and row[0]:
-            return int(row[0])
-
-        return 10
-
-    # ─────────────────────────────────────────────────────
-    # 내부 헬퍼: 정렬 기준 검증
-    # ─────────────────────────────────────────────────────
-    def _resolve_sorting(
-        self,
-        sort_by: Optional[str],
-        order: Optional[str],
-    ) -> Dict[str, str]:
-        sort_column_map: Dict[str, str] = {
-            "sku": "p.sku",
-            "name": "p.name",
-            "current_qty": "sc.qty_on_hand",
-            "available_qty": "sc.qty_on_hand - sc.qty_pending_out",
-            "last_price": "sc.last_unit_price",
-        }
-
-        sort_key = (sort_by or "sku").lower()
-        if sort_key not in sort_column_map:
-            raise DomainError(
-                "STOCK-VALID-001",
-                detail="정렬 기준이 올바르지 않습니다.",
-                ctx={"page_id": PAGE_ID, "sort_by": sort_by},
-            )
-
-        order_key = (order or "asc").lower()
-        if order_key not in ("asc", "desc"):
-            raise DomainError(
-                "STOCK-VALID-001",
-                detail="정렬 방향이 올바르지 않습니다.",
-                ctx={"page_id": PAGE_ID, "order": order},
-            )
-
-        return {
-            "order_by_expr": sort_column_map[sort_key],
-            "order_dir": "ASC" if order_key == "asc" else "DESC",
-        }
-
-    # ─────────────────────────────────────────────────────
-    # 공통 조회 베이스 SQL
-    # ─────────────────────────────────────────────────────
-    def _base_sql(self) -> str:
+    # ─────────────────────────────────────────────
+    # SQL 베이스
+    # ─────────────────────────────────────────────
+    def _base_sql_product(self) -> str:
+        # 실사용 검색/스캔용: product 기준(원장 없어도 조회 가능)
         return """
-            FROM stock_current sc
-            JOIN product p ON p.sku = sc.sku
-            WHERE sc.deleted_at IS NULL
-              AND p.deleted_at IS NULL
-              AND p.is_active = TRUE
-              AND (p.is_bundle IS NULL OR p.is_bundle = FALSE)
+        FROM product p
+        LEFT JOIN stock_current sc
+               ON sc.sku = p.sku
+              AND sc.deleted_at IS NULL
+        WHERE p.deleted_at IS NULL
+          AND p.is_active = TRUE
         """
 
-    # ─────────────────────────────────────────────────────
-    # 결과 매핑
-    # ─────────────────────────────────────────────────────
-    def _map_rows(self, rows) -> List[Dict[str, Any]]:
-        items: List[Dict[str, Any]] = []
+    def _base_sql_operational(self) -> str:
+        # 운영용 리스트: 원장 발생 SKU만
+        return """
+        FROM (
+            SELECT DISTINCT sku
+            FROM inventory_ledger
+        ) ls
+        JOIN product p
+          ON p.sku = ls.sku
+         AND p.deleted_at IS NULL
+         AND p.is_active = TRUE
+        LEFT JOIN stock_current sc
+               ON sc.sku = p.sku
+              AND sc.deleted_at IS NULL
+        WHERE 1=1
+        """
+
+    # ─────────────────────────────────────────────
+    # 0) (호환 유지) 기존 list_items 시그니처
+    # ─────────────────────────────────────────────
+    async def list_items(
+        self,
+        *,
+        q: Optional[str],
+        page: int,
+        size: int,
+        sort_by: Optional[str] = "sku",
+        order: Optional[str] = "asc",
+    ) -> Dict[str, Any]:
+        return await self.list_operational(
+            sku=(q or "").strip() or None,
+            page=page,
+            size=size,
+            sort_by=sort_by,
+            order=order,
+        )
+
+    # ─────────────────────────────────────────────
+    # 1) 운영용 리스트: 원장 발생 SKU만 + SKU 검색만
+    # ─────────────────────────────────────────────
+    async def list_operational(
+        self,
+        *,
+        sku: Optional[str],
+        page: int,
+        size: int,
+        sort_by: Optional[str] = "sku",
+        order: Optional[str] = "asc",
+    ) -> Dict[str, Any]:
+        if page <= 0 or size <= 0:
+            raise DomainError(
+                "STOCK-VALID-001",
+                detail="page/size 값이 올바르지 않습니다.",
+                ctx={"page_id": PAGE_ID, "page": page, "size": size},
+            )
+
+        sku_kw = (sku or "").strip()
+        where_extra = ""
+        params: Dict[str, Any] = {"limit": size, "offset": (page - 1) * size}
+
+        if sku_kw:
+            where_extra = " AND (p.sku ILIKE :kw) "
+            params["kw"] = f"%{sku_kw}%"
+
+        sort_col = "p.sku"
+        if sort_by == "sku":
+            sort_col = "p.sku"
+        sort_order = "ASC" if (order or "asc").lower() == "asc" else "DESC"
+
+        count_stmt = text(
+            f"""
+            SELECT COUNT(1) AS cnt
+            {self._base_sql_operational()}
+            {where_extra}
+            """
+        )
+
+        list_stmt = text(
+            f"""
+            SELECT
+                p.sku AS sku,
+                p.name AS name,
+                COALESCE(sc.qty_on_hand, 0) AS current_qty,
+                COALESCE(sc.qty_on_hand, 0) - COALESCE(sc.qty_pending_out, 0) AS available_qty,
+                sc.last_unit_price AS last_price
+            {self._base_sql_operational()}
+            {where_extra}
+            ORDER BY {sort_col} {sort_order}
+            LIMIT :limit OFFSET :offset
+            """
+        )
+
+        try:
+            cnt_res = await _execute(self.session, count_stmt, params)
+            count = int((cnt_res.mappings().first() or {}).get("cnt") or 0)
+
+            res = await _execute(self.session, list_stmt, params)
+            rows = res.mappings().all()
+        except Exception as exc:
+            raise DomainError("SYSTEM-DB-901", detail=str(exc), ctx={"page_id": PAGE_ID, "sku": sku_kw})
+
+        items = []
         for r in rows:
             items.append(
                 {
                     "sku": r["sku"],
                     "name": r["name"],
-                    "current_qty": int(r["current_qty"]) if r["current_qty"] is not None else 0,
-                    "available_qty": int(r["available_qty"]) if r["available_qty"] is not None else 0,
+                    "current_qty": int(r["current_qty"] or 0),
+                    "available_qty": int(r["available_qty"] or 0),
                     "last_price": float(r["last_price"]) if r["last_price"] is not None else None,
                 }
             )
-        return items
 
-    # ─────────────────────────────────────────────────────
-    # ✅ NEW) 바코드 스캔 단건 조회 (정확 매칭)
-    # ─────────────────────────────────────────────────────
-    async def scan_by_barcode(self, *, barcode: str) -> Dict[str, Any]:
-        """
-        바코드 스캔 전용 단건 조회.
-        - barcode를 product.barcode에 '정확히(=)' 매칭
-        - 해당 상품의 sku로 stock_current를 조회하여 1건 반환
-        """
-        b = str(barcode or "").strip()
-        if not b:
+        return {"items": items, "count": count, "page": page, "size": size}
+
+    # ─────────────────────────────────────────────
+    # 2) 실사용 검색: product 기준 + 상품명/SKU 검색
+    # ─────────────────────────────────────────────
+    async def search_products(
+        self,
+        *,
+        q: Optional[str],
+        page: int,
+        size: int,
+        sort_by: Optional[str] = "sku",
+        order: Optional[str] = "asc",
+    ) -> Dict[str, Any]:
+        if page <= 0 or size <= 0:
             raise DomainError(
                 "STOCK-VALID-001",
-                detail="barcode는 필수입니다.",
-                ctx={"page_id": PAGE_ID},
+                detail="page/size 값이 올바르지 않습니다.",
+                ctx={"page_id": PAGE_ID, "page": page, "size": size},
             )
 
-        # product.barcode = :barcode (정확매칭)
-        # - 활성/미삭제/비묶음 조건 유지
-        # - 재고는 stock_current에서 조인
+        keyword = (q or "").strip()
+        where_extra = ""
+        params: Dict[str, Any] = {"limit": size, "offset": (page - 1) * size}
+
+        if keyword:
+            where_extra = " AND (p.sku ILIKE :kw OR p.name ILIKE :kw) "
+            params["kw"] = f"%{keyword}%"
+
+        sort_col = "p.sku"
+        if sort_by == "name":
+            sort_col = "p.name"
+        elif sort_by == "current_qty":
+            sort_col = "COALESCE(sc.qty_on_hand, 0)"
+        sort_order = "ASC" if (order or "asc").lower() == "asc" else "DESC"
+
+        count_stmt = text(
+            f"""
+            SELECT COUNT(1) AS cnt
+            {self._base_sql_product()}
+            {where_extra}
+            """
+        )
+
+        list_stmt = text(
+            f"""
+            SELECT
+                p.sku AS sku,
+                p.name AS name,
+                COALESCE(sc.qty_on_hand, 0) AS current_qty,
+                COALESCE(sc.qty_on_hand, 0) - COALESCE(sc.qty_pending_out, 0) AS available_qty,
+                sc.last_unit_price AS last_price
+            {self._base_sql_product()}
+            {where_extra}
+            ORDER BY {sort_col} {sort_order}
+            LIMIT :limit OFFSET :offset
+            """
+        )
+
+        try:
+            cnt_res = await _execute(self.session, count_stmt, params)
+            count = int((cnt_res.mappings().first() or {}).get("cnt") or 0)
+
+            res = await _execute(self.session, list_stmt, params)
+            rows = res.mappings().all()
+        except Exception as exc:
+            raise DomainError("SYSTEM-DB-901", detail=str(exc), ctx={"page_id": PAGE_ID, "q": keyword})
+
+        items = []
+        for r in rows:
+            items.append(
+                {
+                    "sku": r["sku"],
+                    "name": r["name"],
+                    "current_qty": int(r["current_qty"] or 0),
+                    "available_qty": int(r["available_qty"] or 0),
+                    "last_price": float(r["last_price"]) if r["last_price"] is not None else None,
+                }
+            )
+
+        return {"items": items, "count": count, "page": page, "size": size}
+
+    # ─────────────────────────────────────────────
+    # 2-1) ✅ 운영용 xlsx 다운로드 (bytes 반환)
+    #   - 기준: 운영용(원장 발생 SKU만)
+    #   - 필터: sku 부분검색 + (옵션) selected_skus 정확일치 목록
+    # ─────────────────────────────────────────────
+    async def export_operational_xlsx_bytes(
+        self,
+        *,
+        sku: Optional[str] = None,
+        selected_skus: Optional[List[str]] = None,
+    ) -> Tuple[bytes, str]:
+        # openpyxl은 가벼운 편이라 여기서 import
+        from io import BytesIO
+        from datetime import datetime
+        from openpyxl import Workbook
+        from openpyxl.utils import get_column_letter
+
+        sku_kw = (sku or "").strip()
+        clean_skus = [s.strip() for s in (selected_skus or []) if s and s.strip()]
+        where_extra = ""
+        params: Dict[str, Any] = {}
+
+        if sku_kw:
+            where_extra += " AND (p.sku ILIKE :kw) "
+            params["kw"] = f"%{sku_kw}%"
+
+        if clean_skus:
+            where_extra += " AND (p.sku = ANY(:skus)) "
+            params["skus"] = clean_skus
+
         stmt = text(
             f"""
             SELECT
                 p.sku AS sku,
                 p.name AS name,
-                sc.qty_on_hand AS current_qty,
-                sc.qty_on_hand - sc.qty_pending_out AS available_qty,
+                COALESCE(sc.qty_on_hand, 0) AS current_qty,
+                COALESCE(sc.qty_on_hand, 0) - COALESCE(sc.qty_pending_out, 0) AS available_qty,
                 sc.last_unit_price AS last_price
-            {self._base_sql()}
+            {self._base_sql_operational()}
+            {where_extra}
+            ORDER BY p.sku ASC
+            """
+        )
+
+        try:
+            res = await _execute(self.session, stmt, params)
+            rows = res.mappings().all()
+        except Exception as exc:
+            raise DomainError("SYSTEM-DB-901", detail=str(exc), ctx={"page_id": PAGE_ID, "sku": sku_kw})
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "stock_status"
+
+        headers = ["SKU", "상품명", "현재수량", "가용수량", "마지막단가"]
+        ws.append(headers)
+
+        for r in rows:
+            ws.append(
+                [
+                    r["sku"],
+                    r["name"],
+                    int(r["current_qty"] or 0),
+                    int(r["available_qty"] or 0),
+                    float(r["last_price"]) if r["last_price"] is not None else None,
+                ]
+            )
+
+        # 보기좋게 컬럼 폭 대충 맞춤(과한 계산은 안 함)
+        widths = [26, 50, 12, 12, 14]
+        for i, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+        bio = BytesIO()
+        wb.save(bio)
+        content = bio.getvalue()
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"stock_status_{stamp}.xlsx"
+        return content, filename
+
+    # ─────────────────────────────────────────────
+    # 3) 다건 SKU 조회 (기존 유지: product 기준)
+    # ─────────────────────────────────────────────
+    async def list_by_skus(
+        self,
+        *,
+        skus: List[str],
+        page: int,
+        size: int,
+        sort_by: Optional[str] = "sku",
+        order: Optional[str] = "asc",
+    ) -> Dict[str, Any]:
+        clean = [s.strip() for s in (skus or []) if s and s.strip()]
+        if not clean:
+            return {"items": [], "count": 0, "page": page, "size": size}
+
+        sort_col = "p.sku"
+        if sort_by == "name":
+            sort_col = "p.name"
+        elif sort_by == "current_qty":
+            sort_col = "COALESCE(sc.qty_on_hand, 0)"
+        sort_order = "ASC" if (order or "asc").lower() == "asc" else "DESC"
+
+        stmt = text(
+            f"""
+            SELECT
+                p.sku AS sku,
+                p.name AS name,
+                COALESCE(sc.qty_on_hand, 0) AS current_qty,
+                COALESCE(sc.qty_on_hand, 0) - COALESCE(sc.qty_pending_out, 0) AS available_qty,
+                sc.last_unit_price AS last_price
+            {self._base_sql_product()}
+              AND p.sku = ANY(:skus)
+            ORDER BY {sort_col} {sort_order}
+            """
+        )
+
+        try:
+            res = await _execute(self.session, stmt, {"skus": clean})
+            rows = res.mappings().all()
+        except Exception as exc:
+            raise DomainError("SYSTEM-DB-901", detail=str(exc), ctx={"page_id": PAGE_ID})
+
+        items = []
+        for r in rows:
+            items.append(
+                {
+                    "sku": r["sku"],
+                    "name": r["name"],
+                    "current_qty": int(r["current_qty"] or 0),
+                    "available_qty": int(r["available_qty"] or 0),
+                    "last_price": float(r["last_price"]) if r["last_price"] is not None else None,
+                }
+            )
+
+        return {"items": items, "count": len(items), "page": page, "size": size}
+
+    # ─────────────────────────────────────────────
+    # 4) 엑셀(선택 SKU) (기존 유지: product 기준 / JSON)
+    # ─────────────────────────────────────────────
+    async def export_items(self, *, selected_skus: List[str]) -> Dict[str, Any]:
+        clean = [s.strip() for s in (selected_skus or []) if s and s.strip()]
+        if not clean:
+            return {"items": [], "count": 0}
+
+        stmt = text(
+            f"""
+            SELECT
+                p.sku AS sku,
+                p.name AS name,
+                COALESCE(sc.qty_on_hand, 0) AS current_qty,
+                COALESCE(sc.qty_on_hand, 0) - COALESCE(sc.qty_pending_out, 0) AS available_qty,
+                sc.last_unit_price AS last_price
+            {self._base_sql_product()}
+              AND p.sku = ANY(:skus)
+            ORDER BY p.sku ASC
+            """
+        )
+
+        try:
+            res = await _execute(self.session, stmt, {"skus": clean})
+            rows = res.mappings().all()
+        except Exception as exc:
+            raise DomainError("SYSTEM-DB-901", detail=str(exc), ctx={"page_id": PAGE_ID})
+
+        items = []
+        for r in rows:
+            items.append(
+                {
+                    "sku": r["sku"],
+                    "name": r["name"],
+                    "current_qty": int(r["current_qty"] or 0),
+                    "available_qty": int(r["available_qty"] or 0),
+                    "last_price": float(r["last_price"]) if r["last_price"] is not None else None,
+                }
+            )
+
+        return {"items": items, "count": len(items)}
+
+    # ─────────────────────────────────────────────
+    # 5) 바코드 스캔 단건 조회 (기존 유지)
+    # ─────────────────────────────────────────────
+    async def scan_by_barcode(self, *, barcode: str) -> Dict[str, Any]:
+        b = (barcode or "").strip()
+        if not b:
+            raise DomainError("STOCK-VALID-001", detail="barcode가 비어있습니다.", ctx={"page_id": PAGE_ID})
+
+        stmt = text(
+            f"""
+            SELECT
+                p.sku AS sku,
+                p.name AS name,
+                COALESCE(sc.qty_on_hand, 0) AS current_qty,
+                COALESCE(sc.qty_on_hand, 0) - COALESCE(sc.qty_pending_out, 0) AS available_qty,
+                sc.last_unit_price AS last_price
+            {self._base_sql_product()}
               AND p.barcode = :barcode
             LIMIT 1
             """
@@ -229,11 +463,7 @@ class StatusPageService:
             result = await _execute(self.session, stmt, {"barcode": b})
             row = result.mappings().first()
         except Exception as exc:
-            raise DomainError(
-                "SYSTEM-DB-901",
-                detail=str(exc),
-                ctx={"page_id": PAGE_ID, "barcode": b},
-            )
+            raise DomainError("SYSTEM-DB-901", detail=str(exc), ctx={"page_id": PAGE_ID, "barcode": b})
 
         if not row:
             raise DomainError(
@@ -250,257 +480,27 @@ class StatusPageService:
             "last_price": float(row["last_price"]) if row["last_price"] is not None else None,
         }
 
-    # ─────────────────────────────────────────────────────
-    # 1) 재고현황 목록 조회 (단일검색)
-    # ─────────────────────────────────────────────────────
-    async def list_items(
-        self,
-        *,
-        q: Optional[str],
-        page: int,
-        size: int,
-        sort_by: Optional[str] = "sku",
-        order: Optional[str] = "asc",
-    ) -> Dict[str, Any]:
-        if page <= 0:
-            raise DomainError(
-                "STOCK-VALID-001",
-                detail="페이지 번호는 1 이상이어야 합니다.",
-                ctx={"page_id": PAGE_ID, "page": page},
-            )
-
-        size_resolved = await self._resolve_page_size(size)
-
-        sort_info = self._resolve_sorting(sort_by, order)
-        offset = (page - 1) * size_resolved
-
-        # ✅ 검색 대상에 barcode 포함(리스트 검색용)
-        base_sql = (
-            self._base_sql()
-            + """
-              AND (
-                    :q IS NULL
-                 OR p.sku ILIKE '%' || :q || '%'
-                 OR p.name ILIKE '%' || :q || '%'
-                 OR p.barcode ILIKE '%' || :q || '%'
-              )
-            """
-        )
-
-        count_stmt = text(f"SELECT COUNT(*) {base_sql}")
-        count_result = await _execute(self.session, count_stmt, {"q": q})
-        total = count_result.scalar_one() or 0
-
-        list_sql = f"""
-            SELECT
-                p.sku,
-                p.name,
-                sc.qty_on_hand AS current_qty,
-                sc.qty_on_hand - sc.qty_pending_out AS available_qty,
-                sc.last_unit_price AS last_price
-            {base_sql}
-            ORDER BY {sort_info["order_by_expr"]} {sort_info["order_dir"]}
-            OFFSET :offset
-            LIMIT :limit
-        """
-        list_stmt = text(list_sql)
-        rows_result = await _execute(
-            self.session,
-            list_stmt,
-            {"q": q, "offset": offset, "limit": size_resolved},
-        )
-        rows = rows_result.mappings().all()
-
-        return {
-            "items": self._map_rows(rows),
-            "count": int(total),
-            "page": page,
-            "size": size_resolved,
-        }
-
-    # ─────────────────────────────────────────────────────
-    # 2) 다건검색 — SKU 리스트 전용
-    # ─────────────────────────────────────────────────────
-    async def list_by_skus(
-        self,
-        *,
-        skus: List[str],
-        page: int,
-        size: int,
-        sort_by: Optional[str] = "sku",
-        order: Optional[str] = "asc",
-    ) -> Dict[str, Any]:
-        if not skus:
-            raise DomainError(
-                "STOCK-VALID-001",
-                detail="SKU 목록이 비어 있습니다.",
-                ctx={"page_id": PAGE_ID},
-            )
-
-        if page <= 0:
-            raise DomainError(
-                "STOCK-VALID-001",
-                detail="페이지 번호는 1 이상이어야 합니다.",
-                ctx={"page_id": PAGE_ID, "page": page},
-            )
-
-        size_resolved = await self._resolve_page_size(size)
-        sort_info = self._resolve_sorting(sort_by, order)
-        offset = (page - 1) * size_resolved
-
-        base_sql = (
-            self._base_sql()
-            + """
-              AND sc.sku = ANY(:skus)
-            """
-        )
-
-        count_stmt = text(f"SELECT COUNT(*) {base_sql}")
-        count_result = await _execute(self.session, count_stmt, {"skus": skus})
-        total = count_result.scalar_one() or 0
-
-        list_sql = f"""
-            SELECT
-                p.sku,
-                p.name,
-                sc.qty_on_hand AS current_qty,
-                sc.qty_on_hand - sc.qty_pending_out AS available_qty,
-                sc.last_unit_price AS last_price
-            {base_sql}
-            ORDER BY {sort_info["order_by_expr"]} {sort_info["order_dir"]}
-            OFFSET :offset
-            LIMIT :limit
-        """
-        list_stmt = text(list_sql)
-        rows_result = await _execute(
-            self.session,
-            list_stmt,
-            {"skus": skus, "offset": offset, "limit": size_resolved},
-        )
-        rows = rows_result.mappings().all()
-
-        return {
-            "items": self._map_rows(rows),
-            "count": int(total),
-            "page": page,
-            "size": size_resolved,
-        }
-
-    # ─────────────────────────────────────────────────────
-    # 3) 엑셀 내보내기 (openpyxl 실제 생성)
-    # ─────────────────────────────────────────────────────
-    async def export_items(self, *, selected_skus: List[str]) -> Dict[str, Any]:
-        """
-        선택된 SKU 목록을 기준으로 재고현황 엑셀 생성.
-        - 헤더: SKU / 상품명 / 현 재고 / 가용재고
-        - 반환: 파일명, content_type, content_base64, count
-        """
-        if not selected_skus:
-            raise DomainError(
-                "STOCK-VALID-001",
-                detail="선택된 SKU가 없습니다.",
-                ctx={"page_id": PAGE_ID},
-            )
-
-        base_sql = (
-            self._base_sql()
-            + """
-              AND sc.sku = ANY(:skus)
-            """
-        )
-
-        list_sql = f"""
-            SELECT
-                p.sku,
-                p.name,
-                sc.qty_on_hand AS current_qty,
-                sc.qty_on_hand - sc.qty_pending_out AS available_qty
-            {base_sql}
-            ORDER BY p.sku ASC
-        """
-
-        result = await _execute(
-            self.session,
-            text(list_sql),
-            {"skus": selected_skus},
-        )
-        rows = result.mappings().all()
-
-        if not rows:
-            raise DomainError(
-                "STOCK-NOTFOUND-101",
-                detail="엑셀로 내보낼 재고가 없습니다.",
-                ctx={"page_id": PAGE_ID, "skus": selected_skus},
-            )
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "재고현황"
-
-        ws.append(["SKU", "상품명", "현 재고", "가용재고"])
-
-        for r in rows:
-            ws.append(
-                [
-                    r["sku"],
-                    r["name"],
-                    int(r["current_qty"] or 0),
-                    int(r["available_qty"] or 0),
-                ]
-            )
-
-        buf = BytesIO()
-        wb.save(buf)
-        buf.seek(0)
-        content_bytes = buf.read()
-        buf.close()
-
-        content_b64 = base64.b64encode(content_bytes).decode("utf-8")
-
-        today_str = datetime.now().strftime("%Y%m%d")
-        file_name = f"재고현황_{today_str}.xlsx"
-        content_type = (
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-        return {
-            "file_name": file_name,
-            "content_type": content_type,
-            "content_base64": content_b64,
-            "count": len(rows),
-        }
-
-    # ─────────────────────────────────────────────────────
-    # 4) 재고 절대값 조정
-    # ─────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────
+    # 6) 재고 조정(실사) (기존 유지)
+    # ─────────────────────────────────────────────
     async def adjust(self, *, payload: Dict[str, Any]) -> Dict[str, Any]:
         sku = (payload.get("sku") or "").strip()
-        final_qty_raw = payload.get("final_qty")
-        memo = payload.get("memo")
-        user_id = _get_user_id(self.user)
+        final_qty = payload.get("final_qty")
+        memo_text = (payload.get("memo") or "").strip()
 
         if not sku:
-            raise DomainError(
-                "STOCK-VALID-001",
-                detail="SKU는 필수입니다.",
-                ctx={"page_id": PAGE_ID},
-            )
-
+            raise DomainError("STOCK-VALID-001", detail="sku가 비어있습니다.", ctx={"page_id": PAGE_ID})
+        if final_qty is None:
+            raise DomainError("STOCK-VALID-001", detail="final_qty가 비어있습니다.", ctx={"page_id": PAGE_ID, "sku": sku})
         try:
-            final_qty = int(final_qty_raw)
+            final_qty = int(final_qty)
         except Exception:
-            raise DomainError(
-                "STOCK-VALID-001",
-                detail="final_qty는 정수여야 합니다.",
-                ctx={"page_id": PAGE_ID, "value": final_qty_raw},
-            )
-
+            raise DomainError("STOCK-VALID-001", detail="final_qty는 정수여야 합니다.", ctx={"page_id": PAGE_ID, "sku": sku})
         if final_qty < 0:
-            raise DomainError(
-                "STOCK-VALID-001",
-                detail="최종 재고 수량은 0 이상이어야 합니다.",
-                ctx={"page_id": PAGE_ID, "final_qty": final_qty},
-            )
+            raise DomainError("STOCK-VALID-001", detail="final_qty는 0 이상이어야 합니다.", ctx={"page_id": PAGE_ID, "sku": sku, "final_qty": final_qty})
+
+        memo = f"실사조정: {memo_text}" if memo_text else "실사조정"
+        actor = _safe_user_id(self.user)
 
         select_stmt = text(
             """
@@ -517,30 +517,75 @@ class StatusPageService:
             FOR UPDATE
             """
         )
-        result = await _execute(self.session, select_stmt, {"sku": sku})
-        row = result.mappings().first()
 
-        if row is None:
-            raise DomainError(
-                "STOCK-NOTFOUND-101",
-                detail="해당 SKU의 재고 정보를 찾을 수 없습니다.",
-                ctx={"page_id": PAGE_ID, "sku": sku},
-            )
+        try:
+            result = await _execute(self.session, select_stmt, {"sku": sku})
+            row = result.mappings().first()
 
-        before_qty = int(row["qty_on_hand"])
-        qty_pending_out = int(row["qty_pending_out"])
+            if row is None:
+                product_check_stmt = text(
+                    """
+                    SELECT sku
+                    FROM product
+                    WHERE sku = :sku
+                      AND deleted_at IS NULL
+                      AND is_active = TRUE
+                    """
+                )
+                p_res = await _execute(self.session, product_check_stmt, {"sku": sku})
+                product_row = p_res.mappings().first()
+                if product_row is None:
+                    raise DomainError("STOCK-NOTFOUND-101", detail="해당 SKU의 상품을 찾을 수 없습니다.", ctx={"page_id": PAGE_ID, "sku": sku})
+
+                insert_stock_stmt = text(
+                    """
+                    INSERT INTO stock_current (
+                        sku,
+                        qty_on_hand,
+                        qty_reserved,
+                        qty_pending_out,
+                        last_unit_price,
+                        total_value,
+                        updated_by,
+                        updated_at
+                    )
+                    VALUES (
+                        :sku,
+                        0,
+                        0,
+                        0,
+                        NULL,
+                        NULL,
+                        :updated_by,
+                        NOW()
+                    )
+                    ON CONFLICT (sku) DO NOTHING
+                    """
+                )
+                await _execute(self.session, insert_stock_stmt, {"sku": sku, "updated_by": actor})
+                await _commit(self.session)
+
+                result = await _execute(self.session, select_stmt, {"sku": sku})
+                row = result.mappings().first()
+
+                if row is None:
+                    raise DomainError("STOCK-NOTFOUND-101", detail="해당 SKU의 재고 정보를 찾을 수 없습니다.", ctx={"page_id": PAGE_ID, "sku": sku})
+
+        except DomainError:
+            raise
+        except Exception as exc:
+            await _rollback(self.session)
+            raise DomainError("SYSTEM-DB-901", detail=str(exc), ctx={"page_id": PAGE_ID, "sku": sku})
+
+        before_qty = int(row["qty_on_hand"] or 0)
+        qty_pending_out = int(row["qty_pending_out"] or 0)
         last_unit_price = row["last_unit_price"]
 
         if final_qty < qty_pending_out:
             raise DomainError(
                 "STOCK-STATE-451",
                 detail="출고 대기수량보다 작은 값으로 재고를 조정할 수 없습니다.",
-                ctx={
-                    "page_id": PAGE_ID,
-                    "sku": sku,
-                    "final_qty": final_qty,
-                    "qty_pending_out": qty_pending_out,
-                },
+                ctx={"page_id": PAGE_ID, "sku": sku, "final_qty": final_qty, "qty_pending_out": qty_pending_out},
             )
 
         delta = final_qty - before_qty
@@ -584,21 +629,15 @@ class StatusPageService:
                 {
                     "sku": sku,
                     "event_type": "ADJUST",
-                    "ref_type": "STOCK",
+                    "ref_type": "STOCK_ADJUST",
                     "ref_id": None,
-                    "qty_in": qty_in,
-                    "qty_out": qty_out,
+                    "qty_in": int(qty_in),
+                    "qty_out": int(qty_out),
                     "unit_price": last_unit_price,
                     "memo": memo,
-                    "created_by": user_id or None,
-                    "updated_by": user_id or None,
+                    "created_by": actor,
+                    "updated_by": actor,
                 },
-            )
-
-            total_value = (
-                float(last_unit_price) * float(final_qty)
-                if last_unit_price is not None
-                else None
             )
 
             update_stock_stmt = text(
@@ -606,44 +645,29 @@ class StatusPageService:
                 UPDATE stock_current
                 SET
                     qty_on_hand = :final_qty,
-                    total_value = :total_value,
+                    total_value = CASE
+                        WHEN last_unit_price IS NULL THEN NULL
+                        ELSE (:final_qty * last_unit_price)
+                    END,
                     updated_by = :updated_by,
                     updated_at = NOW()
                 WHERE sku = :sku
                   AND deleted_at IS NULL
                 """
             )
-            await _execute(
-                self.session,
-                update_stock_stmt,
-                {
-                    "final_qty": final_qty,
-                    "total_value": total_value,
-                    "updated_by": user_id or None,
-                    "sku": sku,
-                },
-            )
-
+            await _execute(self.session, update_stock_stmt, {"sku": sku, "final_qty": int(final_qty), "updated_by": actor})
             await _commit(self.session)
 
-        except DomainError:
-            await _rollback(self.session)
-            raise
         except Exception as exc:
             await _rollback(self.session)
-            raise DomainError(
-                "SYSTEM-DB-901",
-                detail=str(exc),
-                ctx={"page_id": PAGE_ID, "sku": sku},
-            )
+            raise DomainError("SYSTEM-DB-901", detail=str(exc), ctx={"page_id": PAGE_ID, "sku": sku})
 
-        available_qty = final_qty - qty_pending_out
-
+        after_qty = int(final_qty)
         return {
             "sku": sku,
             "before_qty": before_qty,
-            "after_qty": final_qty,
-            "current_qty": final_qty,
-            "available_qty": available_qty,
+            "after_qty": after_qty,
+            "current_qty": after_qty,
+            "available_qty": after_qty - qty_pending_out,
             "last_price": float(last_unit_price) if last_unit_price is not None else None,
         }

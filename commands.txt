@@ -192,4 +192,4 @@ tasklist | findstr uvicorn
 taskkill /PID <PID번호> /F
 
 # 서버 접근코드
-ssh ubuntu@223.130.129.231
+ssh ubuntu@49.50.137.105

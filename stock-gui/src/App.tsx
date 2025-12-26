@@ -1,29 +1,15 @@
 // 📄 src/App.tsx
-// 입출고시스템 GUI 스켈레톤 통합 버전 (구조·경로 대/소문자 동기화)
-// ------------------------------------------------------
-// 구조 원칙
-// 1) Shell: 사이드바 + 상단 헤더 자리
-// 2) Page: 헤더를 채우는 래퍼 (입고/출고/재고/상품/대시보드/설정)
-// 3) SubPage: 실제 본문 표시 (Outlet 없음)
-// 4) 입고등록 하위는 RegisterPage가 서브탭(조회/등록) 렌더 전담
-// ------------------------------------------------------
-//
-// ✅ 변경사항(v1.6)
-// - /login만 공개 라우트
-// - 그 외 모든 경로는 sessionStorage의 "accessToken" 없으면 /login으로 즉시 리다이렉트
-// - 토큰 키를 1개로 고정(오탐/불일치/우회 방지)
+// v1.7-hotfix2
+// - 보호영역 기준: "토큰 존재"가 아니라 "인증 필수 API 호출 결과 ok:true" 기준
+// - apiHub.get은 실패해도 throw가 아니라 ok:false로 반환하므로, 여기서 res.ok를 직접 체크한다.
+// - ok:false면 토큰 정리 후 /login 이동
 
-import React from "react";
-import {
-  Routes,
-  Route,
-  Navigate,
-  Outlet,
-  useLocation,
-} from "react-router-dom";
+import React, { useEffect, useState } from "react";
+import { Routes, Route, Navigate, Outlet, useLocation } from "react-router-dom";
 
 import InventoryShell from "./layouts/InventoryShell";
 import { ROUTES } from "./constants/routes";
+import { apiHub } from "./api/hub/apiHub";
 
 // ✅ 메인
 import MainPage from "./pages/Main/MainPage";
@@ -69,34 +55,84 @@ import AdvancedPage from "./pages/Settings/Advanced/AdvancedPage";
 import LoginPage from "./pages/Login/LoginPage";
 
 // ------------------------------------------------------
-// 가드: 토큰 없으면 /login 으로 쫒아내기
+// 토큰 정리(브라우저 잔재 토큰 방지)
+// ------------------------------------------------------
+function clearAllAuthStorage() {
+  try {
+    // apiHub 기준 키 + 레거시 키
+    window.localStorage.removeItem("stockapp.access_token");
+    window.localStorage.removeItem("accessToken");
+
+    // DJ 화면에 있던 잔재 키들
+    window.localStorage.removeItem("refreshToken");
+    window.localStorage.removeItem("currentUser");
+
+    // 혹시 세션에 박힌 케이스도 정리
+    window.sessionStorage.removeItem("stockapp.access_token");
+    window.sessionStorage.removeItem("accessToken");
+    window.sessionStorage.removeItem("refreshToken");
+    window.sessionStorage.removeItem("currentUser");
+  } catch {
+    // 무시
+  }
+}
+
+// ------------------------------------------------------
+// 가드: 인증 필수 API 호출 결과(ok:true)여야만 진입 허용
 // ------------------------------------------------------
 function ProtectedRoute() {
   const loc = useLocation();
 
-  // ✅ 실제 저장 키: accessToken (확정)
-  const token = localStorage.getItem("accessToken");
+  const token =
+    window.localStorage.getItem("stockapp.access_token") ||
+    window.localStorage.getItem("accessToken");
 
-  if (!token) {
+  const [checking, setChecking] = useState(true);
+  const [allowed, setAllowed] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (!token) {
+      setAllowed(false);
+      setChecking(false);
+      return;
+    }
+
+    (async () => {
+      try {
+        // ✅ 인증 필수 API로 검증 (반드시 401/403이 나는 엔드포인트)
+        const res = await apiHub.get("/api/stock/status/list?page=1&size=1&keyword=");
+
+        // apiHub.get은 throw가 아니라 ok:false 반환이므로 여기서 직접 판정
+        if (res && (res as any).ok === true) {
+          setAllowed(true);
+        } else {
+          clearAllAuthStorage();
+          setAllowed(false);
+        }
+      } finally {
+        setChecking(false);
+      }
+    })();
+  }, [token]);
+
+  if (checking) return null;
+
+  if (!token || !allowed) {
     return <Navigate to="/login" replace state={{ from: loc.pathname }} />;
   }
+
   return <Outlet />;
 }
 
 export default function App() {
   return (
     <Routes>
-      {/* 루트 접근 시 메인으로 이동 */}
       <Route path={ROUTES.ROOT} element={<Navigate to={ROUTES.MAIN} replace />} />
 
-      {/* 로그인(공개) */}
       <Route path="/login" element={<LoginPage />} />
 
-      {/* 🔒 보호 영역: 여기 아래는 전부 로그인 필요 */}
       <Route element={<ProtectedRoute />}>
-        {/* 전역 Shell */}
         <Route element={<InventoryShell />}>
-          {/* 🏠 메인 */}
           <Route path={ROUTES.MAIN} element={<MainPage />} />
 
           {/* 📦 입고관리 */}
@@ -120,7 +156,6 @@ export default function App() {
               </InboundPage>
             }
           />
-          {/* 입고등록 서브탭 */}
           <Route
             path={ROUTES.INBOUND.REGISTER.QUERY}
             element={
@@ -171,7 +206,6 @@ export default function App() {
               </OutboundPage>
             }
           />
-          {/* 출고등록 서브탭 */}
           <Route
             path={ROUTES.OUTBOUND.REGISTER.QUERY}
             element={
@@ -265,12 +299,10 @@ export default function App() {
             element={<Navigate to={ROUTES.SETTINGS.BASIC} replace />}
           />
 
-          {/* 보호영역 fallback */}
           <Route path="*" element={<Navigate to={ROUTES.MAIN} replace />} />
         </Route>
       </Route>
 
-      {/* 전체 fallback (가드가 최종적으로 /login 처리) */}
       <Route path="*" element={<Navigate to={ROUTES.MAIN} replace />} />
     </Routes>
   );

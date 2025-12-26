@@ -8,8 +8,9 @@
      - [export] GET /api/stock/history/export
 
    - 재고 현황(Status)
-     - [ping]   GET /api/stock/status/ping
-     - [list]   GET /api/stock/status/list
+     - [ping]   GET  /api/stock/status/ping
+     - [list]   GET  /api/stock/status/list
+     - [scan]   POST /api/stock/status/scan   ✅ (바코드 스캔 단건)
      - [multi]  POST /api/stock/status/multi
      - [action] POST /api/stock/status/action
 */
@@ -26,6 +27,7 @@ const STOCK_HISTORY_EXPORT_URL = "/api/stock/history/export";
 
 const STOCK_STATUS_PING_URL    = "/api/stock/status/ping";
 const STOCK_STATUS_LIST_URL    = "/api/stock/status/list";
+const STOCK_STATUS_SCAN_URL    = "/api/stock/status/scan";   // ✅ 추가
 const STOCK_STATUS_MULTI_URL   = "/api/stock/status/multi";
 const STOCK_STATUS_ACTION_URL  = "/api/stock/status/action";
 
@@ -147,6 +149,26 @@ async function getStatusList(params: {
   });
 }
 
+/* 2-2-1. ✅ 바코드 스캔 단건 조회 (정확 매칭) */
+
+export interface StockStatusScanRequest {
+  barcode: string;
+}
+
+export interface StockStatusScanResult {
+  sku: string;
+  name: string;
+  current_qty: number;
+  available_qty: number;
+  last_price: number | null;
+}
+
+async function scanStatusByBarcode(
+  body: StockStatusScanRequest
+): Promise<ApiResult<StockStatusScanResult>> {
+  return apiHub.post<StockStatusScanResult>(STOCK_STATUS_SCAN_URL, body);
+}
+
 /* 2-3. 재고 현황 다건 조회 */
 
 export interface StockStatusMultiRequest {
@@ -202,6 +224,7 @@ export const stockAdapter = {
   // 재고 현황
   pingStatus,
   getStatusList,
+  scanStatusByBarcode, // ✅ 추가
   multiStatus,
   statusAction,
 } as const;

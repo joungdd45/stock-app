@@ -55,6 +55,9 @@ const fmtCurrency = (n: number) =>
     maximumFractionDigits: 0,
   }).format(n);
 
+// ✅ 원화 표시(화면 전용)
+const fmtWon = (n: number) => `₩ ${fmtCurrency(n)}`;
+
 // 백엔드 → 화면용 매핑
 const mapFromApi = (item: {
   item_id: number;
@@ -160,13 +163,14 @@ export default function CompletePage() {
     });
   }, [rawRows, sort]);
 
+  // ✅ 화면 표시: totalPrice/unitPrice에 원화 표시
   const displayRows = useMemo(
     () =>
       sortedRows.map((r) => ({
         ...r,
         quantity: fmtInt(r.quantity),
-        totalPrice: fmtCurrency(r.totalPrice),
-        unitPrice: fmtCurrency(r.unitPrice),
+        totalPrice: fmtWon(r.totalPrice),
+        unitPrice: fmtWon(r.unitPrice),
       })),
     [sortedRows],
   );
@@ -240,7 +244,8 @@ export default function CompletePage() {
 
     // 수량/금액/단가 숫자 입력
     if (field === "quantity" || field === "totalPrice" || field === "unitPrice") {
-      const num = value === "" ? 0 : Number(value.replace(/[, ]/g, ""));
+      // ✅ ₩, 콤마, 공백 제거
+      const num = value === "" ? 0 : Number(value.replace(/[₩, ]/g, ""));
       if (Number.isNaN(num)) return;
 
       let nextQuantity = editForm.quantity;
@@ -452,12 +457,12 @@ export default function CompletePage() {
               </div>
 
               {/* 총 단가 */}
-              <div className="flex items센터 gap-3">
+              <div className="flex items-center gap-3">
                 <label className="w-24 text-sm text-gray-600">총 단가</label>
                 <input
                   type="text"
                   className="flex-1 rounded-md border px-3 py-2 text-sm text-right"
-                  value={fmtCurrency(editForm.totalPrice)}
+                  value={fmtWon(editForm.totalPrice)}
                   onChange={(e) => handleEditChange("totalPrice", e.target.value)}
                 />
               </div>
@@ -468,7 +473,7 @@ export default function CompletePage() {
                 <input
                   type="text"
                   className="flex-1 rounded-md border px-3 py-2 text-sm text-right"
-                  value={fmtCurrency(editForm.unitPrice)}
+                  value={fmtWon(editForm.unitPrice)}
                   onChange={(e) => handleEditChange("unitPrice", e.target.value)}
                 />
               </div>

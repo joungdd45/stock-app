@@ -2,9 +2,6 @@ from fastapi import FastAPI, APIRouter, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from backend.system.error_codes import register_global_handlers
 
-# ─────────────────────────────────────────────
-# APP 초기화
-# ─────────────────────────────────────────────
 app = FastAPI(
     title="stock-app",
     version="0.1.0",
@@ -13,11 +10,12 @@ app = FastAPI(
     openapi_url="/api/openapi.json",
 )
 
-# 전역 에러 핸들러
 register_global_handlers(app)
 
 # ─────────────────────────────────────────────
-# CORS
+# CORS (정리 버전)
+#  - localhost 계열은 정규식으로 통째로 허용 (http/https + 포트 유무)
+#  - ngrok/기타 고정 도메인은 allow_origins에 유지
 # ─────────────────────────────────────────────
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
@@ -27,24 +25,22 @@ ALLOWED_ORIGINS = [
     "http://localhost:8000",
     "http://192.168.45.139:5174",
     "https://pseudoallegoristic-sina-nonremedial.ngrok-free.dev",
+    "capacitor://localhost",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"^https?://localhost(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ─────────────────────────────────────────────
-# System Health / Ready
-# ─────────────────────────────────────────────
 @app.get("/health", tags=["system"])
 def health():
     return {"status": "ok"}
 
-# PC 프론트에서 직접 두드릴 수 있는 Health 엔드포인트
 @app.get("/system/health", tags=["system"])
 def system_health():
     return {"ok": True, "service": "backend", "status": "healthy"}
@@ -61,25 +57,18 @@ def api_ready():
 
 app.include_router(api)
 
-# ─────────────────────────────────────────────
-# /api/system/ping
-# ─────────────────────────────────────────────
 system_router = APIRouter(prefix="/api/system", tags=["system"])
 
 @system_router.get("/ping")
 def system_ping():
     return {"ok": True, "data": "pong"}
 
-# /api/system/health 도 함께 제공(필요시 사용)
 @system_router.get("/health")
 def api_system_health():
     return {"ok": True, "service": "backend", "status": "healthy"}
 
 app.include_router(system_router)
 
-# ─────────────────────────────────────────────
-# Guard
-# ─────────────────────────────────────────────
 def guard(request: Request):
     try:
         return True
@@ -88,9 +77,6 @@ def guard(request: Request):
     except Exception:
         return True
 
-# ─────────────────────────────────────────────
-# 라우터 연결
-# ─────────────────────────────────────────────
 from backend.routers.login.login import login
 app.include_router(login)
 
@@ -150,5 +136,3 @@ app.include_router(settings_advanced)
 
 from backend.routers.app.app_version import app_version
 app.include_router(app_version)
-
-

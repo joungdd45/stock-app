@@ -8,10 +8,11 @@
      - [export] GET /api/stock/history/export
 
    - 재고 현황(Status)
-     - [ping]   GET /api/stock/status/ping
-     - [list]   GET /api/stock/status/list
-     - [multi]  POST /api/stock/status/multi
-     - [action] POST /api/stock/status/action
+     - [ping]         GET /api/stock/status/ping
+     - [list]         GET /api/stock/status/list
+     - [multi]        POST /api/stock/status/multi
+     - [action]       POST /api/stock/status/action
+     - ✅ [export-xlsx] GET /api/stock/status/export-xlsx (스트리밍 다운로드)
 */
 
 import { apiHub, type ApiResult } from "../hub/apiHub";
@@ -20,14 +21,77 @@ import { apiHub, type ApiResult } from "../hub/apiHub";
  * 0. 공통 상수
  * ─────────────────────────────────────────────── */
 
-const STOCK_HISTORY_PING_URL   = "/api/stock/history/ping";
-const STOCK_HISTORY_LIST_URL   = "/api/stock/history/list";
+const STOCK_HISTORY_PING_URL = "/api/stock/history/ping";
+const STOCK_HISTORY_LIST_URL = "/api/stock/history/list";
 const STOCK_HISTORY_EXPORT_URL = "/api/stock/history/export";
 
-const STOCK_STATUS_PING_URL    = "/api/stock/status/ping";
-const STOCK_STATUS_LIST_URL    = "/api/stock/status/list";
-const STOCK_STATUS_MULTI_URL   = "/api/stock/status/multi";
-const STOCK_STATUS_ACTION_URL  = "/api/stock/status/action";
+const STOCK_STATUS_PING_URL = "/api/stock/status/ping";
+const STOCK_STATUS_LIST_URL = "/api/stock/status/list";
+const STOCK_STATUS_MULTI_URL = "/api/stock/status/multi";
+const STOCK_STATUS_ACTION_URL = "/api/stock/status/action";
+const STOCK_STATUS_EXPORT_XLSX_URL = "/api/stock/status/export-xlsx";
+
+/* ───────────────────────────────────────────────
+ * 0-1. 다운로드 유틸
+ * ─────────────────────────────────────────────── */
+
+function parseFilenameFromContentDisposition(v: string | null): string | null {
+  if (!v) return null;
+
+  // filename*=UTF-8''xxx
+  const m1 = v.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+  if (m1?.[1]) return decodeURIComponent(m1[1].trim());
+
+  // filename="xxx" or filename=xxx
+  const m2 =
+    v.match(/filename\s*=\s*"([^"]+)"/i) ||
+    v.match(/filename\s*=\s*([^;]+)/i);
+
+  if (m2?.[1]) return m2[1].trim();
+  return null;
+}
+
+/**
+ * ✅ 서버에서 쓰는 토큰 키를 “추측”이 아니라 후보로 확실히 커버
+ * - 가장 우선: stockapp.access_token
+ * - 그다음: accessToken / access_token / token / jwt
+ */
+function getAccessToken(): string | null {
+  try {
+    return (
+      localStorage.getItem("stockapp.access_token") ||
+      sessionStorage.getItem("stockapp.access_token") ||
+      localStorage.getItem("accessToken") ||
+      sessionStorage.getItem("accessToken") ||
+      localStorage.getItem("access_token") ||
+      sessionStorage.getItem("access_token") ||
+      localStorage.getItem("token") ||
+      sessionStorage.getItem("token") ||
+      localStorage.getItem("jwt") ||
+      sessionStorage.getItem("jwt") ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function downloadBlob(res: Response, fallbackName: string) {
+  const cd = res.headers.get("content-disposition");
+  const filename = parseFilenameFromContentDisposition(cd) || fallbackName;
+
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  URL.revokeObjectURL(objectUrl);
+}
 
 /* ============================================================
    ⬛ 1. 재고 이력(History)
@@ -110,9 +174,9 @@ async function exportHistory(
 /* 2-1. 재고 현황 핑 */
 
 export interface StockStatusPingResponse {
-  page: string;    // "stock.status"
+  page: string; // "stock.status"
   version: string; // 예: "v1.5"
-  stage: string;   // "implemented"
+  stage: string; // "implemented"
 }
 
 async function pingStatus(): Promise<ApiResult<StockStatusPingResponse>> {
@@ -142,9 +206,7 @@ async function getStatusList(params: {
   sku?: string | null;
   keyword?: string | null;
 }): Promise<ApiResult<StockStatusListResult>> {
-  return apiHub.get<StockStatusListResult>(STOCK_STATUS_LIST_URL, {
-    params,
-  });
+  return apiHub.get<StockStatusListResult>(STOCK_STATUS_LIST_URL, { params });
 }
 
 /* 2-3. 재고 현황 다건 조회 */
@@ -163,7 +225,7 @@ async function multiStatus(
   return apiHub.post<StockStatusListResult>(STOCK_STATUS_MULTI_URL, body);
 }
 
-/* 2-4. 재고 현황 액션(엑셀 export / 조정 등) */
+/* 2-4. 재고 현황 액션(엑셀 export/base64 또는 조정 등) */
 
 export interface StockStatusActionRequest {
   action: "export" | "adjust";
@@ -183,10 +245,40 @@ export interface StockStatusActionExportResponse {
 async function statusAction(
   body: StockStatusActionRequest
 ): Promise<ApiResult<StockStatusActionExportResponse>> {
-  return apiHub.post<StockStatusActionExportResponse>(
-    STOCK_STATUS_ACTION_URL,
-    body
-  );
+  return apiHub.post<StockStatusActionExportResponse>(STOCK_STATUS_ACTION_URL, body);
+}
+
+/* 2-5. ✅ 재고 현황 xlsx 다운로드 (스트리밍 다운로드) */
+
+export interface StockStatusExportXlsxParams {
+  sku?: string | null;
+}
+
+async function downloadStatusXlsx(params?: StockStatusExportXlsxParams): Promise<void> {
+  const qs = new URLSearchParams();
+  if (params?.sku) qs.set("sku", params.sku);
+
+  const url =
+    qs.toString().length > 0
+      ? `${STOCK_STATUS_EXPORT_XLSX_URL}?${qs.toString()}`
+      : STOCK_STATUS_EXPORT_XLSX_URL;
+
+  const token = getAccessToken();
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const res = await fetch(url, {
+    method: "GET",
+    headers,
+    credentials: "include",
+  });
+
+  if (!res.ok) {
+    throw new Error(`엑셀 다운로드 실패 (status=${res.status})`);
+  }
+
+  const fallbackName = `stock_status_${new Date().toISOString().slice(0, 10)}.xlsx`;
+  await downloadBlob(res, fallbackName);
 }
 
 /* ============================================================
@@ -203,7 +295,8 @@ export const stockAdapter = {
   pingStatus,
   getStatusList,
   multiStatus,
-  statusAction,
+  statusAction,        // 레거시 유지
+  downloadStatusXlsx,  // ✅ 신규
 } as const;
 
 export type StockAdapter = typeof stockAdapter;

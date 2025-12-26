@@ -17,7 +17,7 @@ from fastapi import APIRouter
 app_version = APIRouter(prefix="/api/app", tags=["app"])
 
 # ✅ 운영 시 여기만 올리면 됨 (서버 기준)
-MIN_APP_VERSION = "1.0.3"
+MIN_APP_VERSION = "1.0.5"
 MESSAGE = "최신 버전으로 업데이트해 주세요."
 
 

@@ -62,6 +62,9 @@ const ALL_HEADERS = [
 const fmtInt = (n: number) =>
   new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 0 }).format(n);
 
+// ✅ 원화 표시 통일 (CSV 제외, 화면 표시 전용)
+const fmtWon = (n: number) => `₩ ${fmtInt(n)}`;
+
 /* ─────────────────────────────────────────
  * 필터 박스
  * ───────────────────────────────────────── */
@@ -501,7 +504,7 @@ export default function RegisterQueryPage() {
     fetchList("reset");
   };
 
-  // CSV 다운로드
+  // CSV 다운로드 (❗️요청대로 원화표시 미적용: 기존 그대로 유지)
   const handleDownloadCSV = () => {
     dbg("CSV export 시작");
     const cols = ALL_HEADERS.filter((h) => visibleKeys.has(h.key)).map(
@@ -594,11 +597,7 @@ export default function RegisterQueryPage() {
     const targets = rows.filter((r) => selectedIds.includes(r.id));
     if (targets.length === 0) return;
 
-    if (
-      !window.confirm(
-        `선택된 ${targets.length}건을 삭제할까요?`,
-      )
-    ) {
+    if (!window.confirm(`선택된 ${targets.length}건을 삭제할까요?`)) {
       return;
     }
 
@@ -647,6 +646,7 @@ export default function RegisterQueryPage() {
     [visibleKeys],
   );
 
+  // ✅ 화면 표시용 가공: totalPrice/unitPrice에 원화 표시 (CSV는 그대로)
   const rowsForCarbon = rows.map((r) => {
     const base: any = { id: r.id };
     for (const h of visibleHeaders) {
@@ -655,9 +655,9 @@ export default function RegisterQueryPage() {
         k === "qty"
           ? fmtInt(r.qty)
           : k === "totalPrice"
-          ? fmtInt(r.totalPrice)
+          ? fmtWon(r.totalPrice)
           : k === "unitPrice"
-          ? fmtInt(r.unitPrice)
+          ? fmtWon(r.unitPrice)
           : (r as any)[k];
     }
     return base;
@@ -754,9 +754,7 @@ export default function RegisterQueryPage() {
                       <TableRow>
                         <TableSelectAll {...getSelectionProps()} />
                         {headers.map((header: any) => {
-                          const propsNoKey = stripKey(
-                            getHeaderProps({ header, isSortable: true }),
-                          );
+                          const propsNoKey = stripKey(getHeaderProps({ header, isSortable: true }));
                           return (
                             <TableHeader
                               key={header.key}
@@ -822,9 +820,7 @@ export default function RegisterQueryPage() {
                       {!loading && !error && carbonRows.length === 0 && (
                         <TableRow>
                           <TableCell colSpan={(headers as any[]).length + 1}>
-                            <div className="py-10 text-center text-gray-500">
-                             입고 내역이 없습니다.
-                            </div>
+                            <div className="py-10 text-center text-gray-500">입고 내역이 없습니다.</div>
                           </TableCell>
                         </TableRow>
                       )}
@@ -834,8 +830,8 @@ export default function RegisterQueryPage() {
 
                 <div className="flex flex-col gap-2 border-top border-gray-100 p-3 md:flex-row md:items-center md:justify-between">
                   <div className="text-sm text-gray-600">
-                    총 <b>{fmtInt(totalCount)}</b>건 · 현재 페이지 수량{" "}
-                    <b>{fmtInt(summary.qty)}</b> · 금액 <b>{fmtInt(summary.amount)}</b>
+                    총 <b>{fmtInt(totalCount)}</b>건 · 현재 페이지 수량 <b>{fmtInt(summary.qty)}</b> · 금액{" "}
+                    <b>{fmtWon(summary.amount)}</b>
                   </div>
                   <div className="flex items-center gap-2">
                     <select

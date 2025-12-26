@@ -4,7 +4,7 @@
 // - 백엔드 stockAdapter(status) 연동
 // - 다건검색(POST /api/stock/status/multi)
 // - 재고 조정 모달(POST /api/stock/status/action, action="adjust")
-// - 엑셀 다운로드(POST /api/stock/status/action, action="export")
+// - ✅ 엑셀 다운로드: stockAdapter.downloadStatusXlsx() (쿼리 없이 호출)
 // - 이 페이지만 체크박스 컬럼 제거(CSS 스코프)
 
 import React, { useEffect, useMemo, useState } from "react";
@@ -343,11 +343,7 @@ export default function StatusPage() {
         lastUnitPrice: it.last_price,
       }))
       // 🔥 재고가 전부 0인 항목은 숨김
-      .filter(
-        (r) =>
-          (r.stockNow ?? 0) > 0 ||
-          (r.stockAvail ?? 0) > 0,
-      );
+      .filter((r) => (r.stockNow ?? 0) > 0 || (r.stockAvail ?? 0) > 0);
 
     const key = sort.key;
     if (key && key !== "adjust") {
@@ -376,8 +372,7 @@ export default function StatusPage() {
         name: r.name,
         stockNow: fmt(r.stockNow),
         stockAvail: fmt(r.stockAvail),
-        lastUnitPrice:
-          r.lastUnitPrice != null ? fmt(r.lastUnitPrice) : "-",
+        lastUnitPrice: r.lastUnitPrice != null ? fmt(r.lastUnitPrice) : "-",
         adjust: (
           <button
             className="rounded-lg bg-emerald-600 px-3 py-1 text-xs text-white"
@@ -393,64 +388,13 @@ export default function StatusPage() {
     [processed.rows],
   );
 
-  /* 엑셀 다운로드: status.action(action=export) */
+  /* ✅ 엑셀 다운로드: 쿼리 없이 export-xlsx 호출 (URL 길이 이슈 제거) */
   const handleExport = async () => {
     try {
-      const skusToExport = items
-        .map((it) => ({
-          sku: it.sku,
-          current_qty: it.current_qty,
-          available_qty: it.available_qty,
-        }))
-        // 엑셀도 0재고는 빼고 싶다면 같은 필터 적용
-        .filter(
-          (r) =>
-            (r.current_qty ?? 0) > 0 ||
-            (r.available_qty ?? 0) > 0,
-        )
-        .map((r) => r.sku);
-
-      if (!skusToExport.length) {
-        window.alert("내보낼 재고 데이터가 없습니다.");
-        return;
-      }
-
-      const res = await stockAdapter.statusAction({
-        action: "export",
-        selected_skus: skusToExport,
-        memo: "재고현황 엑셀 다운로드",
-      });
-
-      if (!res.ok || !res.data) {
-        console.error("status export error", res.error);
-        if (res.error) {
-          handleError(res.error);
-        } else {
-          window.alert("엑셀 다운로드 중 오류가 발생했습니다.");
-        }
-        return;
-      }
-
-      const { file_name, content_type, content_base64 } = res.data;
-      const byteString = window.atob(content_base64);
-      const byteNumbers = new Array(byteString.length);
-      for (let i = 0; i < byteString.length; i += 1) {
-        byteNumbers[i] = byteString.charCodeAt(i);
-      }
-      const byteArray = new Uint8Array(byteNumbers);
-      const blob = new Blob([byteArray], { type: content_type });
-      const url = URL.createObjectURL(blob);
-
-      const a = document.createElement("a");
-      a.href = url;
-      a.download =
-        file_name ||
-        `stock_status_${new Date().toISOString().slice(0, 10)}.xlsx`;
-      a.click();
-      URL.revokeObjectURL(url);
+      await stockAdapter.downloadStatusXlsx();
     } catch (err) {
       console.error("status export exception", err);
-      window.alert("엑셀 다운로드 처리 중 예외가 발생했습니다.");
+      window.alert("엑셀 다운로드에 실패했습니다.");
     }
   };
 

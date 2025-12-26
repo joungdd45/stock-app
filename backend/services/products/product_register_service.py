@@ -3,12 +3,14 @@
 # 역할:
 #   - 상품 목록 조회
 #   - SKU 단건 조회
+#   - (NEW) 바코드 단건 조회 (barcode → sku 변환용)
 #   - 단건 등록
 #   - 수정
 #   - 선택 삭제
 #   - 묶음 매핑 단건 업데이트
 #   - 상품 대량 등록(bulk-excel, JSON rows 기준)
-# 단계: v1-7 (DB v1.6-r2: base_sku / pack_qty / is_bundle 반영 + SKU 단건조회)
+#   - 상품 검색 조회(q 부분일치)
+# 단계: v1-8 (v1-7 + 바코드 단건조회 get_by_barcode 추가)
 # 규칙:
 #   - 전체수정
 #   - sync(Session 전용)
@@ -32,14 +34,14 @@ from typing import Dict, Any, List, Set
 from datetime import datetime
 
 from sqlalchemy.orm import Session
-from sqlalchemy import select, update, delete
+from sqlalchemy import select, update, func, or_
 from sqlalchemy.exc import IntegrityError
 
 from backend.system.error_codes import DomainError
 
 
 PAGE_ID = "product.register"
-PAGE_VERSION = "v1-7"
+PAGE_VERSION = "v1-8"
 
 
 # ─────────────────────────────────────────────
@@ -142,8 +144,116 @@ class ProductRegisterService:
         }
 
     # ======================================================
+    # 1-0) 검색 조회 (상품명/sku 부분일치)
+    # ======================================================
+    def search_items(
+        self,
+        *,
+        q: str,
+        page: int = 1,
+        size: int = 50,
+        active_only: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        상품 검색 조회
+        - name ILIKE %q% OR sku ILIKE %q%
+        - deleted_at IS NULL
+        - active_only=True 이면 is_active=True만
+        - 페이징 지원
+        - 응답 필드 구조는 list_items()와 동일(추가로 page/size/q/active_only 포함)
+        """
+        q = (q or "").strip()
+        if not q:
+            raise DomainError(
+                "PRODUCT-VALID-010",
+                detail="q는 필수입니다.",
+                ctx={"page_id": PAGE_ID},
+            )
+
+        try:
+            page = int(page)
+        except Exception:
+            page = 1
+        if page <= 0:
+            page = 1
+
+        try:
+            size = int(size)
+        except Exception:
+            size = 50
+        if size <= 0:
+            size = 50
+        if size > 200:
+            size = 200
+
+        like = f"%{q}%"
+
+        conds = [self.Product.deleted_at.is_(None)]
+        if active_only:
+            conds.append(self.Product.is_active.is_(True))
+
+        conds.append(
+            or_(
+                self.Product.name.ilike(like),
+                self.Product.sku.ilike(like),
+            )
+        )
+
+        # count
+        count_stmt = select(func.count()).select_from(self.Product).where(*conds)
+        total = int(self.session.execute(count_stmt).scalar_one() or 0)
+
+        # items
+        stmt = (
+            select(self.Product)
+            .where(*conds)
+            .order_by(self.Product.created_at.desc())
+            .offset((page - 1) * size)
+            .limit(size)
+        )
+
+        rows = self.session.execute(stmt).scalars().all()
+
+        items: List[Dict[str, Any]] = []
+        for r in rows:
+            last_inbound_unit_price = getattr(r, "last_inbound_unit_price", None)
+            weight = getattr(r, "weight", None)
+
+            # 묶음 관련 여부 (bundle_sku 또는 component_sku로 포함되는지)
+            bundle_exists = self.session.execute(
+                select(self.Bundle).where(
+                    (
+                        (self.Bundle.bundle_sku == r.sku)
+                        | (self.Bundle.component_sku == r.sku)
+                    ),
+                    self.Bundle.deleted_at.is_(None),
+                )
+            ).first()
+
+            items.append(
+                {
+                    "sku": r.sku,
+                    "name": r.name,
+                    "last_inbound_price": last_inbound_unit_price,
+                    "weight": weight,
+                    "barcode": r.barcode,
+                    "is_bundle_related": True if bundle_exists else False,
+                    "is_active": r.is_active,
+                }
+            )
+
+        return {
+            "ok": True,
+            "count": total,
+            "items": items,
+            "page": page,
+            "size": size,
+            "q": q,
+            "active_only": active_only,
+        }
+
+    # ======================================================
     # 1-1) SKU 단건 조회
-    #      - 입고/출고/모바일에서 SKU 기준으로 상품정보 조회
     # ======================================================
     def get_by_sku(self, *, sku: str) -> Dict[str, Any]:
         """
@@ -171,6 +281,64 @@ class ProductRegisterService:
                 "PRODUCT-NOTFOUND-001",
                 detail="해당 SKU를 찾을 수 없습니다.",
                 ctx={"sku": sku},
+            )
+
+        last_inbound_unit_price = getattr(product, "last_inbound_unit_price", None)
+        weight = getattr(product, "weight", None)
+
+        bundle_exists = self.session.execute(
+            select(self.Bundle).where(
+                (
+                    (self.Bundle.bundle_sku == product.sku)
+                    | (self.Bundle.component_sku == product.sku)
+                ),
+                self.Bundle.deleted_at.is_(None),
+            )
+        ).first()
+
+        item = {
+            "sku": product.sku,
+            "name": product.name,
+            "last_inbound_price": last_inbound_unit_price,
+            "weight": weight,
+            "barcode": product.barcode,
+            "is_bundle_related": True if bundle_exists else False,
+        }
+
+        return {
+            "ok": True,
+            "item": item,
+        }
+
+    # ======================================================
+    # 1-2) (NEW) 바코드 단건 조회 (barcode → sku 변환)
+    # ======================================================
+    def get_by_barcode(self, *, barcode: str) -> Dict[str, Any]:
+        """
+        바코드 기준 상품 단건 조회
+        - Product.barcode 정확 일치
+        - deleted_at IS NULL
+        """
+        barcode = (barcode or "").strip()
+        if not barcode:
+            raise DomainError(
+                "PRODUCT-VALID-011",
+                detail="barcode는 필수입니다.",
+                ctx={"page_id": PAGE_ID},
+            )
+
+        product = self.session.execute(
+            select(self.Product).where(
+                self.Product.barcode == barcode,
+                self.Product.deleted_at.is_(None),
+            )
+        ).scalar_one_or_none()
+
+        if not product:
+            raise DomainError(
+                "PRODUCT-NOTFOUND-002",
+                detail="해당 바코드로 등록된 상품을 찾을 수 없습니다.",
+                ctx={"barcode": barcode},
             )
 
         last_inbound_unit_price = getattr(product, "last_inbound_unit_price", None)
@@ -264,9 +432,9 @@ class ProductRegisterService:
             weight=weight,
             last_inbound_unit_price=last_inbound_unit_price,
             # 신규 상품은 단품 기준:
-            base_sku=sku,      # 자기 자신을 기준 SKU로
-            pack_qty=1,        # 단품 1개
-            is_bundle=False,   # 기본적으로 묶음상품 아님
+            base_sku=sku,  # 자기 자신을 기준 SKU로
+            pack_qty=1,  # 단품 1개
+            is_bundle=False,  # 기본적으로 묶음상품 아님
             created_by=username,
             updated_by=username,
         )
@@ -361,7 +529,6 @@ class ProductRegisterService:
     # ======================================================
     # 4) 선택 삭제 (상품 삭제 기능 봉인)
     # ======================================================
-
     def delete(self, *, skus: List[str]) -> Dict[str, Any]:
         """
         선택 삭제 (비활성)
@@ -379,8 +546,6 @@ class ProductRegisterService:
 
     # ======================================================
     # 5) 묶음 매핑 단건 업데이트
-    #    - bundle_sku 기준 기존 매핑 논리삭제 → 신규 매핑 전체 재삽입
-    #    - Product.base_sku / pack_qty / is_bundle 갱신
     # ======================================================
     def update_bundle_mapping(self, *, payload: Dict[str, Any]) -> Dict[str, Any]:
         bundle_sku = (payload.get("bundle_sku") or "").strip()
@@ -421,7 +586,6 @@ class ProductRegisterService:
             )
 
         # 🔹 우리 규칙: 단일상품 × N개만 허용
-        #    → component_sku는 1종류만 있어야 함
         unique_components: Set[str] = set(component_skus)
         if len(unique_components) != 1:
             raise DomainError(
@@ -461,7 +625,7 @@ class ProductRegisterService:
             )
             total_pack_qty += qty_val
 
-        # SKU 존재 여부 체크 (bundle_sku + component_skus)
+        # SKU 존재 여부 체크
         all_skus: Set[str] = {bundle_sku, *component_skus}
         existing_products = self.session.execute(
             select(self.Product).where(
@@ -483,13 +647,8 @@ class ProductRegisterService:
         now = datetime.utcnow()
         username = self.user.get("username")
 
-        # 🔹 Product 정보 업데이트 (묶음 → 단품 환산 기준 세팅)
-        # bundle_sku 상품 / base_sku(단품) 상품 둘 다 로드
-        product_map: Dict[str, Any] = {
-            p.sku: p
-            for p in existing_products
-        }
-
+        # Product 정보 업데이트
+        product_map: Dict[str, Any] = {p.sku: p for p in existing_products}
         bundle_product = product_map.get(bundle_sku)
         base_product = product_map.get(base_sku)
 
@@ -500,14 +659,12 @@ class ProductRegisterService:
                 ctx={"bundle_sku": bundle_sku, "base_sku": base_sku},
             )
 
-        # bundle_sku: 묶음 상품으로 표시
         bundle_product.base_sku = base_sku
         bundle_product.pack_qty = total_pack_qty
         bundle_product.is_bundle = True
         bundle_product.updated_at = now
         bundle_product.updated_by = username
 
-        # base_sku: 단품 기준 유지
         base_product.base_sku = base_sku
         base_product.pack_qty = 1
         base_product.is_bundle = False
@@ -553,8 +710,6 @@ class ProductRegisterService:
 
     # ======================================================
     # 6) 상품 대량 등록 (bulk-excel rows)
-    #    - 프론트에서 엑셀 파싱 → rows 배열(JSON) 전달
-    #    - 각 row 개별 검증 / 기존 SKU는 스킵
     # ======================================================
     def bulk_create(self, *, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not isinstance(rows, list) or len(rows) == 0:
@@ -590,7 +745,6 @@ class ProductRegisterService:
             name = (row.get("name") or "").strip()
             barcode = row.get("barcode")
             weight = row.get("weight")
-            # last_inbound_unit_price 또는 last_inbound_price 둘 중 하나 사용
             last_inbound_price = row.get("last_inbound_unit_price")
             if last_inbound_price is None:
                 last_inbound_price = row.get("last_inbound_price")
@@ -663,9 +817,9 @@ class ProductRegisterService:
                 barcode=barcode,
                 weight=weight,
                 last_inbound_unit_price=last_inbound_unit_price,
-                base_sku=sku,       # 단품 기준: 자기 자신을 기준 SKU로
-                pack_qty=1,         # 단품 1개
-                is_bundle=False,    # 기본적으로 묶음상품 아님
+                base_sku=sku,
+                pack_qty=1,
+                is_bundle=False,
                 created_by=username,
                 updated_by=username,
                 created_at=now,
@@ -681,7 +835,6 @@ class ProductRegisterService:
                 self.session.commit()
             except IntegrityError as e:
                 self.session.rollback()
-                # 이 경우는 설계상 예상 밖이므로 전체 실패로 보고 DomainError
                 raise DomainError(
                     "PRODUCT-DB-001",
                     detail="대량 등록 중 DB 오류가 발생했습니다.",
