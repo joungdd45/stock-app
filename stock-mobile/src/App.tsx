@@ -34,7 +34,7 @@ import { setGlobalToast } from "@/api/hub/apiHub";
 /* ─────────────────────────────────────────────
    ✅ 버전체크 설정
 ─────────────────────────────────────────────*/
-const APP_VERSION = "1.0.3";
+const APP_VERSION = "1.0.0";
 const VERSION_CHECK_URL = "/api/app/version";
 const DEFAULT_BLOCK_MESSAGE = "최신 버전으로 업데이트해 주세요.";
 
