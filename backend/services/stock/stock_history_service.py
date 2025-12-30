@@ -1,9 +1,9 @@
 # 📄 backend/services/stock/stock_history_service.py
 # 페이지: 재고 이력(HistoryPage)
 # 역할: 비즈니스 로직 전담 (조회, 검증, 계산, 엑셀 내보내기)
-# 단계: v2.1 (Users 제거 대응)
+# 단계: v2.3 (날짜 필터: DATE(created_at) 기준으로 비교 → 타임존 이슈 제거)
 # PAGE_ID: stock.history
-# PAGE_VERSION: v2.1
+# PAGE_VERSION: v2.3
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.system.error_codes import DomainError
 
 PAGE_ID = "stock.history"
-PAGE_VERSION = "v2.1"
+PAGE_VERSION = "v2.3"
 
 
 # ─────────────────────────────────────────────────────────
@@ -87,6 +87,20 @@ class StockHistoryService:
                 ctx={"value": value},
             )
 
+    def _validate_date_range(
+        self, *, from_date: Optional[str], to_date: Optional[str]
+    ) -> tuple[Optional[date], Optional[date]]:
+        d_from = self._parse_date(from_date, "from_date")
+        d_to = self._parse_date(to_date, "to_date")
+
+        if d_from and d_to and d_from > d_to:
+            raise DomainError(
+                "STOCK-VALID-001",
+                detail="from_date는 to_date보다 클 수 없습니다.",
+                ctx={"from_date": from_date, "to_date": to_date},
+            )
+        return d_from, d_to
+
     # ─────────────────────────────────────
     # 1) 재고 이력 조회
     # ─────────────────────────────────────
@@ -115,24 +129,26 @@ class StockHistoryService:
                 ctx={"size": size},
             )
 
-        date_from = self._parse_date(from_date, "from_date")
-        date_to = self._parse_date(to_date, "to_date")
+        d_from, d_to = self._validate_date_range(from_date=from_date, to_date=to_date)
 
         L = self.models["InventoryLedger"]
         P = self.models["Product"]
         S = self.models["StockCurrent"]
 
         # 🔹 묶음 SKU는 재고이력에서 숨긴다
-        conditions = [
-            or_(P.is_bundle.is_(None), P.is_bundle == False)
-        ]
+        conditions = [or_(P.is_bundle.is_(None), P.is_bundle == False)]
 
-        if date_from:
-            conditions.append(L.created_at >= date_from)
-        if date_to:
-            conditions.append(L.created_at <= date_to)
+        # ✅ 핵심: DATE(created_at) 기준으로 날짜만 비교(타임존/시간 문제 제거)
+        created_date = func.date(L.created_at)
+
+        if d_from:
+            conditions.append(created_date >= d_from)
+        if d_to:
+            conditions.append(created_date <= d_to)
+
         if sku:
             conditions.append(L.sku == sku)
+
         if keyword:
             conditions.append(
                 or_(
@@ -143,7 +159,7 @@ class StockHistoryService:
 
         where_clause = and_(*conditions) if conditions else None
 
-        # 총 개수 조회
+        # 총 개수
         count_stmt = select(func.count()).select_from(L).join(P, L.sku == P.sku)
         if where_clause is not None:
             count_stmt = count_stmt.where(where_clause)
@@ -160,7 +176,6 @@ class StockHistoryService:
 
         offset = (page - 1) * size
 
-        # 목록 조회
         list_stmt = (
             select(
                 L.id.label("ledger_id"),
@@ -189,7 +204,6 @@ class StockHistoryService:
         rows = (await self._exec(list_stmt)).fetchall()
 
         items: List[Dict[str, Any]] = []
-
         for r in rows:
             event_label = {
                 "INBOUND": "입고",
@@ -234,24 +248,24 @@ class StockHistoryService:
         keyword: Optional[str],
     ) -> Dict[str, Any]:
 
+        d_from, d_to = self._validate_date_range(from_date=from_date, to_date=to_date)
+
         L = self.models["InventoryLedger"]
         P = self.models["Product"]
         S = self.models["StockCurrent"]
 
         # 🔹 묶음 SKU(is_bundle=True)는 엑셀에서도 제외
-        conditions = [
-            or_(P.is_bundle.is_(None), P.is_bundle == False)
-        ]
+        conditions = [or_(P.is_bundle.is_(None), P.is_bundle == False)]
 
-        date_from = self._parse_date(from_date, "from_date")
-        date_to = self._parse_date(to_date, "to_date")
+        created_date = func.date(L.created_at)
+        if d_from:
+            conditions.append(created_date >= d_from)
+        if d_to:
+            conditions.append(created_date <= d_to)
 
-        if date_from:
-            conditions.append(L.created_at >= date_from)
-        if date_to:
-            conditions.append(L.created_at <= date_to)
         if sku:
             conditions.append(L.sku == sku)
+
         if keyword:
             conditions.append(
                 or_(
@@ -349,7 +363,6 @@ class StockHistoryService:
         buffer.seek(0)
 
         content_base64 = base64.b64encode(buffer.read()).decode("utf-8")
-
         file_name = f"stock_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
         return {
@@ -358,3 +371,4 @@ class StockHistoryService:
             "content_base64": content_base64,
             "count": len(rows),
         }
+

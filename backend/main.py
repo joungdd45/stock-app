@@ -136,3 +136,12 @@ app.include_router(settings_advanced)
 
 from backend.routers.app.app_version import app_version
 app.include_router(app_version)
+
+from backend.routers.draft.inbound_draft import router as inbound_draft
+app.include_router(inbound_draft)
+
+from backend.routers.draft.outbound_draft import router as outbound_draft
+app.include_router(outbound_draft)
+
+from backend.routers.draft.stocktake_draft import router as stocktake_draft
+app.include_router(stocktake_draft)
