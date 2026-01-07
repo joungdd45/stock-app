@@ -32,6 +32,8 @@ export const ROUTES = {
     ROOT: "/inventory",
     STATUS: "/inventory/status",
     HISTORY: "/inventory/history",
+    STOCKTAKE_BULK: "/inventory/stocktake/bulk",
+    BARCODE_BULK: "/inventory/barcode/bulk", // ✅ 바코드 대량등록
   },
 
   PRODUCTS: {
@@ -49,14 +51,13 @@ export const ROUTES = {
 
   SETTINGS: {
     ROOT: "/settings",
-    BASIC: "/settings/basic",       // ✅ 추가
-    ADVANCED: "/settings/advanced", // ✅ 추가
+    BASIC: "/settings/basic",
+    ADVANCED: "/settings/advanced",
   },
 } as const;
 
-  export type RouteValue =
-    | string
-    | { [k: string]: RouteValue };
-  
-  export type Routes = typeof ROUTES;
-  
+export type RouteValue =
+  | string
+  | { [k: string]: RouteValue };
+
+export type Routes = typeof ROUTES;

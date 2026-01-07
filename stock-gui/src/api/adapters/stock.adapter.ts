@@ -13,10 +13,23 @@
      - [multi]        POST /api/stock/status/multi
      - [action]       POST /api/stock/status/action
      - ✅ [export-xlsx] GET /api/stock/status/export-xlsx (스트리밍 다운로드)
+     - ✅ [bulk-adjust] POST /api/stock/status/bulk-adjust (PC 재고실사 대량확정)
 
-   - 재고 실사(Stocktake)
-     - ✅ [bulk-confirm] POST /api/stocktake/bulk/confirm  (PC 대량등록 확정)
-       * payload는 SKU/qty만 (상품명은 UI 표시용)
+   - 재고 실사(PC 대량등록 확정)
+     - ✅ [bulk-adjust] POST /api/stock/status/bulk-adjust
+       * payload: items[{ sku, final_qty, memo? }]
+       * ✅ memo 정책: 프론트는 "자동 기본값"을 넣지 않는다(중복 방지)
+         - memo가 필요하면 페이지에서 명시적으로 넣는다
+         - 없으면 memo 필드를 보내지 않는다
+
+   - ✅ 바코드 등록(대량용 단건 API)
+     - ✅ POST /api/inbound/process/register-barcode
+       * payload: { sku, barcode, name? }
+       * name은 표시용(서버에서 무시해도 됨)
+
+   ⚠️ 타입 주의:
+   - ApiFailure가 data를 필수로 요구하는 구조라서
+     ok:false 리턴에도 data를 반드시 넣는다.
 */
 
 import { apiHub, type ApiResult } from "../hub/apiHub";
@@ -35,10 +48,11 @@ const STOCK_STATUS_MULTI_URL = "/api/stock/status/multi";
 const STOCK_STATUS_ACTION_URL = "/api/stock/status/action";
 const STOCK_STATUS_EXPORT_XLSX_URL = "/api/stock/status/export-xlsx";
 
-/** ✅ 재고실사 대량등록(PC) 확정 엔드포인트
- *  - 서버 라우터 경로가 다르면 여기만 바꾸면 됨
- */
-const STOCKTAKE_BULK_CONFIRM_URL = "/api/stocktake/bulk/confirm";
+/** ✅ 재고실사 대량확정(PC) 엔드포인트 */
+const STOCKTAKE_BULK_CONFIRM_URL = "/api/stock/status/bulk-adjust";
+
+/** ✅ 바코드 등록(단건) 엔드포인트 (대량등록은 프론트에서 한 줄씩 호출) */
+const REGISTER_BARCODE_URL = "/api/inbound/process/register-barcode";
 
 /* ───────────────────────────────────────────────
  * 0-1. 다운로드 유틸
@@ -52,11 +66,9 @@ function parseFilenameFromContentDisposition(v: string | null): string | null {
   if (m1?.[1]) return decodeURIComponent(m1[1].trim());
 
   // filename="xxx" or filename=xxx
-  const m2 =
-    v.match(/filename\s*=\s*"([^"]+)"/i) ||
-    v.match(/filename\s*=\s*([^;]+)/i);
-
+  const m2 = v.match(/filename\s*=\s*"([^"]+)"/i) || v.match(/filename\s*=\s*([^;]+)/i);
   if (m2?.[1]) return m2[1].trim();
+
   return null;
 }
 
@@ -106,8 +118,6 @@ async function downloadBlob(res: Response, fallbackName: string) {
    ⬛ 1. 재고 이력(History)
    ============================================================ */
 
-/* 1-1. 재고 이력 핑 */
-
 export interface StockHistoryPingResponse {
   page: string;
   version: string;
@@ -117,8 +127,6 @@ export interface StockHistoryPingResponse {
 async function pingHistory(): Promise<ApiResult<StockHistoryPingResponse>> {
   return apiHub.get<StockHistoryPingResponse>(STOCK_HISTORY_PING_URL);
 }
-
-/* 1-2. 재고 이력 목록 조회 */
 
 export interface StockHistoryListFiltersDto {
   from_date?: string | null;
@@ -151,15 +159,11 @@ export interface StockHistoryListResult {
   size: number;
 }
 
-async function getHistoryList(
-  filters: StockHistoryListFiltersDto
-): Promise<ApiResult<StockHistoryListResult>> {
+async function getHistoryList(filters: StockHistoryListFiltersDto): Promise<ApiResult<StockHistoryListResult>> {
   return apiHub.get<StockHistoryListResult>(STOCK_HISTORY_LIST_URL, {
     params: filters,
   });
 }
-
-/* 1-3. 재고 이력 엑셀 export */
 
 export interface StockHistoryExportResult {
   file_name: string;
@@ -168,9 +172,7 @@ export interface StockHistoryExportResult {
   count: number;
 }
 
-async function exportHistory(
-  filters: StockHistoryListFiltersDto
-): Promise<ApiResult<StockHistoryExportResult>> {
+async function exportHistory(filters: StockHistoryListFiltersDto): Promise<ApiResult<StockHistoryExportResult>> {
   return apiHub.get<StockHistoryExportResult>(STOCK_HISTORY_EXPORT_URL, {
     params: filters,
   });
@@ -179,8 +181,6 @@ async function exportHistory(
 /* ============================================================
    ⬛ 2. 재고 현황(Status)
    ============================================================ */
-
-/* 2-1. 재고 현황 핑 */
 
 export interface StockStatusPingResponse {
   page: string; // "stock.status"
@@ -191,8 +191,6 @@ export interface StockStatusPingResponse {
 async function pingStatus(): Promise<ApiResult<StockStatusPingResponse>> {
   return apiHub.get<StockStatusPingResponse>(STOCK_STATUS_PING_URL);
 }
-
-/* 2-2. 재고 현황 목록 조회 */
 
 export interface StockStatusItem {
   sku: string;
@@ -228,9 +226,7 @@ export interface StockStatusMultiRequest {
   order: "asc" | "desc";
 }
 
-async function multiStatus(
-  body: StockStatusMultiRequest
-): Promise<ApiResult<StockStatusListResult>> {
+async function multiStatus(body: StockStatusMultiRequest): Promise<ApiResult<StockStatusListResult>> {
   return apiHub.post<StockStatusListResult>(STOCK_STATUS_MULTI_URL, body);
 }
 
@@ -251,9 +247,7 @@ export interface StockStatusActionExportResponse {
   count: number;
 }
 
-async function statusAction(
-  body: StockStatusActionRequest
-): Promise<ApiResult<StockStatusActionExportResponse>> {
+async function statusAction(body: StockStatusActionRequest): Promise<ApiResult<StockStatusActionExportResponse>> {
   return apiHub.post<StockStatusActionExportResponse>(STOCK_STATUS_ACTION_URL, body);
 }
 
@@ -267,10 +261,7 @@ async function downloadStatusXlsx(params?: StockStatusExportXlsxParams): Promise
   const qs = new URLSearchParams();
   if (params?.sku) qs.set("sku", params.sku);
 
-  const url =
-    qs.toString().length > 0
-      ? `${STOCK_STATUS_EXPORT_XLSX_URL}?${qs.toString()}`
-      : STOCK_STATUS_EXPORT_XLSX_URL;
+  const url = qs.toString().length > 0 ? `${STOCK_STATUS_EXPORT_XLSX_URL}?${qs.toString()}` : STOCK_STATUS_EXPORT_XLSX_URL;
 
   const token = getAccessToken();
   const headers: Record<string, string> = {};
@@ -291,12 +282,13 @@ async function downloadStatusXlsx(params?: StockStatusExportXlsxParams): Promise
 }
 
 /* ============================================================
-   ⬛ 3. 재고 실사(Stocktake) - PC 대량등록
+   ⬛ 3. 재고 실사(PC 대량등록 확정)
    ============================================================ */
 
 export interface StocktakeBulkConfirmItem {
   sku: string;
-  qty: number; // 최종 실사 수량
+  final_qty: number; // ✅ 서버 스펙 (필수)
+  memo?: string | null; // ✅ 서버 스펙 (옵션)
 }
 
 export interface StocktakeBulkConfirmRequest {
@@ -309,14 +301,74 @@ export interface StocktakeBulkConfirmResponse {
   message?: string;
 }
 
-async function stocktakeBulkConfirm(
-  body: StocktakeBulkConfirmRequest
-): Promise<ApiResult<StocktakeBulkConfirmResponse>> {
-  return apiHub.post<StocktakeBulkConfirmResponse>(STOCKTAKE_BULK_CONFIRM_URL, body);
+async function stocktakeBulkConfirm(body: StocktakeBulkConfirmRequest): Promise<ApiResult<StocktakeBulkConfirmResponse>> {
+  const normalized: StocktakeBulkConfirmRequest = {
+    items: (body.items ?? []).map((it) => {
+      const sku = String(it.sku ?? "").trim();
+      const final_qty = Number(it.final_qty);
+      const memo = String(it.memo ?? "").trim();
+
+      return {
+        sku,
+        final_qty,
+        ...(memo ? { memo } : {}), // ✅ memo가 있을 때만 보냄(자동 주입 금지)
+      };
+    }),
+  };
+
+  return apiHub.post<StocktakeBulkConfirmResponse>(STOCKTAKE_BULK_CONFIRM_URL, normalized);
 }
 
 /* ============================================================
-   ⬛ 4. 어댑터 export
+   ⬛ 4. ✅ 바코드 등록(대량용 단건)
+   ============================================================ */
+
+export interface RegisterBarcodeForSkuRequest {
+  sku: string;
+  barcode: string;
+  name?: string | null; // 표시용(서버에서 무시해도 됨)
+}
+
+/** 응답은 서버마다 다를 수 있으니, 페이지에서는 ok만 보게 최소한으로 둠 */
+export interface RegisterBarcodeForSkuResponse {
+  message?: string;
+}
+
+async function registerBarcodeForSku(
+  body: RegisterBarcodeForSkuRequest
+): Promise<ApiResult<RegisterBarcodeForSkuResponse>> {
+  const sku = String(body.sku ?? "").trim();
+  const barcode = String(body.barcode ?? "").trim();
+  const name = String(body.name ?? "").trim();
+
+  // ✅ ApiFailure가 data를 필수로 요구하는 구조라서, ok:false에도 data를 넣는다.
+  if (!sku) {
+    return {
+      ok: false,
+      data: null as any,
+      error: { message: "SKU가 비어있어요." } as any,
+    };
+  }
+  if (!barcode) {
+    return {
+      ok: false,
+      data: null as any,
+      error: { message: "바코드가 비어있어요." } as any,
+    };
+  }
+
+  // name은 표시용이라 비어있으면 아예 보내지 않음
+  const normalized: RegisterBarcodeForSkuRequest = {
+    sku,
+    barcode,
+    ...(name ? { name } : {}),
+  };
+
+  return apiHub.post<RegisterBarcodeForSkuResponse>(REGISTER_BARCODE_URL, normalized);
+}
+
+/* ============================================================
+   ⬛ 5. 어댑터 export
    ============================================================ */
 
 export const stockAdapter = {
@@ -329,11 +381,14 @@ export const stockAdapter = {
   pingStatus,
   getStatusList,
   multiStatus,
-  statusAction,        // 레거시 유지
-  downloadStatusXlsx,  // ✅ 신규
+  statusAction, // 레거시 유지
+  downloadStatusXlsx, // ✅ 신규
 
   // 재고 실사(PC)
   stocktakeBulkConfirm, // ✅ 신규
+
+  // ✅ 바코드 등록(대량)
+  registerBarcodeForSku, // ✅ 신규
 } as const;
 
 export type StockAdapter = typeof stockAdapter;

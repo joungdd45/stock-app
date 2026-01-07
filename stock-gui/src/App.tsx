@@ -35,6 +35,8 @@ import OutboundRegisterFormPage from "./pages/Outbound/Register/OutboundRegister
 import StockPage from "./pages/Stock/StockPage";
 import StatusPage from "./pages/Stock/Status/StatusPage";
 import HistoryPage from "./pages/Stock/History/HistoryPage";
+import StockTakeBulkPage from "./pages/Stock/stocktake/StockTakeBulkPage";
+import StockBarcodeBulkPage from "./pages/Stock/barcode/StockBarcodeBulkPage"; // ✅ 바코드 대량등록
 
 // ✅ 상품관리
 import ProductPage from "./pages/Product/ProductPage";
@@ -237,6 +239,26 @@ export default function App() {
             element={
               <StockPage>
                 <HistoryPage />
+              </StockPage>
+            }
+          />
+
+          {/* ✅ 재고 실사(대량) */}
+          <Route
+            path={ROUTES.INVENTORY.STOCKTAKE_BULK}
+            element={
+              <StockPage>
+                <StockTakeBulkPage />
+              </StockPage>
+            }
+          />
+
+          {/* ✅ 바코드 등록(대량) */}
+          <Route
+            path={ROUTES.INVENTORY.BARCODE_BULK}
+            element={
+              <StockPage>
+                <StockBarcodeBulkPage />
               </StockPage>
             }
           />

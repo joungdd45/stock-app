@@ -1,7 +1,7 @@
 # 📄 backend/routers/inbound/inbound_process.py
 # 페이지: 입고 처리(inbound.process) — 바코드 스캔/등록/수량지정/입고확정
 # 역할: 프론트 요청 수신 → 가드/의존성 → 서비스 호출 → 응답 포맷
-# 단계: v5.0 (서비스 v5.0 기준 정합 완료)
+# 단계: v5.2 (서비스 v5.2 기준: register_barcode_bulk 추가)
 # 규칙: 구조 통일 작업지침 v2 / 전체수정 원칙 적용
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from backend.security.guard import guard
 # 페이지 메타
 # ─────────────────────────────────────────────────────────
 PAGE_ID = "inbound.process"
-PAGE_VERSION = "v5.0"
+PAGE_VERSION = "v5.2"
 
 ROUTE_PREFIX = "/api/inbound/process"
 ROUTE_TAGS = ["inbound-process"]
@@ -75,6 +75,16 @@ class RegisterBarcodeRequest(BaseModel):
     name: Optional[str] = None
 
 
+# ✅ 대량 등록 DTO
+class RegisterBarcodeBulkItem(BaseModel):
+    sku: str
+    barcode: str
+
+
+class RegisterBarcodeBulkRequest(BaseModel):
+    items: List[RegisterBarcodeBulkItem]
+
+
 class SetQtyRequest(BaseModel):
     sku: str
     qty: Any
@@ -105,7 +115,7 @@ def ping():
         ok=True,
         page=PAGE_ID,
         version=PAGE_VERSION,
-        stage="implemented",  # scan / register-barcode / set-qty / confirm 구현
+        stage="implemented",  # scan / register-barcode / register-barcode/bulk / set-qty / confirm
     )
 
 
@@ -159,6 +169,32 @@ async def register_barcode(
 
     if payload.name is not None:
         result.setdefault("name", payload.name)
+
+    return ActionResponse(ok=True, data=ActionData(result=result))
+
+
+@inbound_process.post(
+    "/register-barcode/bulk",
+    response_model=ActionResponse,
+    summary="[write] 바코드 대량 등록 (SKU 기준, commit 1회)",
+)
+async def register_barcode_bulk(
+    payload: RegisterBarcodeBulkRequest,
+    svc: InboundProcessService = Depends(get_service),
+):
+    try:
+        # 서비스는 Any로 받으니 dict list로 넘겨도 됨
+        items_payload = [it.model_dump() for it in payload.items]
+        result = await svc.register_barcode_bulk(items=items_payload)
+    except DomainError as exc:
+        raise DomainError(
+            exc.code,
+            detail=exc.detail,
+            ctx={**(exc.ctx or {}), "page_id": PAGE_ID},
+            stage="router",
+            domain=PAGE_ID,
+            trace_id=exc.trace_id,
+        )
 
     return ActionResponse(ok=True, data=ActionData(result=result))
 

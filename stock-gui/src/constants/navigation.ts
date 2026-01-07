@@ -36,6 +36,8 @@ export const NAV_ITEMS: NavItem[] = [
     children: [
       { label: "재고 현황", path: ROUTES.INVENTORY.STATUS },
       { label: "재고 이력", path: ROUTES.INVENTORY.HISTORY },
+      { label: "재고 실사", path: ROUTES.INVENTORY.STOCKTAKE_BULK },
+      { label: "바코드 등록(대량)", path: ROUTES.INVENTORY.BARCODE_BULK }, // ✅ 추가
     ],
   },
 
@@ -61,6 +63,6 @@ export const NAV_ITEMS: NavItem[] = [
       { label: "기본설정", path: ROUTES.SETTINGS.BASIC },
       { label: "고급설정", path: ROUTES.SETTINGS.ADVANCED },
     ],
-  }
+  },
 ];
 // [NOAH PATCH END]

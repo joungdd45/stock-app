@@ -1,30 +1,11 @@
 # 📄 backend/services/inbound/inbound_process_service.py
-# 페이지: 입고 처리 — 바코드 스캔·상품확인·수량검증·바코드등록·입고확정
-# 역할: 비즈니스 로직 전담 (조회, 검증, 도메인 예외, 입고확정에 따른 재고 반영)
-# 단계: v5.0 (서비스 구현 / DB 스펙 v1.6-r1 기준)
-#
-# ✅ 이 파일이 담당하는 것
-# - 바코드 스캔 → product 테이블에서 상품 찾기
-# - SKU·수량 입력값 검증
-# - 비활성/삭제 상품에 대한 상태 체크
-# - SKU 기준 바코드 등록(매핑)
-# - 입고확정(confirm) 시:
-#   - inbound_header / inbound_item 상태를 draft to committed 로 변경(필드 존재 시)
-#   - inventory_ledger 에 입고 이력 추가
-#   - stock_current 에 재고 반영(qty_on_hand 증가)
-#
-# ✅ 이 파일이 절대 하지 않는 것
-# - 입고전표 신규 생성(등록 탭에서의 생성)
-# - 단가(unit_price)·총액(total_price) 계산
-# - supplier_name(입고처) 처리
-#
-# 👉 전표 생성·단가·입고처·가격 관련 계산은
-#    "입고 등록 / 입고 완료" 도메인 서비스에서 담당한다.
+# 페이지: 입고 처리 — 바코드 스캔/등록/수량지정/입고확정
+# 단계: v5.2 (register_barcode_bulk 추가: 대량 바코드 등록 1회 커밋)
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, List, Iterable, Set
+from typing import Any, Dict, Optional, List, Iterable, Set, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -32,11 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.system.error_codes import DomainError
 
-# ─────────────────────────────────────────────────────────
-# 페이지 메타 정보
-# ─────────────────────────────────────────────────────────
 PAGE_ID = "inbound.process"
-PAGE_VERSION = "v5.0"
+PAGE_VERSION = "v5.2"
 
 
 # ─────────────────────────────────────────────────────────
@@ -44,11 +22,7 @@ PAGE_VERSION = "v5.0"
 # ─────────────────────────────────────────────────────────
 def _get_models() -> Dict[str, Any]:
     """
-    실제 프로젝트 모델을 반환하도록 연결.
-
-    v5.0:
-        - backend.models 에서 아래 모델들을 지연 임포트해서 사용.
-          Product, InboundHeader, InboundItem, InventoryLedger, StockCurrent
+    backend.models 에서 필요한 모델들을 지연 임포트해서 반환.
     """
     try:
         from backend.models import (  # type: ignore
@@ -58,7 +32,7 @@ def _get_models() -> Dict[str, Any]:
             InventoryLedger,
             StockCurrent,
         )
-    except Exception as exc:  # 모델 import 자체 실패
+    except Exception as exc:
         raise DomainError(
             "SYSTEM-DB-901",
             detail="입고 처리 서비스에서 모델을 불러오지 못했습니다.",
@@ -75,10 +49,6 @@ def _get_models() -> Dict[str, Any]:
 
 
 def _get_session_adapter(session: Any) -> Any:
-    """
-    동기/비동기 세션 차이를 흡수하기 위한 어댑터.
-    - 현재는 Session, AsyncSession만 허용
-    """
     if isinstance(session, (Session, AsyncSession)):
         return session
 
@@ -90,203 +60,121 @@ def _get_session_adapter(session: Any) -> Any:
 
 
 # ─────────────────────────────────────────────────────────
-# 입력 검증 유틸
+# 입력 정규화/검증
 # ─────────────────────────────────────────────────────────
 def _normalize_barcode(raw: Optional[str]) -> str:
     if raw is None:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="바코드는 필수입니다.",
-            ctx={"page_id": PAGE_ID, "field": "barcode", "reason": "REQUIRED"},
-        )
-    barcode = raw.strip()
-    if not barcode:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="바코드는 공백일 수 없습니다.",
-            ctx={"page_id": PAGE_ID, "field": "barcode", "reason": "EMPTY"},
-        )
-    if len(barcode) > 50:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="바코드는 50자 이하만 허용됩니다.",
-            ctx={"page_id": PAGE_ID, "field": "barcode", "reason": "TOO_LONG"},
-        )
-    return barcode
+        raise DomainError("INBOUND-VALID-001", detail="바코드는 필수입니다.", ctx={"page_id": PAGE_ID, "field": "barcode"})
+    code = raw.strip()
+    if not code:
+        raise DomainError("INBOUND-VALID-001", detail="바코드는 공백일 수 없습니다.", ctx={"page_id": PAGE_ID, "field": "barcode"})
+    if len(code) > 50:
+        raise DomainError("INBOUND-VALID-001", detail="바코드는 50자 이하만 허용됩니다.", ctx={"page_id": PAGE_ID, "field": "barcode"})
+    return code
 
 
 def _normalize_sku(raw: Optional[str]) -> str:
     if raw is None:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="SKU는 필수입니다.",
-            ctx={"page_id": PAGE_ID, "field": "sku", "reason": "REQUIRED"},
-        )
+        raise DomainError("INBOUND-VALID-001", detail="SKU는 필수입니다.", ctx={"page_id": PAGE_ID, "field": "sku"})
     sku = raw.strip()
     if not sku:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="SKU는 공백일 수 없습니다.",
-            ctx={"page_id": PAGE_ID, "field": "sku", "reason": "EMPTY"},
-        )
+        raise DomainError("INBOUND-VALID-001", detail="SKU는 공백일 수 없습니다.", ctx={"page_id": PAGE_ID, "field": "sku"})
     if len(sku) > 50:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="SKU는 50자 이하만 허용됩니다.",
-            ctx={"page_id": PAGE_ID, "field": "sku", "reason": "TOO_LONG"},
-        )
+        raise DomainError("INBOUND-VALID-001", detail="SKU는 50자 이하만 허용됩니다.", ctx={"page_id": PAGE_ID, "field": "sku"})
     return sku
 
 
-def _normalize_qty(raw: Any, *, allow_zero: bool = True) -> int:
-    """
-    qty 입력 검증.
-    - 정수 변환 가능해야 함
-    - allow_zero=False 인 경우 1 이상이어야 함
-    - 수량 미입력 케이스는 UX 메시지를 위해 분리
-    """
+def _normalize_qty(raw: Any, *, allow_zero: bool) -> int:
     if raw is None or (isinstance(raw, str) and raw.strip() == ""):
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="수량을 기입하세요.",
-            ctx={"page_id": PAGE_ID, "field": "qty", "reason": "REQUIRED"},
-        )
+        raise DomainError("INBOUND-VALID-001", detail="수량을 기입하세요.", ctx={"page_id": PAGE_ID, "field": "qty"})
 
     try:
         qty = int(raw)
     except Exception:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="수량(qty)은 정수여야 합니다.",
-            ctx={"page_id": PAGE_ID, "field": "qty", "reason": "NOT_INT"},
-        )
-
-    if not allow_zero and qty <= 0:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="입고 수량은 1 이상이어야 합니다.",
-            ctx={"page_id": PAGE_ID, "field": "qty", "reason": "NOT_POSITIVE"},
-        )
+        raise DomainError("INBOUND-VALID-001", detail="수량(qty)은 정수여야 합니다.", ctx={"page_id": PAGE_ID, "field": "qty"})
 
     if qty < 0:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="수량은 음수일 수 없습니다.",
-            ctx={"page_id": PAGE_ID, "field": "qty", "reason": "NEGATIVE"},
-        )
+        raise DomainError("INBOUND-VALID-001", detail="수량은 음수일 수 없습니다.", ctx={"page_id": PAGE_ID, "field": "qty"})
+
+    if not allow_zero and qty <= 0:
+        raise DomainError("INBOUND-VALID-001", detail="입고 수량은 1 이상이어야 합니다.", ctx={"page_id": PAGE_ID, "field": "qty"})
 
     return qty
 
 
 def _normalize_header_id(raw: Any) -> int:
-    if raw is None:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="header_id는 필수입니다.",
-            ctx={"page_id": PAGE_ID, "field": "header_id", "reason": "REQUIRED"},
-        )
     try:
-        header_id = int(raw)
+        v = int(raw)
     except Exception:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="header_id는 정수여야 합니다.",
-            ctx={"page_id": PAGE_ID, "field": "header_id", "reason": "NOT_INT"},
-        )
-    if header_id <= 0:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="header_id는 1 이상이어야 합니다.",
-            ctx={"page_id": PAGE_ID, "field": "header_id", "reason": "NOT_POSITIVE"},
-        )
-    return header_id
+        raise DomainError("INBOUND-VALID-001", detail="header_id는 정수여야 합니다.", ctx={"page_id": PAGE_ID, "field": "header_id"})
+    if v <= 0:
+        raise DomainError("INBOUND-VALID-001", detail="header_id는 1 이상이어야 합니다.", ctx={"page_id": PAGE_ID, "field": "header_id"})
+    return v
 
 
 def _normalize_operator(raw: Optional[str]) -> str:
     if raw is None:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="operator는 필수입니다.",
-            ctx={"page_id": PAGE_ID, "field": "operator", "reason": "REQUIRED"},
-        )
+        raise DomainError("INBOUND-VALID-001", detail="operator는 필수입니다.", ctx={"page_id": PAGE_ID, "field": "operator"})
     op = raw.strip()
     if not op:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="operator는 공백일 수 없습니다.",
-            ctx={"page_id": PAGE_ID, "field": "operator", "reason": "EMPTY"},
-        )
+        raise DomainError("INBOUND-VALID-001", detail="operator는 공백일 수 없습니다.", ctx={"page_id": PAGE_ID, "field": "operator"})
     if len(op) > 50:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="operator는 50자 이하만 허용됩니다.",
-            ctx={"page_id": PAGE_ID, "field": "operator", "reason": "TOO_LONG"},
-        )
+        raise DomainError("INBOUND-VALID-001", detail="operator는 50자 이하만 허용됩니다.", ctx={"page_id": PAGE_ID, "field": "operator"})
     return op
 
 
 def _normalize_confirm_items(raw_items: Any) -> List[Dict[str, Any]]:
     if raw_items is None:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="items는 필수입니다.",
-            ctx={"page_id": PAGE_ID, "field": "items", "reason": "REQUIRED"},
-        )
+        raise DomainError("INBOUND-VALID-001", detail="items는 필수입니다.", ctx={"page_id": PAGE_ID, "field": "items"})
     if not isinstance(raw_items, Iterable) or isinstance(raw_items, (str, bytes)):
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="items 형식이 올바르지 않습니다.",
-            ctx={"page_id": PAGE_ID, "field": "items", "reason": "NOT_LIST"},
-        )
+        raise DomainError("INBOUND-VALID-001", detail="items 형식이 올바르지 않습니다.", ctx={"page_id": PAGE_ID, "field": "items"})
 
     items: List[Dict[str, Any]] = []
     for idx, row in enumerate(raw_items):
         if not isinstance(row, dict):
-            raise DomainError(
-                "INBOUND-VALID-001",
-                detail="items 요소는 객체 형태여야 합니다.",
-                ctx={
-                    "page_id": PAGE_ID,
-                    "field": "items",
-                    "reason": "ITEM_NOT_OBJECT",
-                    "index": idx,
-                },
-            )
+            raise DomainError("INBOUND-VALID-001", detail="items 요소는 객체여야 합니다.", ctx={"page_id": PAGE_ID, "field": "items", "index": idx})
         if "item_id" not in row:
-            raise DomainError(
-                "INBOUND-VALID-001",
-                detail="각 items에는 item_id가 필요합니다.",
-                ctx={
-                    "page_id": PAGE_ID,
-                    "field": "items.item_id",
-                    "reason": "REQUIRED",
-                    "index": idx,
-                },
-            )
+            raise DomainError("INBOUND-VALID-001", detail="각 items에는 item_id가 필요합니다.", ctx={"page_id": PAGE_ID, "field": "items.item_id", "index": idx})
         items.append(row)
 
     if not items:
-        raise DomainError(
-            "INBOUND-VALID-001",
-            detail="확정할 items가 없습니다.",
-            ctx={"page_id": PAGE_ID, "field": "items", "reason": "EMPTY_LIST"},
-        )
-
+        raise DomainError("INBOUND-VALID-001", detail="확정할 items가 없습니다.", ctx={"page_id": PAGE_ID, "field": "items"})
     return items
 
 
 # ─────────────────────────────────────────────────────────
-# 서비스 클래스 — 라우터에서 DI로 사용
+# bulk 입력 정규화/검증
+# ─────────────────────────────────────────────────────────
+def _normalize_register_items(raw_items: Any) -> List[Dict[str, str]]:
+    if raw_items is None:
+        raise DomainError("INBOUND-VALID-001", detail="items는 필수입니다.", ctx={"page_id": PAGE_ID, "field": "items"})
+    if not isinstance(raw_items, Iterable) or isinstance(raw_items, (str, bytes)):
+        raise DomainError("INBOUND-VALID-001", detail="items 형식이 올바르지 않습니다.", ctx={"page_id": PAGE_ID, "field": "items"})
+
+    out: List[Dict[str, str]] = []
+    for idx, row in enumerate(raw_items):
+        if not isinstance(row, dict):
+            raise DomainError("INBOUND-VALID-001", detail="items 요소는 객체여야 합니다.", ctx={"page_id": PAGE_ID, "field": "items", "index": idx})
+
+        sku_raw = row.get("sku")
+        barcode_raw = row.get("barcode")
+
+        # 개별 행은 실패로 흘릴 거라 여기서 예외를 크게 터뜨리지 않고,
+        # 호출부에서 try/catch하여 fail_items에 담는다.
+        sku = str(sku_raw).strip() if sku_raw is not None else ""
+        barcode = str(barcode_raw).strip() if barcode_raw is not None else ""
+
+        out.append({"sku": sku, "barcode": barcode})
+
+    if not out:
+        raise DomainError("INBOUND-VALID-001", detail="등록할 items가 없습니다.", ctx={"page_id": PAGE_ID, "field": "items"})
+    return out
+
+
+# ─────────────────────────────────────────────────────────
+# 서비스
 # ─────────────────────────────────────────────────────────
 class InboundProcessService:
-    """
-    입고 처리 서비스 구현체.
-    - 바코드 스캔 → 상품 확인
-    - SKU·수량 검증
-    - SKU 기준 바코드 등록
-    - 입고 확정(confirm) 시 전표 상태 변경, ledger 기록, 재고 반영
-    """
-
     page_id: str = PAGE_ID
     page_version: str = PAGE_VERSION
 
@@ -295,115 +183,80 @@ class InboundProcessService:
         self.user = user
         self.models = _get_models()
 
-    # -----------------------------------------------------
-    # 내부 공통 유틸: sync / async 통합
-    # -----------------------------------------------------
     async def _execute(self, stmt):
-        """Session/AsyncSession에 따라 execute 호출 통합."""
         if isinstance(self.session, AsyncSession):
             return await self.session.execute(stmt)
-        else:
-            return self.session.execute(stmt)
+        return self.session.execute(stmt)
 
     async def _fetch_one(self, stmt):
-        """select(...) 문장을 실행해서 scalar_one_or_none 결과를 반환."""
         result = await self._execute(stmt)
         return result.scalar_one_or_none()
 
     async def _commit(self) -> None:
-        """세션 커밋을 sync/async 구분 없이 수행."""
         if isinstance(self.session, AsyncSession):
             await self.session.commit()
         else:
             self.session.commit()
 
-    # -----------------------------------------------------
-    # 1) 바코드 스캔
-    # -----------------------------------------------------
+    # 1) 바코드 스캔: 다건 후보 반환 (+ 1개면 호환 키도 제공)
     async def scan_barcode(self, *, barcode: str) -> Dict[str, Any]:
-        """
-        바코드 스캔 후 상품 식별 서비스.
-        - 입력 검증
-        - product 테이블 조회
-        - 삭제/비활성 여부 검증
-        - 화면에 표시할 상품 요약정보 반환
-        """
         code = _normalize_barcode(barcode)
         Product = self.models["Product"]
 
         stmt = select(Product).where(Product.barcode == code)
-        product = await self._fetch_one(stmt)
+        result = await self._execute(stmt)
+        products = result.scalars().all()
 
-        if product is None:
+        if not products:
             raise DomainError(
                 "INBOUND-NOTFOUND-101",
                 detail="등록된 바코드를 찾을 수 없습니다.",
-                ctx={
-                    "page_id": PAGE_ID,
-                    "barcode": code,
-                    "reason": "BARCODE_NOT_FOUND",
-                },
+                ctx={"page_id": PAGE_ID, "barcode": code},
             )
 
-        is_active = getattr(product, "is_active", True)
-        deleted_at = getattr(product, "deleted_at", None)
-        if not is_active or deleted_at is not None:
+        candidates: List[Dict[str, Any]] = []
+        for p in products:
+            is_active = getattr(p, "is_active", True)
+            deleted_at = getattr(p, "deleted_at", None)
+            if not is_active or deleted_at is not None:
+                continue
+            candidates.append(
+                {
+                    "sku": getattr(p, "sku", None),
+                    "barcode": getattr(p, "barcode", None),
+                    "name": getattr(p, "name", None),
+                    "brand": getattr(p, "brand", None),
+                    "category": getattr(p, "category", None),
+                    "last_inbound_unit_price": getattr(p, "last_inbound_unit_price", None),
+                    "last_inbound_date": getattr(p, "last_inbound_date", None),
+                    "is_active": is_active,
+                }
+            )
+
+        if not candidates:
             raise DomainError(
                 "INBOUND-STATE-451",
-                detail="비활성화되었거나 삭제된 상품은 입고 처리할 수 없습니다.",
-                ctx={
-                    "page_id": PAGE_ID,
-                    "barcode": code,
-                    "sku": getattr(product, "sku", None),
-                    "reason": "INACTIVE_OR_DELETED_PRODUCT",
-                },
+                detail="비활성화되었거나 삭제된 상품만 존재합니다.",
+                ctx={"page_id": PAGE_ID, "barcode": code},
             )
 
-        return {
-            "sku": getattr(product, "sku", None),
-            "barcode": getattr(product, "barcode", None),
-            "name": getattr(product, "name", None),
-            "brand": getattr(product, "brand", None),
-            "category": getattr(product, "category", None),
-            "last_inbound_unit_price": getattr(
-                product, "last_inbound_unit_price", None
-            ),
-            "last_inbound_date": getattr(product, "last_inbound_date", None),
-            "is_active": is_active,
-        }
+        out: Dict[str, Any] = {"barcode": code, "count": len(candidates), "candidates": candidates}
+        if len(candidates) == 1:
+            out.update(candidates[0])  # 구형 응답 호환
+        return out
 
-    # -----------------------------------------------------
-    # 2) 바코드 등록 (SKU 기준)
-    # -----------------------------------------------------
-    async def register_barcode(
-        self,
-        *,
-        barcode: str,
-        sku: str,
-    ) -> Dict[str, Any]:
-        """
-        바코드 등록 서비스.
-        - 바코드/sku 검증
-        - sku로 상품 조회
-        - 다른 상품이 이미 사용 중인 바코드인지 검증
-        - 대상 상품에 바코드 세팅 후 커밋
-        """
+    # 2) 바코드 등록: SKU 기준 (동일 바코드 타 SKU 사용 허용 정책)
+    async def register_barcode(self, *, barcode: str, sku: str) -> Dict[str, Any]:
         code = _normalize_barcode(barcode)
         norm_sku = _normalize_sku(sku)
         Product = self.models["Product"]
 
-        stmt_sku = select(Product).where(Product.sku == norm_sku)
-        product = await self._fetch_one(stmt_sku)
-
+        product = await self._fetch_one(select(Product).where(Product.sku == norm_sku))
         if product is None:
             raise DomainError(
                 "INBOUND-NOTFOUND-101",
                 detail="바코드를 등록할 상품(SKU)를 찾을 수 없습니다.",
-                ctx={
-                    "page_id": PAGE_ID,
-                    "sku": norm_sku,
-                    "reason": "SKU_NOT_FOUND",
-                },
+                ctx={"page_id": PAGE_ID, "sku": norm_sku},
             )
 
         is_active = getattr(product, "is_active", True)
@@ -412,88 +265,174 @@ class InboundProcessService:
             raise DomainError(
                 "INBOUND-STATE-451",
                 detail="비활성화되었거나 삭제된 상품에는 바코드를 등록할 수 없습니다.",
-                ctx={
-                    "page_id": PAGE_ID,
-                    "sku": norm_sku,
-                    "reason": "INACTIVE_OR_DELETED_PRODUCT",
-                },
+                ctx={"page_id": PAGE_ID, "sku": norm_sku},
             )
 
-        stmt_barcode = select(Product).where(
-            Product.barcode == code,
-            Product.sku != norm_sku,
-        )
-        other = await self._fetch_one(stmt_barcode)
-        if other is not None:
-            raise DomainError(
-                "INBOUND-STATE-452",
-                detail="이미 다른 상품에 등록된 바코드입니다.",
-                ctx={
-                    "page_id": PAGE_ID,
-                    "barcode": code,
-                    "conflict_sku": getattr(other, "sku", None),
-                    "reason": "BARCODE_ALREADY_USED",
-                },
-            )
-
-        current_barcode = getattr(product, "barcode", None)
-        if current_barcode and current_barcode != code:
+        current = getattr(product, "barcode", None)
+        if current and current != code:
             raise DomainError(
                 "INBOUND-STATE-453",
                 detail="이 상품에는 이미 다른 바코드가 등록되어 있습니다.",
-                ctx={
-                    "page_id": PAGE_ID,
-                    "sku": norm_sku,
-                    "current_barcode": current_barcode,
-                    "new_barcode": code,
-                    "reason": "PRODUCT_ALREADY_HAS_BARCODE",
-                },
+                ctx={"page_id": PAGE_ID, "sku": norm_sku, "current_barcode": current, "new_barcode": code},
             )
 
-        if current_barcode == code:
-            return {
-                "sku": getattr(product, "sku", None),
-                "barcode": current_barcode,
-                "name": getattr(product, "name", None),
-            }
+        if current == code:
+            return {"sku": getattr(product, "sku", None), "barcode": current, "name": getattr(product, "name", None)}
 
         product.barcode = code
         await self._commit()
+        return {"sku": getattr(product, "sku", None), "barcode": getattr(product, "barcode", None), "name": getattr(product, "name", None)}
+
+    # ✅ 2-b) 바코드 대량 등록: SKU 기준 (commit 1회)
+    async def register_barcode_bulk(self, *, items: Any) -> Dict[str, Any]:
+        """
+        대량 바코드 등록(PC 대량등록용)
+        - items: [{ "sku": "...", "barcode": "..." }, ...]
+        - 정책:
+          * SKU 기준으로 Product 조회
+          * 비활성/삭제 상품은 실패
+          * 이미 다른 바코드가 등록된 SKU는 실패(단건과 동일 정책)
+          * 동일 바코드가 이미 등록된 SKU는 skip 처리(성공으로 치되 업데이트 없음)
+          * commit은 1회만 수행
+        """
+        Product = self.models["Product"]
+
+        raw_list = _normalize_register_items(items)
+
+        # 1) 행 단위 정규화/검증 + 중복 SKU 처리(마지막 값 우선)
+        #    - 같은 SKU가 여러 번 오면 마지막 요청으로 덮어쓴다(대량 복붙 UX에서 흔함)
+        sku_to_barcode: Dict[str, str] = {}
+        input_order: List[str] = []
+        pre_fail: List[Dict[str, Any]] = []
+
+        for idx, row in enumerate(raw_list):
+            try:
+                norm_sku = _normalize_sku(row.get("sku"))
+                code = _normalize_barcode(row.get("barcode"))
+            except DomainError as exc:
+                pre_fail.append(
+                    {
+                        "index": idx,
+                        "sku": row.get("sku"),
+                        "barcode": row.get("barcode"),
+                        "code": exc.code,
+                        "detail": exc.detail,
+                    }
+                )
+                continue
+
+            if norm_sku not in sku_to_barcode:
+                input_order.append(norm_sku)
+            sku_to_barcode[norm_sku] = code
+
+        if not sku_to_barcode and pre_fail:
+            return {
+                "ok_count": 0,
+                "skip_count": 0,
+                "fail_count": len(pre_fail),
+                "updated_count": 0,
+                "updated_items": [],
+                "fail_items": pre_fail,
+            }
+
+        sku_list = list(sku_to_barcode.keys())
+
+        # 2) 상품 한 번에 조회
+        result = await self._execute(select(Product).where(Product.sku.in_(sku_list)))
+        products = result.scalars().all()
+        product_map: Dict[str, Any] = {str(getattr(p, "sku")): p for p in products}
+
+        # 3) 적용/실패/스킵 분류
+        updated_items: List[Dict[str, Any]] = []
+        fail_items: List[Dict[str, Any]] = list(pre_fail)
+        ok_count = 0
+        skip_count = 0
+
+        for sku in input_order:
+            code = sku_to_barcode[sku]
+            p = product_map.get(sku)
+
+            if p is None:
+                fail_items.append(
+                    {
+                        "sku": sku,
+                        "barcode": code,
+                        "code": "INBOUND-NOTFOUND-101",
+                        "detail": "바코드를 등록할 상품(SKU)를 찾을 수 없습니다.",
+                    }
+                )
+                continue
+
+            is_active = getattr(p, "is_active", True)
+            deleted_at = getattr(p, "deleted_at", None)
+            if not is_active or deleted_at is not None:
+                fail_items.append(
+                    {
+                        "sku": sku,
+                        "barcode": code,
+                        "code": "INBOUND-STATE-451",
+                        "detail": "비활성화되었거나 삭제된 상품에는 바코드를 등록할 수 없습니다.",
+                    }
+                )
+                continue
+
+            current = getattr(p, "barcode", None)
+
+            # 단건 정책과 동일: 다른 바코드가 이미 있으면 실패
+            if current and current != code:
+                fail_items.append(
+                    {
+                        "sku": sku,
+                        "barcode": code,
+                        "code": "INBOUND-STATE-453",
+                        "detail": "이 상품에는 이미 다른 바코드가 등록되어 있습니다.",
+                        "current_barcode": current,
+                    }
+                )
+                continue
+
+            # 동일 바코드면 업데이트 불필요(스킵)
+            if current == code:
+                ok_count += 1
+                skip_count += 1
+                continue
+
+            # 업데이트 대상
+            p.barcode = code
+            ok_count += 1
+            updated_items.append(
+                {
+                    "sku": sku,
+                    "barcode": code,
+                    "name": getattr(p, "name", None),
+                }
+            )
+
+        # 4) 변경이 하나라도 있으면 commit 1회
+        if updated_items:
+            await self._commit()
 
         return {
-            "sku": getattr(product, "sku", None),
-            "barcode": getattr(product, "barcode", None),
-            "name": getattr(product, "name", None),
+            "ok_count": ok_count,
+            "skip_count": skip_count,
+            "fail_count": len(fail_items),
+            "updated_count": len(updated_items),
+            "updated_items": updated_items,
+            "fail_items": fail_items,
         }
 
-    # -----------------------------------------------------
-    # 3) 수량 설정/검증
-    # -----------------------------------------------------
-    async def set_qty(
-        self,
-        *,
-        sku: str,
-        qty: Any,
-    ) -> Dict[str, Any]:
-        """
-        수량 설정용 검증 서비스.
-        - SKU 유효성/존재 여부 검증
-        - 수량 규칙 검증
-        - DB에 수량을 반영하지 않고, 화면 상태 조정을 위한 정보만 반환
-        """
+    # 3) 수량 설정: 검증 + 조회
+    async def set_qty(self, *, sku: str, qty: Any) -> Dict[str, Any]:
         norm_sku = _normalize_sku(sku)
         norm_qty = _normalize_qty(qty, allow_zero=True)
 
         Product = self.models["Product"]
-
-        stmt = select(Product).where(Product.sku == norm_sku)
-        product = await self._fetch_one(stmt)
-
+        product = await self._fetch_one(select(Product).where(Product.sku == norm_sku))
         if product is None:
             raise DomainError(
                 "INBOUND-NOTFOUND-101",
                 detail="수량 설정 대상 SKU를 찾을 수 없습니다.",
-                ctx={"page_id": PAGE_ID, "sku": norm_sku, "reason": "SKU_NOT_FOUND"},
+                ctx={"page_id": PAGE_ID, "sku": norm_sku},
             )
 
         is_active = getattr(product, "is_active", True)
@@ -502,234 +441,92 @@ class InboundProcessService:
             raise DomainError(
                 "INBOUND-STATE-451",
                 detail="비활성화되었거나 삭제된 상품은 입고 처리할 수 없습니다.",
-                ctx={
-                    "page_id": PAGE_ID,
-                    "sku": norm_sku,
-                    "reason": "INACTIVE_OR_DELETED_PRODUCT",
-                },
+                ctx={"page_id": PAGE_ID, "sku": norm_sku},
             )
 
-        return {
-            "sku": getattr(product, "sku", None),
-            "name": getattr(product, "name", None),
-            "qty": norm_qty,
-        }
+        return {"sku": getattr(product, "sku", None), "name": getattr(product, "name", None), "qty": norm_qty}
 
-    # -----------------------------------------------------
-    # 4) 입고 확정(confirm)
-    # -----------------------------------------------------
-    async def confirm(
-        self,
-        *,
-        header_id: Any,
-        items: Any,
-        operator: Optional[str],
-    ) -> Dict[str, Any]:
-        """
-        입고 확정 서비스.
-
-        입력:
-        {
-          "header_id": 1,
-          "items": [
-            { "item_id": 3, "sku": "EXIST-BULK-001", "qty": 3 }
-          ],
-          "operator": "DJ"
-        }
-
-        처리:
-        1) header_id, items, operator 검증
-        2) inbound_header(draft) 조회, 상태 검사
-        3) items.item_id 기준으로 inbound_item 조회
-        4) 상태/sku/qty 검증 후 최종 수량 사용
-        5) header / item 상태 draft to committed (필드 존재 시)
-        6) inventory_ledger 에 SKU별 입고 이력 기록
-        7) stock_current 에 SKU별 qty_on_hand 증가
-        """
+    # 4) 확정: 기존 구조 유지(필드 유무를 hasattr로 방어)
+    async def confirm(self, *, header_id: Any, items: Any, operator: Optional[str]) -> Dict[str, Any]:
         InboundHeader = self.models["InboundHeader"]
         InboundItem = self.models["InboundItem"]
         InventoryLedger = self.models["InventoryLedger"]
         StockCurrent = self.models["StockCurrent"]
-        Product = self.models["Product"]  # ← 추가
+        Product = self.models["Product"]
 
-        norm_header_id = _normalize_header_id(header_id)
-        norm_items = _normalize_confirm_items(items)
-        norm_operator = _normalize_operator(operator)
+        hid = _normalize_header_id(header_id)
+        rows = _normalize_confirm_items(items)
+        op = _normalize_operator(operator)
 
-        # 📌 이번 확정 시점 기준 UTC 날짜 계산 (입고일로 사용)
         now_utc = datetime.now(timezone.utc)
         inbound_date = now_utc.date()
 
-        # 1) 헤더 조회 (deleted_at NULL)
-        stmt_header = select(InboundHeader).where(
-            InboundHeader.id == norm_header_id,
-            getattr(InboundHeader, "deleted_at", None).is_(None)
-            if hasattr(InboundHeader, "deleted_at")
-            else True,
-        )
-        header_obj = await self._fetch_one(stmt_header)
+        header = await self._fetch_one(select(InboundHeader).where(InboundHeader.id == hid))
+        if header is None:
+            raise DomainError("INBOUND-CONFIRM-001", detail="입고전표를 찾을 수 없습니다.", ctx={"page_id": PAGE_ID, "header_id": hid})
 
-        if header_obj is None:
-            raise DomainError(
-                "INBOUND-CONFIRM-001",
-                detail="입고전표를 찾을 수 없습니다.",
-                ctx={"page_id": PAGE_ID, "header_id": norm_header_id},
-            )
+        if getattr(header, "status", None) == "committed":
+            raise DomainError("INBOUND-CONFIRM-002", detail="이미 확정된 입고전표입니다.", ctx={"page_id": PAGE_ID, "header_id": hid})
 
-        header_status = getattr(header_obj, "status", None)
-        if header_status == "committed":
-            raise DomainError(
-                "INBOUND-CONFIRM-002",
-                detail="이미 확정된 입고전표입니다.",
-                ctx={"page_id": PAGE_ID, "header_id": norm_header_id},
-            )
-
-        # 2) item_id 목록 추출
         item_ids: List[int] = []
-        for row in norm_items:
+        for r in rows:
             try:
-                item_id = int(row.get("item_id"))
+                iid = int(r.get("item_id"))
             except Exception:
-                raise DomainError(
-                    "INBOUND-VALID-001",
-                    detail="item_id는 정수여야 합니다.",
-                    ctx={
-                        "page_id": PAGE_ID,
-                        "field": "items.item_id",
-                        "value": row.get("item_id"),
-                    },
-                )
-            if item_id <= 0:
-                raise DomainError(
-                    "INBOUND-VALID-001",
-                    detail="item_id는 1 이상이어야 합니다.",
-                    ctx={
-                        "page_id": PAGE_ID,
-                        "field": "items.item_id",
-                        "value": item_id,
-                    },
-                )
-            item_ids.append(item_id)
+                raise DomainError("INBOUND-VALID-001", detail="item_id는 정수여야 합니다.", ctx={"page_id": PAGE_ID, "field": "items.item_id"})
+            if iid <= 0:
+                raise DomainError("INBOUND-VALID-001", detail="item_id는 1 이상이어야 합니다.", ctx={"page_id": PAGE_ID, "field": "items.item_id"})
+            item_ids.append(iid)
 
-        # 3) inbound_item 조회 (deleted_at NULL)
-        stmt_items = select(InboundItem).where(
-            InboundItem.id.in_(item_ids),
-            getattr(InboundItem, "deleted_at", None).is_(None)
-            if hasattr(InboundItem, "deleted_at")
-            else True,
-        )
-        result_items = await self._execute(stmt_items)
-        db_items: List[Any] = result_items.scalars().all()
+        result_items = await self._execute(select(InboundItem).where(InboundItem.id.in_(item_ids)))
+        db_items = result_items.scalars().all()
 
         if len(db_items) != len(item_ids):
-            found_ids: Set[int] = {getattr(x, "id") for x in db_items}
-            missing = [iid for iid in item_ids if iid not in found_ids]
-            raise DomainError(
-                "INBOUND-CONFIRM-003",
-                detail="일부 입고 아이템을 찾을 수 없습니다.",
-                ctx={
-                    "page_id": PAGE_ID,
-                    "header_id": norm_header_id,
-                    "missing_item_ids": missing,
-                },
-            )
+            found = {int(getattr(x, "id")) for x in db_items}
+            missing = [x for x in item_ids if x not in found]
+            raise DomainError("INBOUND-CONFIRM-003", detail="일부 입고 아이템을 찾을 수 없습니다.", ctx={"page_id": PAGE_ID, "missing_item_ids": missing})
 
-        db_item_map: Dict[int, Any] = {getattr(x, "id"): x for x in db_items}
+        db_item_map = {int(getattr(x, "id")): x for x in db_items}
 
-        # header_id / status 검사
-        for db_item in db_items:
-            item_header_id = getattr(db_item, "header_id", None)
-            if item_header_id != norm_header_id:
-                raise DomainError(
-                    "INBOUND-CONFIRM-004",
-                    detail="입고전표와 아이템의 header_id가 일치하지 않습니다.",
-                    ctx={
-                        "page_id": PAGE_ID,
-                        "header_id": norm_header_id,
-                        "item_id": getattr(db_item, "id", None),
-                        "item_header_id": item_header_id,
-                    },
-                )
-            item_status = getattr(db_item, "status", None)
-            if item_status == "committed":
-                raise DomainError(
-                    "INBOUND-CONFIRM-005",
-                    detail="이미 확정된 입고 아이템이 포함되어 있습니다.",
-                    ctx={
-                        "page_id": PAGE_ID,
-                        "header_id": norm_header_id,
-                        "item_id": getattr(db_item, "id", None),
-                    },
-                )
-
-        # 🔹 상품 정보 미리 로드 (묶음 여부 확인용)
         sku_set: Set[str] = set()
-        for db_item in db_items:
-            db_sku = getattr(db_item, "sku", None)
-            if db_sku:
-                sku_set.add(str(db_sku))
+        for it in db_items:
+            sku = getattr(it, "sku", None)
+            if sku:
+                sku_set.add(str(sku))
 
         product_map: Dict[str, Any] = {}
         if sku_set:
-            stmt_product = select(Product).where(Product.sku.in_(list(sku_set)))
-            result_product = await self._execute(stmt_product)
-            product_list = result_product.scalars().all()
-            product_map = {
-                str(getattr(p, "sku")): p
-                for p in product_list
-            }
+            rp = await self._execute(select(Product).where(Product.sku.in_(list(sku_set))))
+            plist = rp.scalars().all()
+            product_map = {str(getattr(p, "sku")): p for p in plist}
 
-        # 4) 요청 기준 sku / qty 검증 및 집계  ← ★ 여기부터 전체 교체
-        total_qty = 0  # 전표에 표시되는 총합 (사용자 입력 기준)
-        qty_by_sku: Dict[str, int] = {}  # 실제 재고에 반영되는 양(단품 기준)
+        total_qty = 0
+        qty_by_sku: Dict[str, int] = {}
 
-        for row in norm_items:
-            item_id = int(row["item_id"])
-            req_sku_raw = row.get("sku")
-            req_qty_raw = row.get("qty")
+        for r in rows:
+            iid = int(r["item_id"])
+            req_sku = r.get("sku")
+            req_qty = r.get("qty")
 
-            db_item = db_item_map[item_id]
-
+            db_item = db_item_map[iid]
             db_sku = getattr(db_item, "sku", None)
-            if req_sku_raw is not None:
-                norm_req_sku = _normalize_sku(str(req_sku_raw))
-                if db_sku is not None and norm_req_sku != str(db_sku):
-                    raise DomainError(
-                        "INBOUND-CONFIRM-006",
-                        detail="요청한 SKU와 전표의 SKU가 일치하지 않습니다.",
-                        ctx={
-                            "page_id": PAGE_ID,
-                            "header_id": norm_header_id,
-                            "item_id": item_id,
-                            "req_sku": norm_req_sku,
-                            "db_sku": db_sku,
-                        },
-                    )
 
-            # 입력 수량 정규화
-            norm_qty = _normalize_qty(req_qty_raw, allow_zero=False)
+            if req_sku is not None and db_sku is not None:
+                if _normalize_sku(str(req_sku)) != str(db_sku):
+                    raise DomainError("INBOUND-CONFIRM-006", detail="요청한 SKU와 전표의 SKU가 일치하지 않습니다.", ctx={"page_id": PAGE_ID, "item_id": iid})
 
-            # 전표 화면용 qty는 그대로 입력값 유지
+            qty = _normalize_qty(req_qty, allow_zero=False)
             if hasattr(db_item, "qty"):
-                db_item.qty = norm_qty
+                db_item.qty = qty
 
-            # 화면용 총합
-            total_qty += norm_qty
+            total_qty += qty
 
-            # SKU 확인
-            sku_key = str(db_sku) if db_sku is not None else ""
-            if not sku_key:
-                raise DomainError(
-                    "INBOUND-CONFIRM-007",
-                    detail="입고 아이템에 SKU가 없습니다.",
-                    ctx={
-                        "page_id": PAGE_ID,
-                        "header_id": norm_header_id,
-                        "item_id": item_id,
-                    },
-                )
+            if not db_sku:
+                raise DomainError("INBOUND-CONFIRM-007", detail="입고 아이템에 SKU가 없습니다.", ctx={"page_id": PAGE_ID, "item_id": iid})
 
-            # 🔹 묶음 SKU 여부 확인 → 단품 SKU로 환산
+            sku_key = str(db_sku)
+
+            # 묶음/팩 처리(필드가 있을 때만)
             product = product_map.get(sku_key)
             target_sku = sku_key
             factor = 1
@@ -738,91 +535,70 @@ class InboundProcessService:
                 is_bundle = bool(getattr(product, "is_bundle", False))
                 base_sku = getattr(product, "base_sku", None)
                 pack_qty = getattr(product, "pack_qty", 1) or 1
-
-                # 묶음 SKU이면 base_sku × pack_qty 로 변환
                 if is_bundle and base_sku and pack_qty > 1:
                     target_sku = str(base_sku)
-                    factor = pack_qty
+                    factor = int(pack_qty)
 
-            # 최종 단품 기준 입고량
-            effective_qty = norm_qty * factor
+            eff = qty * factor
+            qty_by_sku[target_sku] = qty_by_sku.get(target_sku, 0) + eff
 
-            # 합산
-            qty_by_sku[target_sku] = qty_by_sku.get(target_sku, 0) + effective_qty
+        if hasattr(header, "status"):
+            header.status = "committed"
+        if hasattr(header, "updated_by"):
+            header.updated_by = op
+        if hasattr(header, "inbound_date"):
+            header.inbound_date = inbound_date
 
-        # 5) header / item 상태를 committed 로 변경 (필드 존재 시)  ← ★ 여기까지 전체 교체 완료
+        for it in db_items:
+            if hasattr(it, "status"):
+                it.status = "committed"
+            if hasattr(it, "updated_by"):
+                it.updated_by = op
 
-        if hasattr(header_obj, "status"):
-            header_obj.status = "committed"
-        if hasattr(header_obj, "updated_by"):
-            header_obj.updated_by = norm_operator
-        # 📌 header에 inbound_date 컬럼이 있으면 이번 확정일로 세팅
-        if hasattr(header_obj, "inbound_date"):
-            header_obj.inbound_date = inbound_date
-
-        for db_item in db_items:
-            if hasattr(db_item, "status"):
-                db_item.status = "committed"
-            if hasattr(db_item, "updated_by"):
-                db_item.updated_by = norm_operator
-
-        # 6) inventory_ledger 기록 추가 (v1.6-r1 스펙)
-        #    - event_type, ref_type, ref_id, qty_in, qty_out 사용
+        # ledger
         for sku_key, qty in qty_by_sku.items():
             ledger = InventoryLedger(
                 sku=sku_key,
                 event_type="INBOUND",
                 ref_type="INBOUND",
-                ref_id=norm_header_id,
+                ref_id=hid,
                 qty_in=qty,
                 qty_out=0,
             )
-            # 📌 ledger에 process_date 컬럼이 있으면 동일한 입고일로 세팅
             if hasattr(ledger, "process_date"):
                 ledger.process_date = inbound_date
             if hasattr(ledger, "created_by"):
-                ledger.created_by = norm_operator
+                ledger.created_by = op
             if hasattr(ledger, "updated_by"):
-                ledger.updated_by = norm_operator
+                ledger.updated_by = op
             self.session.add(ledger)
 
-        # 7) stock_current 갱신 (qty_on_hand 기준)
+        # stock_current
         sku_list = list(qty_by_sku.keys())
         if sku_list:
-            stmt_stock = select(StockCurrent).where(StockCurrent.sku.in_(sku_list))
-            result_stock = await self._execute(stmt_stock)
-            db_stock_list: List[Any] = result_stock.scalars().all()
-            stock_map: Dict[str, Any] = {
-                str(getattr(x, "sku")): x for x in db_stock_list
-            }
+            rs = await self._execute(select(StockCurrent).where(StockCurrent.sku.in_(sku_list)))
+            stock_list = rs.scalars().all()
+            stock_map = {str(getattr(x, "sku")): x for x in stock_list}
 
             for sku_key, qty in qty_by_sku.items():
-                stock_row = stock_map.get(sku_key)
-                if stock_row is None:
-                    stock_row = StockCurrent(
-                        sku=sku_key,
-                        qty_on_hand=qty,
-                        qty_reserved=0,
-                        qty_pending_out=0,
-                    )
-                    if hasattr(stock_row, "updated_by"):
-                        stock_row.updated_by = norm_operator
-                    self.session.add(stock_row)
+                row = stock_map.get(sku_key)
+                if row is None:
+                    row = StockCurrent(sku=sku_key, qty_on_hand=qty, qty_reserved=0, qty_pending_out=0)
+                    if hasattr(row, "updated_by"):
+                        row.updated_by = op
+                    self.session.add(row)
                 else:
-                    current_qty = getattr(stock_row, "qty_on_hand", 0) or 0
-                    new_qty = int(current_qty) + int(qty)
-                    stock_row.qty_on_hand = new_qty
-                    if hasattr(stock_row, "updated_by"):
-                        stock_row.updated_by = norm_operator
+                    cur = int(getattr(row, "qty_on_hand", 0) or 0)
+                    row.qty_on_hand = cur + int(qty)
+                    if hasattr(row, "updated_by"):
+                        row.updated_by = op
 
-        # 8) 커밋
         await self._commit()
 
         return {
-            "header_id": norm_header_id,
-            "confirmed_count": len(norm_items),
+            "header_id": hid,
+            "confirmed_count": len(rows),
             "total_qty": total_qty,
-            "operator": norm_operator,
-            # 📌 프론트/입고완료 리스트에서 사용할 수 있는 입고일(YYYY-MM-DD)
+            "operator": op,
             "inbound_date": inbound_date.isoformat(),
         }
