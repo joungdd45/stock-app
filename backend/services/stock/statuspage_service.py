@@ -1,11 +1,14 @@
 # 📄 backend/services/stock/statuspage_service.py
 # 페이지: 재고 현황(StatusPage)
 # 역할: 재고현황 조회/스캔/엑셀(xlsx)/재고조정(실사)
-# 단계: v1.8 (xlsx 다운로드 전용 export 추가)
+# 단계: v1.9 (실사 벌크 조정 추가: adjust_bulk)
 #
-# ✅ 변경 요약(v1.8)
-# - 운영용 xlsx 다운로드: export_operational_xlsx_bytes(sku, selected_skus)
-# - 기존 action(export)은 유지(호환) / 프론트는 export-xlsx 사용 권장
+# ✅ 변경 요약(v1.9)
+# - 서비스에 PC용 벌크 실사(대량 조정) 추가: adjust_bulk(items)
+# - 기존 adjust() 동작은 동일(단건 실사)
+# - 내부 로직을 _adjust_core()로 분리하여
+#   - 단건: 1건 처리 후 commit 1회
+#   - 벌크: N건 처리 후 commit 1회(트랜잭션 1회)
 
 from __future__ import annotations
 
@@ -19,7 +22,7 @@ from sqlalchemy.orm import Session
 from backend.system.error_codes import DomainError
 
 PAGE_ID = "stock.status"
-PAGE_VERSION = "v1.8"
+PAGE_VERSION = "v1.9"
 
 
 async def _run_sync(fn):
@@ -268,7 +271,6 @@ class StatusPageService:
         sku: Optional[str] = None,
         selected_skus: Optional[List[str]] = None,
     ) -> Tuple[bytes, str]:
-        # openpyxl은 가벼운 편이라 여기서 import
         from io import BytesIO
         from datetime import datetime
         from openpyxl import Workbook
@@ -325,7 +327,6 @@ class StatusPageService:
                 ]
             )
 
-        # 보기좋게 컬럼 폭 대충 맞춤(과한 계산은 안 함)
         widths = [26, 50, 12, 12, 14]
         for i, w in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(i)].width = w
@@ -481,15 +482,13 @@ class StatusPageService:
         }
 
     # ─────────────────────────────────────────────
-    # 6) 재고 조정(실사) (기존 유지)
+    # (내부) 실사조정 코어: commit/rollback은 바깥에서
     # ─────────────────────────────────────────────
-    async def adjust(self, *, payload: Dict[str, Any]) -> Dict[str, Any]:
-        sku = (payload.get("sku") or "").strip()
-        final_qty = payload.get("final_qty")
-        memo_text = (payload.get("memo") or "").strip()
-
+    async def _adjust_core(self, *, sku: str, final_qty: int, memo_text: str) -> Dict[str, Any]:
+        sku = (sku or "").strip()
         if not sku:
             raise DomainError("STOCK-VALID-001", detail="sku가 비어있습니다.", ctx={"page_id": PAGE_ID})
+
         if final_qty is None:
             raise DomainError("STOCK-VALID-001", detail="final_qty가 비어있습니다.", ctx={"page_id": PAGE_ID, "sku": sku})
         try:
@@ -499,7 +498,8 @@ class StatusPageService:
         if final_qty < 0:
             raise DomainError("STOCK-VALID-001", detail="final_qty는 0 이상이어야 합니다.", ctx={"page_id": PAGE_ID, "sku": sku, "final_qty": final_qty})
 
-        memo = f"실사조정: {memo_text}" if memo_text else "실사조정"
+        # ✅ 재고이력 메모는 "실사조정" 고정(요청대로)
+        memo = f"실사조정: {memo_text.strip()}" if (memo_text or "").strip() else "실사조정"
         actor = _safe_user_id(self.user)
 
         select_stmt = text(
@@ -518,64 +518,57 @@ class StatusPageService:
             """
         )
 
-        try:
+        # stock_current 없으면 생성 후 다시 lock
+        result = await _execute(self.session, select_stmt, {"sku": sku})
+        row = result.mappings().first()
+
+        if row is None:
+            product_check_stmt = text(
+                """
+                SELECT sku
+                FROM product
+                WHERE sku = :sku
+                  AND deleted_at IS NULL
+                  AND is_active = TRUE
+                """
+            )
+            p_res = await _execute(self.session, product_check_stmt, {"sku": sku})
+            product_row = p_res.mappings().first()
+            if product_row is None:
+                raise DomainError("STOCK-NOTFOUND-101", detail="해당 SKU의 상품을 찾을 수 없습니다.", ctx={"page_id": PAGE_ID, "sku": sku})
+
+            insert_stock_stmt = text(
+                """
+                INSERT INTO stock_current (
+                    sku,
+                    qty_on_hand,
+                    qty_reserved,
+                    qty_pending_out,
+                    last_unit_price,
+                    total_value,
+                    updated_by,
+                    updated_at
+                )
+                VALUES (
+                    :sku,
+                    0,
+                    0,
+                    0,
+                    NULL,
+                    NULL,
+                    :updated_by,
+                    NOW()
+                )
+                ON CONFLICT (sku) DO NOTHING
+                """
+            )
+            await _execute(self.session, insert_stock_stmt, {"sku": sku, "updated_by": actor})
+
+            # 같은 트랜잭션에서 다시 FOR UPDATE
             result = await _execute(self.session, select_stmt, {"sku": sku})
             row = result.mappings().first()
-
             if row is None:
-                product_check_stmt = text(
-                    """
-                    SELECT sku
-                    FROM product
-                    WHERE sku = :sku
-                      AND deleted_at IS NULL
-                      AND is_active = TRUE
-                    """
-                )
-                p_res = await _execute(self.session, product_check_stmt, {"sku": sku})
-                product_row = p_res.mappings().first()
-                if product_row is None:
-                    raise DomainError("STOCK-NOTFOUND-101", detail="해당 SKU의 상품을 찾을 수 없습니다.", ctx={"page_id": PAGE_ID, "sku": sku})
-
-                insert_stock_stmt = text(
-                    """
-                    INSERT INTO stock_current (
-                        sku,
-                        qty_on_hand,
-                        qty_reserved,
-                        qty_pending_out,
-                        last_unit_price,
-                        total_value,
-                        updated_by,
-                        updated_at
-                    )
-                    VALUES (
-                        :sku,
-                        0,
-                        0,
-                        0,
-                        NULL,
-                        NULL,
-                        :updated_by,
-                        NOW()
-                    )
-                    ON CONFLICT (sku) DO NOTHING
-                    """
-                )
-                await _execute(self.session, insert_stock_stmt, {"sku": sku, "updated_by": actor})
-                await _commit(self.session)
-
-                result = await _execute(self.session, select_stmt, {"sku": sku})
-                row = result.mappings().first()
-
-                if row is None:
-                    raise DomainError("STOCK-NOTFOUND-101", detail="해당 SKU의 재고 정보를 찾을 수 없습니다.", ctx={"page_id": PAGE_ID, "sku": sku})
-
-        except DomainError:
-            raise
-        except Exception as exc:
-            await _rollback(self.session)
-            raise DomainError("SYSTEM-DB-901", detail=str(exc), ctx={"page_id": PAGE_ID, "sku": sku})
+                raise DomainError("STOCK-NOTFOUND-101", detail="해당 SKU의 재고 정보를 찾을 수 없습니다.", ctx={"page_id": PAGE_ID, "sku": sku})
 
         before_qty = int(row["qty_on_hand"] or 0)
         qty_pending_out = int(row["qty_pending_out"] or 0)
@@ -592,75 +585,69 @@ class StatusPageService:
         qty_in = delta if delta > 0 else 0
         qty_out = -delta if delta < 0 else 0
 
-        try:
-            insert_ledger_stmt = text(
-                """
-                INSERT INTO inventory_ledger (
-                    sku,
-                    event_type,
-                    ref_type,
-                    ref_id,
-                    qty_in,
-                    qty_out,
-                    unit_price,
-                    memo,
-                    created_by,
-                    updated_by,
-                    created_at
-                )
-                VALUES (
-                    :sku,
-                    :event_type,
-                    :ref_type,
-                    :ref_id,
-                    :qty_in,
-                    :qty_out,
-                    :unit_price,
-                    :memo,
-                    :created_by,
-                    :updated_by,
-                    NOW()
-                )
-                """
+        insert_ledger_stmt = text(
+            """
+            INSERT INTO inventory_ledger (
+                sku,
+                event_type,
+                ref_type,
+                ref_id,
+                qty_in,
+                qty_out,
+                unit_price,
+                memo,
+                created_by,
+                updated_by,
+                created_at
             )
-            await _execute(
-                self.session,
-                insert_ledger_stmt,
-                {
-                    "sku": sku,
-                    "event_type": "ADJUST",
-                    "ref_type": "STOCK_ADJUST",
-                    "ref_id": None,
-                    "qty_in": int(qty_in),
-                    "qty_out": int(qty_out),
-                    "unit_price": last_unit_price,
-                    "memo": memo,
-                    "created_by": actor,
-                    "updated_by": actor,
-                },
+            VALUES (
+                :sku,
+                :event_type,
+                :ref_type,
+                :ref_id,
+                :qty_in,
+                :qty_out,
+                :unit_price,
+                :memo,
+                :created_by,
+                :updated_by,
+                NOW()
             )
+            """
+        )
+        await _execute(
+            self.session,
+            insert_ledger_stmt,
+            {
+                "sku": sku,
+                "event_type": "ADJUST",
+                "ref_type": "STOCK_ADJUST",
+                "ref_id": None,
+                "qty_in": int(qty_in),
+                "qty_out": int(qty_out),
+                "unit_price": last_unit_price,
+                "memo": memo,
+                "created_by": actor,
+                "updated_by": actor,
+            },
+        )
 
-            update_stock_stmt = text(
-                """
-                UPDATE stock_current
-                SET
-                    qty_on_hand = :final_qty,
-                    total_value = CASE
-                        WHEN last_unit_price IS NULL THEN NULL
-                        ELSE (:final_qty * last_unit_price)
-                    END,
-                    updated_by = :updated_by,
-                    updated_at = NOW()
-                WHERE sku = :sku
-                  AND deleted_at IS NULL
-                """
-            )
-            await _execute(self.session, update_stock_stmt, {"sku": sku, "final_qty": int(final_qty), "updated_by": actor})
-            await _commit(self.session)
-
-        except Exception as exc:
-            await _rollback(self.session)
-            raise DomainError("SYSTEM-DB-901", detail=str(exc), ctx={"page_id": PAGE_ID, "sku": sku})
+        update_stock_stmt = text(
+            """
+            UPDATE stock_current
+            SET
+                qty_on_hand = :final_qty,
+                total_value = CASE
+                    WHEN last_unit_price IS NULL THEN NULL
+                    ELSE (:final_qty * last_unit_price)
+                END,
+                updated_by = :updated_by,
+                updated_at = NOW()
+            WHERE sku = :sku
+              AND deleted_at IS NULL
+            """
+        )
+        await _execute(self.session, update_stock_stmt, {"sku": sku, "final_qty": int(final_qty), "updated_by": actor})
 
         after_qty = int(final_qty)
         return {
@@ -671,3 +658,50 @@ class StatusPageService:
             "available_qty": after_qty - qty_pending_out,
             "last_price": float(last_unit_price) if last_unit_price is not None else None,
         }
+
+    # ─────────────────────────────────────────────
+    # 6) 재고 조정(실사) (기존 유지)
+    # ─────────────────────────────────────────────
+    async def adjust(self, *, payload: Dict[str, Any]) -> Dict[str, Any]:
+        sku = (payload.get("sku") or "").strip()
+        final_qty = payload.get("final_qty")
+        memo_text = (payload.get("memo") or "").strip()
+
+        try:
+            out = await self._adjust_core(sku=sku, final_qty=final_qty, memo_text=memo_text)
+            await _commit(self.session)
+            return out
+        except DomainError:
+            await _rollback(self.session)
+            raise
+        except Exception as exc:
+            await _rollback(self.session)
+            raise DomainError("SYSTEM-DB-901", detail=str(exc), ctx={"page_id": PAGE_ID, "sku": sku})
+
+    # ─────────────────────────────────────────────
+    # 7) ✅ 재고 실사 벌크 조정 (PC 전용)
+    #  - 트랜잭션 1회: N건 처리 후 commit 1회
+    #  - 입력: items = [{ sku, final_qty, memo? }, ...]
+    #  - 메모는 항상 "실사조정" (필요시 "실사조정: <memo>")
+    # ─────────────────────────────────────────────
+    async def adjust_bulk(self, *, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        clean_items = [it for it in (items or []) if isinstance(it, dict)]
+        if not clean_items:
+            raise DomainError("STOCK-VALID-001", detail="조정할 항목이 없습니다.", ctx={"page_id": PAGE_ID})
+
+        results: List[Dict[str, Any]] = []
+        try:
+            for it in clean_items:
+                sku = (it.get("sku") or "").strip()
+                final_qty = it.get("final_qty")
+                memo_text = (it.get("memo") or "").strip()
+                results.append(await self._adjust_core(sku=sku, final_qty=final_qty, memo_text=memo_text))
+
+            await _commit(self.session)
+            return {"items": results, "count": len(results)}
+        except DomainError:
+            await _rollback(self.session)
+            raise
+        except Exception as exc:
+            await _rollback(self.session)
+            raise DomainError("SYSTEM-DB-901", detail=str(exc), ctx={"page_id": PAGE_ID})

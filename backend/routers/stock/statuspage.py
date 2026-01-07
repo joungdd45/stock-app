@@ -1,12 +1,13 @@
 # 📄 backend/routers/stock/statuspage.py
 # 페이지: 재고 현황(StatusPage)
 # 역할: 프론트 요청 수신 → 가드/의존성 → 서비스 호출 → 응답 포맷 래핑
-# 단계: v1.8 (운영용 xlsx 다운로드 엔드포인트 추가)
+# 단계: v1.9 (실사 벌크 조정 엔드포인트 추가)
 #
 # ✅ 엔드포인트 구분
-# - [운영용] GET /list         : 원장 발생 SKU만, SKU 검색
-# - [실사용] GET /search       : 상품 기준, 상품명/SKU 검색
-# - [다운로드] GET /export-xlsx : 운영용 기준 xlsx 다운로드 (토큰 필요)
+# - [운영용] GET /list           : 원장 발생 SKU만, SKU 검색
+# - [실사용] GET /search         : 상품 기준, 상품명/SKU 검색
+# - [다운로드] GET /export-xlsx   : 운영용 기준 xlsx 다운로드 (토큰 필요)
+# - [실사] POST /bulk-adjust     : ✅ PC용 벌크 실사(대량 조정)
 # - scan/multi/action은 기존 유지 (action.export는 JSON이라 다운로드용 아님)
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from backend.security.guard import guard
 # 페이지 메타
 # ─────────────────────────────────────────────────────────
 PAGE_ID = "stock.status"
-PAGE_VERSION = "v1.8"
+PAGE_VERSION = "v1.9"
 
 ROUTE_PREFIX = "/api/stock/status"
 ROUTE_TAGS = ["statuspage"]
@@ -96,6 +97,17 @@ class ScanRequest(BaseModel):
     barcode: str = Field(..., description="스캔된 바코드 값")
 
 
+# ✅ PC 재고실사(벌크) DTO
+class BulkAdjustItem(BaseModel):
+    sku: str = Field(..., description="SKU")
+    final_qty: int = Field(..., description="최종 재고수량(정수)")
+    memo: Optional[str] = Field(default=None, description="메모(선택) - 서비스에서 '실사조정'으로 기록")
+
+
+class BulkAdjustRequest(BaseModel):
+    items: List[BulkAdjustItem] = Field(..., description="벌크 실사 조정 항목")
+
+
 # ─────────────────────────────────────────────────────────
 # [system] ping
 # ─────────────────────────────────────────────────────────
@@ -107,6 +119,7 @@ def ping():
         version=PAGE_VERSION,
         stage="implemented",
     )
+
 
 # ─────────────────────────────────────────────────────────
 # 1️⃣ [운영용] 재고현황 목록
@@ -135,6 +148,7 @@ async def list_operational(
 
     return ActionResponse(ok=True, data=ActionData(result=result))
 
+
 # ─────────────────────────────────────────────────────────
 # 2️⃣ [실사용] 상품 검색 (실사/검색 전용)
 #   - 기준: product 전체
@@ -162,6 +176,7 @@ async def search_products(
 
     return ActionResponse(ok=True, data=ActionData(result=result))
 
+
 # ─────────────────────────────────────────────────────────
 # 2-1️⃣ [다운로드] 운영용 xlsx 다운로드
 #   - 기준: 운영용(원장 발생 SKU만)
@@ -174,7 +189,6 @@ async def export_xlsx(
     svc: StatusPageService = Depends(get_service),
 ):
     try:
-        # 서비스는 (content_bytes, filename) 형태를 반환해야 함
         content, filename = await svc.export_operational_xlsx_bytes(
             sku=sku,
             selected_skus=skus,
@@ -182,14 +196,32 @@ async def export_xlsx(
     except DomainError as exc:
         raise exc
 
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"'
-    }
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return StreamingResponse(
         BytesIO(content),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers=headers,
     )
+
+
+# ─────────────────────────────────────────────────────────
+# ✅ 2-2️⃣ [실사] PC용 벌크 재고조정(대량 실사)
+#   - 라우터는 얇게: items만 서비스에 전달
+#   - 서비스가 트랜잭션 1회로 처리 (commit 1회)
+# ─────────────────────────────────────────────────────────
+@statuspage.post("/bulk-adjust", response_model=ActionResponse)
+async def bulk_adjust(
+    payload: BulkAdjustRequest,
+    svc: StatusPageService = Depends(get_service),
+):
+    try:
+        # 서비스는 items: List[Dict]를 받도록 설계됨
+        result = await svc.adjust_bulk(items=[it.dict() for it in payload.items])
+    except DomainError as exc:
+        raise exc
+
+    return ActionResponse(ok=True, data=ActionData(result=result))
+
 
 # ─────────────────────────────────────────────────────────
 # 3️⃣ 바코드 스캔 단건 조회 (기존 유지)
@@ -205,6 +237,7 @@ async def scan_by_barcode(
         raise exc
 
     return ActionResponse(ok=True, data=ActionData(result=result))
+
 
 # ─────────────────────────────────────────────────────────
 # 4️⃣ 다건 SKU 조회 (기존 유지)
@@ -226,6 +259,7 @@ async def multi_items(
         raise exc
 
     return ActionResponse(ok=True, data=ActionData(result=result))
+
 
 # ─────────────────────────────────────────────────────────
 # 5️⃣ 재고 조정 / (기존) export(JSON) 유지

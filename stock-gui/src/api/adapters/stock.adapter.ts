@@ -13,6 +13,10 @@
      - [multi]        POST /api/stock/status/multi
      - [action]       POST /api/stock/status/action
      - ✅ [export-xlsx] GET /api/stock/status/export-xlsx (스트리밍 다운로드)
+
+   - 재고 실사(Stocktake)
+     - ✅ [bulk-confirm] POST /api/stocktake/bulk/confirm  (PC 대량등록 확정)
+       * payload는 SKU/qty만 (상품명은 UI 표시용)
 */
 
 import { apiHub, type ApiResult } from "../hub/apiHub";
@@ -30,6 +34,11 @@ const STOCK_STATUS_LIST_URL = "/api/stock/status/list";
 const STOCK_STATUS_MULTI_URL = "/api/stock/status/multi";
 const STOCK_STATUS_ACTION_URL = "/api/stock/status/action";
 const STOCK_STATUS_EXPORT_XLSX_URL = "/api/stock/status/export-xlsx";
+
+/** ✅ 재고실사 대량등록(PC) 확정 엔드포인트
+ *  - 서버 라우터 경로가 다르면 여기만 바꾸면 됨
+ */
+const STOCKTAKE_BULK_CONFIRM_URL = "/api/stocktake/bulk/confirm";
 
 /* ───────────────────────────────────────────────
  * 0-1. 다운로드 유틸
@@ -282,7 +291,32 @@ async function downloadStatusXlsx(params?: StockStatusExportXlsxParams): Promise
 }
 
 /* ============================================================
-   ⬛ 3. 어댑터 export
+   ⬛ 3. 재고 실사(Stocktake) - PC 대량등록
+   ============================================================ */
+
+export interface StocktakeBulkConfirmItem {
+  sku: string;
+  qty: number; // 최종 실사 수량
+}
+
+export interface StocktakeBulkConfirmRequest {
+  items: StocktakeBulkConfirmItem[];
+}
+
+/** 서버 응답 스펙은 라우터 확정 후 맞추면 됨 (일단 유연하게) */
+export interface StocktakeBulkConfirmResponse {
+  count?: number;
+  message?: string;
+}
+
+async function stocktakeBulkConfirm(
+  body: StocktakeBulkConfirmRequest
+): Promise<ApiResult<StocktakeBulkConfirmResponse>> {
+  return apiHub.post<StocktakeBulkConfirmResponse>(STOCKTAKE_BULK_CONFIRM_URL, body);
+}
+
+/* ============================================================
+   ⬛ 4. 어댑터 export
    ============================================================ */
 
 export const stockAdapter = {
@@ -297,6 +331,9 @@ export const stockAdapter = {
   multiStatus,
   statusAction,        // 레거시 유지
   downloadStatusXlsx,  // ✅ 신규
+
+  // 재고 실사(PC)
+  stocktakeBulkConfirm, // ✅ 신규
 } as const;
 
 export type StockAdapter = typeof stockAdapter;
